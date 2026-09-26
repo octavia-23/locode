@@ -2,6 +2,7 @@ import { ToolDefinition } from '../types.js';
 import { viewFileTool, writeFileTool, editFileTool } from './file-ops.js';
 import { listDirTool, searchCodeTool } from './search.js';
 import { runCommandTool } from './terminal.js';
+import { fetchWebTool, searchWebTool } from './web.js';
 
 export const allTools: ToolDefinition[] = [
   viewFileTool,
@@ -9,7 +10,9 @@ export const allTools: ToolDefinition[] = [
   editFileTool,
   listDirTool,
   searchCodeTool,
-  runCommandTool
+  runCommandTool,
+  fetchWebTool,
+  searchWebTool
 ];
 
 export const toolRegistry = new Map<string, ToolDefinition>();

@@ -4,29 +4,50 @@ import { confirm } from '@inquirer/prompts';
 import chalk from 'chalk';
 import { AgentContext, ChatMessage } from '../types.js';
 import { allTools, toolRegistry } from '../tools/index.js';
-import { OllamaProvider } from '../providers/ollama.js';
+import { ILLMProvider } from '../providers/types.js';
+import { createLLMProvider } from '../providers/factory.js';
 import { ContextManager } from './context.js';
 import { TerminalRenderer } from '../ui/renderer.js';
 import { buildSystemPrompt } from './prompt.js';
+import { CheckpointManager } from '../git/checkpoint.js';
+import { resolveFileMentions } from './mentions.js';
+
+export interface SessionStats {
+  turns: number;
+  totalTokens: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalDurationMs: number;
+}
 
 export class AgentLoop {
   private messages: ChatMessage[] = [];
-  private provider: OllamaProvider;
+  private provider: ILLMProvider;
   private renderer: TerminalRenderer;
   private contextManager: ContextManager;
   private context: AgentContext;
+  private checkpointManager: CheckpointManager;
+  private stats: SessionStats = {
+    turns: 0,
+    totalTokens: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    totalDurationMs: 0
+  };
 
   constructor(context: AgentContext, renderer: TerminalRenderer) {
     this.context = context;
     this.renderer = renderer;
-    this.provider = new OllamaProvider(context.model, context.ollamaHost);
+    this.provider = createLLMProvider(context);
     this.contextManager = new ContextManager(16384);
+    this.checkpointManager = new CheckpointManager(context.cwd);
+  }
 
-    // Initialize system message
-    this.messages.push({
+  async init() {
+    this.messages = [{
       role: 'system',
-      content: buildSystemPrompt(context.cwd)
-    });
+      content: await buildSystemPrompt(this.context.cwd)
+    }];
   }
 
   setContext(context: Partial<AgentContext>) {
@@ -36,10 +57,18 @@ export class AgentLoop {
     }
   }
 
-  clearHistory() {
+  getProvider(): ILLMProvider {
+    return this.provider;
+  }
+
+  getStats(): SessionStats {
+    return this.stats;
+  }
+
+  async clearHistory() {
     this.messages = [{
       role: 'system',
-      content: buildSystemPrompt(this.context.cwd)
+      content: await buildSystemPrompt(this.context.cwd)
     }];
   }
 
@@ -47,10 +76,43 @@ export class AgentLoop {
     return this.messages;
   }
 
+  async undo(): Promise<{ success: boolean; message: string }> {
+    return await this.checkpointManager.undo();
+  }
+
+  /**
+   * Generates a clean Conventional Commit message based on git diff
+   */
+  async generateCommitMessage(diffText: string): Promise<string> {
+    const prompt = `Based on the following git diff, generate a concise Conventional Commit message (e.g. "feat: add user auth" or "fix(parser): handle empty strings"). Output ONLY the commit message without any quotes or explanations.\n\nGit diff:\n${diffText.slice(0, 4000)}`;
+
+    try {
+      const res = await this.provider.chat([
+        { role: 'user', content: prompt }
+      ], []);
+      return res.content.trim().replace(/^["']|["']$/g, '');
+    } catch {
+      return 'chore: update project files';
+    }
+  }
+
   async run(userInput: string) {
+    if (this.messages.length === 0) {
+      await this.init();
+    }
+
+    // 1. Create a git checkpoint prior to making any modifications
+    await this.checkpointManager.createCheckpoint();
+
+    // 2. Resolve any @file references in user prompt
+    const { processedPrompt, injectedFiles } = await resolveFileMentions(userInput, this.context.cwd);
+    if (injectedFiles.length > 0) {
+      this.renderer.printMentionedFiles(injectedFiles);
+    }
+
     this.messages.push({
       role: 'user',
-      content: userInput
+      content: processedPrompt
     });
 
     const maxSteps = 25;
@@ -68,11 +130,20 @@ export class AgentLoop {
       try {
         response = await this.provider.chat(compacted, allTools);
       } catch (err: any) {
-        this.renderer.printError(`Ollama request failed: ${err.message}`);
+        this.renderer.printError(`Model request failed: ${err.message}`);
         break;
       }
 
       this.renderer.stopSpinner();
+
+      // Accumulate telemetry
+      if (response.usage) {
+        this.stats.turns++;
+        this.stats.totalTokens += response.usage.totalTokens;
+        this.stats.promptTokens += response.usage.promptTokens;
+        this.stats.completionTokens += response.usage.completionTokens;
+        this.stats.totalDurationMs += response.usage.durationMs;
+      }
 
       const { content, tool_calls } = response;
 
@@ -85,12 +156,13 @@ export class AgentLoop {
         this.renderer.printAssistantMessage(trimmedContent);
       }
 
-      // If no tool calls were requested, the model finished its response!
+      // If no tool calls were requested, display telemetry and finish turn
       if (!tool_calls || tool_calls.length === 0) {
         this.messages.push({
           role: 'assistant',
           content: content || ''
         });
+        this.renderer.printTelemetry(response.usage);
         break;
       }
 

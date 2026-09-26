@@ -40,4 +40,7 @@ export interface AgentContext {
   autoApprove: boolean;
   model: string;
   ollamaHost: string;
+  provider?: 'ollama' | 'openai' | 'lmstudio' | 'vllm';
+  apiBase?: string;
+  apiKey?: string;
 }

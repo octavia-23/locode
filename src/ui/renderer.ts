@@ -132,4 +132,23 @@ export class TerminalRenderer {
     this.stopSpinner();
     console.log(chalk.green(`\n✔ ${message}`));
   }
+
+  printMentionedFiles(files: string[]) {
+    if (files.length === 0) return;
+    const formatted = files.map(f => chalk.cyan(`@${f}`)).join(', ');
+    console.log(chalk.dim(`📎 Injected context: ${formatted}\n`));
+  }
+
+  printTelemetry(usage?: { totalTokens: number; durationMs: number; tokensPerSecond: number; completionTokens: number }) {
+    if (!usage) return;
+    const sec = (usage.durationMs / 1000).toFixed(1);
+    const tps = usage.tokensPerSecond > 0 ? `${usage.tokensPerSecond} tok/s` : '';
+    const stats = [
+      `${usage.totalTokens} tokens`,
+      tps,
+      `${sec}s`
+    ].filter(Boolean).join(' · ');
+
+    console.log(chalk.dim(`\n  ⚡ [${stats}]`));
+  }
 }

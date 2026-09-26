@@ -4,7 +4,6 @@ import { input } from '@inquirer/prompts';
 import chalk from 'chalk';
 import { AgentContext } from './types.js';
 import { AgentLoop } from './agent/loop.js';
-import { OllamaProvider } from './providers/ollama.js';
 import { TerminalRenderer } from './ui/renderer.js';
 import { handleSlashCommand } from './ui/commands.js';
 
@@ -12,10 +11,13 @@ const program = new Command();
 
 program
   .name('locode')
-  .description('Local-First AI Developer CLI (Node.js & Ollama)')
-  .version('0.1.0')
+  .description('Local-First AI Developer CLI (Node.js & Local LLM)')
+  .version('0.2.0')
   .argument('[prompt...]', 'Initial coding instruction to execute')
-  .option('-m, --model <name>', 'Ollama model to use', 'qwen2.5-coder:7b')
+  .option('-m, --model <name>', 'Model to use', 'qwen2.5-coder:7b')
+  .option('-p, --provider <type>', 'Provider: ollama | openai | lmstudio | vllm', 'ollama')
+  .option('--api-base <url>', 'Base URL for OpenAI-compatible provider (e.g. http://localhost:1234/v1)')
+  .option('--api-key <key>', 'API key for OpenAI-compatible provider', 'not-needed')
   .option('-y, --yes', 'Automatically approve all tool executions without prompting', false)
   .option('-d, --dir <path>', 'Workspace directory', process.cwd())
   .option('--host <url>', 'Ollama API host URL', 'http://127.0.0.1:11434');
@@ -31,26 +33,32 @@ const context: AgentContext = {
   cwd: targetCwd,
   autoApprove: options.yes,
   model: options.model,
-  ollamaHost: options.host
+  ollamaHost: options.host,
+  provider: options.provider,
+  apiBase: options.apiBase,
+  apiKey: options.apiKey
 };
 
 const renderer = new TerminalRenderer();
-const provider = new OllamaProvider(context.model, context.ollamaHost);
 const agent = new AgentLoop(context, renderer);
+const provider = agent.getProvider();
 
 async function main() {
-  // Check Ollama health
+  await agent.init();
+
+  // Check Provider health
   const isHealthy = await provider.isHealthy();
   if (!isHealthy) {
     renderer.printError(
-      `Unable to connect to Ollama at ${context.ollamaHost}.\n` +
-      `  Please ensure Ollama is installed and running: run 'ollama serve' in a terminal.`
+      `Unable to connect to ${context.provider || 'Ollama'} at ${context.apiBase || context.ollamaHost}.\n` +
+      `  Please ensure your local LLM server is running.`
     );
   }
 
   // If one-shot prompt was passed via CLI: e.g. locode "check git status and test"
   if (promptArgs) {
     renderer.printHeader(context.model, context.cwd, context.autoApprove);
+    console.log(chalk.bold.green(`Task: `) + chalk.white(promptArgs) + '\n');
     await agent.run(promptArgs);
     renderer.stopSpinner();
     return;

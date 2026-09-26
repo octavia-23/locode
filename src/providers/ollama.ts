@@ -1,17 +1,8 @@
 import ollama, { Message as OllamaMessage } from 'ollama';
 import { ChatMessage, ToolDefinition } from '../types.js';
+import { ILLMProvider, ChatProviderResponse } from './types.js';
 
-export interface OllamaChatResponse {
-  content: string;
-  tool_calls?: Array<{
-    function: {
-      name: string;
-      arguments: Record<string, any>;
-    };
-  }>;
-}
-
-export class OllamaProvider {
+export class OllamaProvider implements ILLMProvider {
   private model: string;
   private host: string;
   private numCtx: number;
@@ -52,7 +43,7 @@ export class OllamaProvider {
     messages: ChatMessage[],
     tools: ToolDefinition[],
     onToken?: (token: string) => void
-  ): Promise<OllamaChatResponse> {
+  ): Promise<ChatProviderResponse> {
     const formattedTools = tools.map(t => ({
       type: 'function' as const,
       function: {
@@ -80,6 +71,8 @@ export class OllamaProvider {
       return msg as OllamaMessage;
     });
 
+    const startTime = Date.now();
+
     // If streaming callback provided
     if (onToken) {
       try {
@@ -96,6 +89,9 @@ export class OllamaProvider {
 
         let fullContent = '';
         const accumulatedToolCalls: any[] = [];
+        let promptTokens = 0;
+        let completionTokens = 0;
+        let evalDurationNs = 0;
 
         for await (const chunk of stream) {
           if (chunk.message.content) {
@@ -105,27 +101,40 @@ export class OllamaProvider {
           if (chunk.message.tool_calls && chunk.message.tool_calls.length > 0) {
             accumulatedToolCalls.push(...chunk.message.tool_calls);
           }
+          if (chunk.prompt_eval_count) promptTokens = chunk.prompt_eval_count;
+          if (chunk.eval_count) completionTokens = chunk.eval_count;
+          if (chunk.eval_duration) evalDurationNs = chunk.eval_duration;
         }
 
-        // Check fallback parser if no native tool calls but content contains tool syntax
-        const parsedCalls = accumulatedToolCalls.length > 0 
-          ? accumulatedToolCalls 
+        const durationMs = Date.now() - startTime;
+        const tps = evalDurationNs > 0
+          ? completionTokens / (evalDurationNs / 1e9)
+          : (completionTokens / (durationMs / 1000) || 0);
+
+        const parsedCalls = accumulatedToolCalls.length > 0
+          ? accumulatedToolCalls
           : this.parseFallbackToolCalls(fullContent);
 
         return {
           content: fullContent,
-          tool_calls: parsedCalls.length > 0 ? parsedCalls : undefined
+          tool_calls: parsedCalls.length > 0 ? parsedCalls : undefined,
+          usage: {
+            promptTokens,
+            completionTokens,
+            totalTokens: promptTokens + completionTokens,
+            durationMs,
+            tokensPerSecond: Math.round(tps * 10) / 10
+          }
         };
       } catch (err: any) {
-        // Fallback to non-streaming if streaming fails
-        return this.chatNonStreaming(ollamaMessages, formattedTools);
+        return this.chatNonStreaming(ollamaMessages, formattedTools, startTime);
       }
     }
 
-    return this.chatNonStreaming(ollamaMessages, formattedTools);
+    return this.chatNonStreaming(ollamaMessages, formattedTools, startTime);
   }
 
-  private async chatNonStreaming(messages: OllamaMessage[], tools: any[]): Promise<OllamaChatResponse> {
+  private async chatNonStreaming(messages: OllamaMessage[], tools: any[], startTime: number): Promise<ChatProviderResponse> {
     const response = await ollama.chat({
       model: this.model,
       messages: messages,
@@ -137,6 +146,14 @@ export class OllamaProvider {
       }
     });
 
+    const durationMs = Date.now() - startTime;
+    const promptTokens = response.prompt_eval_count || 0;
+    const completionTokens = response.eval_count || 0;
+    const evalDuration = response.eval_duration || 0;
+    const tps = evalDuration > 0
+      ? completionTokens / (evalDuration / 1e9)
+      : (completionTokens / (durationMs / 1000) || 0);
+
     const content = response.message.content || '';
     const toolCalls = (response.message.tool_calls && response.message.tool_calls.length > 0)
       ? response.message.tool_calls
@@ -144,17 +161,23 @@ export class OllamaProvider {
 
     return {
       content,
-      tool_calls: toolCalls.length > 0 ? toolCalls : undefined
+      tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+      usage: {
+        promptTokens,
+        completionTokens,
+        totalTokens: promptTokens + completionTokens,
+        durationMs,
+        tokensPerSecond: Math.round(tps * 10) / 10
+      }
     };
   }
 
   /**
-   * Fallback parser for Qwen 2.5 Coder in case it outputs tool calls directly in text:
-   * e.g. <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+   * Fallback parser for Qwen 2.5 Coder in case it outputs tool calls directly in text
    */
   private parseFallbackToolCalls(text: string): any[] {
     const toolCalls: any[] = [];
-    
+
     // Pattern 1: <tool_call>\n{...}\n</tool_call>
     const xmlRegex = /<tool_call>([\s\S]*?)<\/tool_call>/g;
     let match: RegExpExecArray | null;
@@ -192,7 +215,7 @@ export class OllamaProvider {
 
     if (toolCalls.length > 0) return toolCalls;
 
-    // Pattern 3: Entire text or line is a JSON object with name & arguments
+    // Pattern 3: Entire text is a JSON object with name & arguments
     try {
       const parsed = JSON.parse(text.trim());
       if (parsed.name && typeof parsed.name === 'string') {

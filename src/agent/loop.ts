@@ -11,6 +11,7 @@ import { TerminalRenderer } from '../ui/renderer.js';
 import { buildSystemPrompt } from './prompt.js';
 import { CheckpointManager } from '../git/checkpoint.js';
 import { resolveFileMentions } from './mentions.js';
+import { MCPManager } from '../mcp/manager.js';
 
 export interface SessionStats {
   turns: number;
@@ -41,13 +42,38 @@ export class AgentLoop {
     this.provider = createLLMProvider(context);
     this.contextManager = new ContextManager(16384);
     this.checkpointManager = new CheckpointManager(context.cwd);
+    this.mcpManager = new MCPManager(context.cwd);
   }
+
+  private mcpManager: MCPManager;
 
   async init() {
     this.messages = [{
       role: 'system',
       content: await buildSystemPrompt(this.context.cwd)
     }];
+
+    // Connect MCP servers if configured
+    const mcpTools = await this.mcpManager.init();
+    for (const tool of mcpTools) {
+      toolRegistry.set(tool.name, tool);
+      if (!allTools.some(t => t.name === tool.name)) {
+        allTools.push(tool);
+      }
+    }
+
+    if (mcpTools.length > 0) {
+      const servers = this.mcpManager.getActiveServers().join(', ');
+      this.renderer.printSuccess(`Connected to MCP servers [${servers}] with ${mcpTools.length} tools`);
+    }
+  }
+
+  getMCPManager(): MCPManager {
+    return this.mcpManager;
+  }
+
+  async close() {
+    await this.mcpManager.closeAll();
   }
 
   setContext(context: Partial<AgentContext>) {

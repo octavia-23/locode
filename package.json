@@ -27,6 +27,7 @@
   "license": "MIT",
   "dependencies": {
     "@inquirer/prompts": "^8.7.2",
+    "@modelcontextprotocol/sdk": "^1.30.1",
     "chalk": "^5.6.2",
     "cli-highlight": "^2.1.11",
     "commander": "^15.0.0",

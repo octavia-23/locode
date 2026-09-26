@@ -21,6 +21,7 @@ export async function handleSlashCommand(
       console.log(`\n${chalk.bold.cyan('Available Slash Commands:')}`);
       console.log(`  ${chalk.yellow('/undo')}          - ⏪ Rollback workspace to state before the last agent turn`);
       console.log(`  ${chalk.yellow('/commit [msg]')}  - 🤖 Auto-generate or apply a git commit for current changes`);
+      console.log(`  ${chalk.yellow('/mcp')}           - 🔌 List connected Model Context Protocol (MCP) servers & tools`);
       console.log(`  ${chalk.yellow('/diff')}          - 📝 Show git status and pending changes in workspace`);
       console.log(`  ${chalk.yellow('/stats')}         - 📊 Display session token metrics and speed`);
       console.log(`  ${chalk.yellow('/model [name]')}  - 🔄 View current model or switch on the fly`);
@@ -28,6 +29,26 @@ export async function handleSlashCommand(
       console.log(`  ${chalk.yellow('/tools')}         - 🛠️ List all registered agent tools`);
       console.log(`  ${chalk.yellow('/exit')}          - 🚪 Exit Locode CLI\n`);
       return true;
+
+    case '/mcp': {
+      const mcp = agent.getMCPManager();
+      const servers = mcp.getActiveServers();
+      const tools = mcp.getLoadedTools();
+
+      console.log(`\n${chalk.bold.cyan('🔌 Model Context Protocol (MCP) Integration:')}`);
+      if (servers.length === 0) {
+        console.log(chalk.gray('  No active MCP servers connected.'));
+        console.log(chalk.dim('  Create a .mcp.json file in your project to connect servers (e.g. SQLite, GitHub, Fetch).\n'));
+      } else {
+        console.log(chalk.green(`  Active Servers (${servers.length}): ${servers.join(', ')}`));
+        console.log(`  Loaded MCP Tools (${tools.length}):`);
+        for (const t of tools) {
+          console.log(`    • ${chalk.yellow(t.name)}: ${chalk.gray(t.description)}`);
+        }
+        console.log();
+      }
+      return true;
+    }
 
     case '/undo': {
       renderer.startSpinner('Rolling back to previous checkpoint...');

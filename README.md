@@ -21,10 +21,12 @@
   - `list_dir`: Recursive directory scanner with `.gitignore` filtering.
   - `search_code`: Workspace grep/regex pattern search across code files.
   - `run_command`: Subprocess shell execution for running tests, linters, git, and builds.
+- **🔌 Model Context Protocol (MCP) Client:** Connect any external MCP tool server (PostgreSQL, SQLite, Chrome DevTools, GitHub, Memory) declared in `.mcp.json`.
 - **Safety & Interactive Approvals:** Read-only operations execute automatically; file edits and shell commands prompt for confirmation `[y/N]` unless running with `--yes`.
 - **Interactive REPL & Slash Commands:**
   - `/undo` - ⏪ Rollback workspace to state before the last agent turn.
   - `/commit [msg]` - 🤖 Auto-generate or apply a git commit for current changes.
+  - `/mcp` - 🔌 List connected Model Context Protocol (MCP) servers & tools.
   - `/stats` - 📊 Display session token metrics and speed.
   - `/diff` - 📝 Show git status and pending changes in workspace.
   - `/model [name]` - 🔄 View current model or switch on the fly.
@@ -94,6 +96,24 @@ Give the AI developer CLI a direct command:
 ```bash
 locode "Check git status, run npm test, and fix any failing tests"
 ```
+
+### Connecting MCP Servers
+Add a `.mcp.json` file in your workspace root:
+```json
+{
+  "mcpServers": {
+    "sqlite": {
+      "command": "uvx",
+      "args": ["mcp-server-sqlite", "--db-path", "./app.db"]
+    },
+    "fetch": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-fetch"]
+    }
+  }
+}
+```
+Run `locode` and type `/mcp` to inspect connected external tools!
 
 ---
 

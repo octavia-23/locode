@@ -1,0 +1,29 @@
+import { ToolDefinition } from '../types.js';
+import { viewFileTool, writeFileTool, editFileTool } from './file-ops.js';
+import { listDirTool, searchCodeTool } from './search.js';
+import { runCommandTool } from './terminal.js';
+
+export const allTools: ToolDefinition[] = [
+  viewFileTool,
+  writeFileTool,
+  editFileTool,
+  listDirTool,
+  searchCodeTool,
+  runCommandTool
+];
+
+export const toolRegistry = new Map<string, ToolDefinition>();
+for (const tool of allTools) {
+  toolRegistry.set(tool.name, tool);
+}
+
+export function getOllamaTools() {
+  return allTools.map(tool => ({
+    type: 'function' as const,
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters
+    }
+  }));
+}

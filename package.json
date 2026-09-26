@@ -1,0 +1,49 @@
+{
+  "name": "locode",
+  "version": "0.1.0",
+  "description": "Local-first AI developer CLI powered by local LLMs (Qwen 2.5 Coder, Ollama) and Node.js",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "locode": "./dist/cli.js"
+  },
+  "scripts": {
+    "start": "tsx src/cli.ts",
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/**/*.test.ts"
+  },
+  "keywords": [
+    "ai",
+    "cli",
+    "developer",
+    "claude-code",
+    "ollama",
+    "qwen",
+    "local-llm",
+    "coding-agent"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@inquirer/prompts": "^8.7.2",
+    "chalk": "^5.6.2",
+    "cli-highlight": "^2.1.11",
+    "commander": "^15.0.0",
+    "diff": "^9.0.0",
+    "execa": "^10.0.1",
+    "fast-glob": "^3.3.3",
+    "ignore": "^7.0.10",
+    "marked": "^15.0.12",
+    "marked-terminal": "^7.3.0",
+    "ollama": "^0.6.3",
+    "ora": "^9.4.1"
+  },
+  "devDependencies": {
+    "@types/diff": "^7.0.2",
+    "@types/node": "^26.6.3",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}

@@ -51,9 +51,9 @@ async function main() {
   // If one-shot prompt was passed via CLI: e.g. locode "check git status and test"
   if (promptArgs) {
     renderer.printHeader(context.model, context.cwd, context.autoApprove);
-    console.log(chalk.bold.green(`Task: `) + chalk.white(promptArgs) + '\n');
     await agent.run(promptArgs);
-    process.exit(0);
+    renderer.stopSpinner();
+    return;
   }
 
   // Interactive REPL Mode

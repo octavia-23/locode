@@ -12,6 +12,10 @@ import { buildSystemPrompt } from './prompt.js';
 import { CheckpointManager } from '../git/checkpoint.js';
 import { resolveFileMentions } from './mentions.js';
 import { MCPManager } from '../mcp/manager.js';
+import { CodeVerifier } from './verifier.js';
+import { ArchitectEngine } from './architect.js';
+
+
 
 export interface SessionStats {
   turns: number;
@@ -36,11 +40,11 @@ export class AgentLoop {
     totalDurationMs: 0
   };
 
-  constructor(context: AgentContext, renderer: TerminalRenderer) {
+  constructor(context: AgentContext, renderer: TerminalRenderer, customProvider?: ILLMProvider) {
     this.context = context;
     this.renderer = renderer;
-    this.provider = createLLMProvider(context);
-    this.contextManager = new ContextManager(16384);
+    this.provider = customProvider || createLLMProvider(context);
+    this.contextManager = new ContextManager(context.numCtx || 8192);
     this.checkpointManager = new CheckpointManager(context.cwd);
     this.mcpManager = new MCPManager(context.cwd);
   }
@@ -86,6 +90,11 @@ export class AgentLoop {
   getProvider(): ILLMProvider {
     return this.provider;
   }
+
+  getContext(): AgentContext {
+    return this.context;
+  }
+
 
   getStats(): SessionStats {
     return this.stats;
@@ -143,6 +152,9 @@ export class AgentLoop {
 
     const maxSteps = 25;
     let stepCount = 0;
+    let hasModifiedCode = false;
+    let repairAttempts = 0;
+    const maxRepairAttempts = 3;
 
     while (stepCount < maxSteps) {
       stepCount++;
@@ -182,8 +194,79 @@ export class AgentLoop {
         this.renderer.printAssistantMessage(trimmedContent);
       }
 
-      // If no tool calls were requested, display telemetry and finish turn
+      // If no tool calls were requested, verify code or finish turn
       if (!tool_calls || tool_calls.length === 0) {
+        // Autonomous Verification & Self-Repair Gate
+        if (hasModifiedCode && repairAttempts < maxRepairAttempts) {
+          this.renderer.startSpinner('Running automated verification & health check...');
+          const vResult = await CodeVerifier.run(this.context.cwd);
+          this.renderer.stopSpinner();
+
+          if (!vResult.passed) {
+            repairAttempts++;
+
+            let architectPlan = '';
+            // If verification failed twice or mode is architect, escalate to Architect for root-cause diagnosis
+            if (repairAttempts >= 2 || this.context.mode === 'architect') {
+              const archModel = this.context.architectModel || this.context.model;
+              this.renderer.printWarning(
+                `⚡ Escalating to Architect Engine (${chalk.cyan(archModel)}) for deep root-cause diagnosis...`
+              );
+              this.renderer.startSpinner('Architect analyzing cross-file contracts and root cause...');
+              architectPlan = await ArchitectEngine.diagnose(
+                vResult.errorOutput || '',
+                vResult.command || '',
+                this.messages,
+                this.context,
+                this.provider
+              );
+              this.renderer.stopSpinner();
+              console.log(chalk.bold.magenta('\n🏛️ Senior Architect Directive:'));
+              console.log(chalk.gray(architectPlan) + '\n');
+            } else {
+              this.renderer.printWarning(
+                `Autonomous Self-Repair [Attempt ${repairAttempts}/${maxRepairAttempts}]: \`${vResult.command}\` failed. Feeding error trace back to model...`
+              );
+            }
+
+            this.messages.push({
+              role: 'assistant',
+              content: content || ''
+            });
+
+            const errorPrompt = architectPlan
+              ? `[AUTONOMOUS VERIFICATION FAILED - ARCHITECT ESCALATION]
+Command executed: \`${vResult.command}\`
+Compiler / Test failure:
+\`\`\`
+${vResult.errorOutput}
+\`\`\`
+
+🏛️ Senior Architect Directive:
+${architectPlan}
+
+Follow the Senior Architect's diagnosis above. Use 'edit_file' to apply the surgical fix to the affected files. Do not deviate from the plan.`
+              : `[AUTONOMOUS VERIFICATION FAILED]
+Command executed: \`${vResult.command}\`
+
+Error output:
+\`\`\`
+${vResult.errorOutput}
+\`\`\`
+
+The modifications introduced compilation, syntax, or test errors. Analyze the stack trace above, locate the offending file and line, and use 'edit_file' to repair the error. Do not complete the task until the error is resolved.`;
+
+            this.messages.push({
+              role: 'user',
+              content: errorPrompt
+            });
+            continue; // Continue loop to repair!
+          } else if (vResult.command) {
+            this.renderer.printSuccess(`Verification passed: \`${vResult.command}\` exited with 0 errors.`);
+          }
+
+        }
+
         this.messages.push({
           role: 'assistant',
           content: content || ''
@@ -191,6 +274,7 @@ export class AgentLoop {
         this.renderer.printTelemetry(response.usage);
         break;
       }
+
 
       // Add the assistant's action to message history
       this.messages.push({
@@ -279,12 +363,20 @@ export class AgentLoop {
 
         // Execute tool
         this.renderer.startSpinner(`Executing ${toolName}...`);
+        if ((toolName === 'edit_file' || toolName === 'write_file') && toolArgs.path) {
+          await this.checkpointManager.recordPreEditFile(toolArgs.path);
+        }
         const executionResult = await tool.execute(toolArgs, this.context);
         this.renderer.stopSpinner();
 
         this.renderer.printToolResult(toolName, executionResult.result, executionResult.isError);
 
+        if ((toolName === 'edit_file' || toolName === 'write_file') && !executionResult.isError) {
+          hasModifiedCode = true;
+        }
+
         this.messages.push({
+
           role: 'tool',
           name: toolName,
           content: executionResult.result

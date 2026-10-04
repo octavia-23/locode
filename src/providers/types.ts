@@ -27,4 +27,8 @@ export interface ILLMProvider {
     tools: ToolDefinition[],
     onToken?: (token: string) => void
   ): Promise<ChatProviderResponse>;
+  getNumCtx?(): number;
+  setNumCtx?(numCtx: number): void;
 }
+
+

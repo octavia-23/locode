@@ -4,6 +4,8 @@ import { createTwoFilesPatch } from 'diff';
 import { marked } from 'marked';
 import MarkedTerminal from 'marked-terminal';
 
+import { HardwareProfile } from '../hardware/detector.js';
+
 // Setup marked for terminal
 marked.setOptions({
   renderer: new (MarkedTerminal as any)({
@@ -27,16 +29,30 @@ export class TerminalRenderer {
     }
   }
 
-  printHeader(model: string, cwd: string, autoApprove: boolean) {
+  printHeader(model: string, cwd: string, autoApprove: boolean, hardwareProfile?: HardwareProfile, numCtx?: number) {
     const title = chalk.bold.hex('#61afef')('╔═══════════════════════════════════════════════════════╗');
     const name  = chalk.bold.hex('#61afef')('║   🤖 LOCODE - Local-First AI Developer CLI (Node.js)  ║');
     const foot  = chalk.bold.hex('#61afef')('╚═══════════════════════════════════════════════════════╝');
     console.log(`\n${title}\n${name}\n${foot}`);
     console.log(chalk.gray(`  Model:     ${chalk.cyan(model)} (via Ollama)`));
+    if (hardwareProfile) {
+      const memStr = hardwareProfile.totalVramMb > 0
+        ? `${(hardwareProfile.totalVramMb / 1024).toFixed(1)} GB VRAM`
+        : `${(hardwareProfile.totalRamMb / 1024).toFixed(1)} GB RAM`;
+      const offloadBadge = hardwareProfile.measuredGpuOffloadVerified
+        ? chalk.green.bold('Verified 100% GPU Offload')
+        : (hardwareProfile.estimatedFullOffload7B
+          ? chalk.blue.bold('Estimated GPU Offload')
+          : chalk.yellow.bold('Hybrid CPU/GPU Offload'));
+      const ctxVal = (numCtx || hardwareProfile.selectedCtx || hardwareProfile.recommendedCtx).toLocaleString();
+      console.log(chalk.gray(`  Hardware:  ${chalk.white(hardwareProfile.deviceName)} [${chalk.magenta(memStr)}]`));
+      console.log(chalk.gray(`  Context:   ${chalk.cyan(ctxVal + ' tokens')} [${offloadBadge}]`));
+    }
     console.log(chalk.gray(`  Workspace: ${chalk.white(cwd)}`));
     console.log(chalk.gray(`  Approvals: ${autoApprove ? chalk.yellow('Auto-approve (Danger mode enabled)') : chalk.green('Interactive (Safe mode)')}`));
     console.log(chalk.gray(`  Commands:  Type ${chalk.yellow('/help')} for options, or type your goal.\n`));
   }
+
 
   startSpinner(text: string) {
     if (!this.spinner) {
@@ -128,10 +144,16 @@ export class TerminalRenderer {
     console.log(chalk.red(`\n✖ ${message}`));
   }
 
+  printWarning(message: string) {
+    this.stopSpinner();
+    console.log(chalk.yellow(`\n⚠ ${message}`));
+  }
+
   printSuccess(message: string) {
     this.stopSpinner();
     console.log(chalk.green(`\n✔ ${message}`));
   }
+
 
   printMentionedFiles(files: string[]) {
     if (files.length === 0) return;

@@ -35,6 +35,8 @@ export interface ChatMessage {
   }>;
 }
 
+import { HardwareProfile } from './hardware/detector.js';
+
 export interface AgentContext {
   cwd: string;
   autoApprove: boolean;
@@ -43,4 +45,10 @@ export interface AgentContext {
   provider?: 'ollama' | 'openai' | 'lmstudio' | 'vllm';
   apiBase?: string;
   apiKey?: string;
+  numCtx?: number;
+  hardwareProfile?: HardwareProfile;
+  architectModel?: string;
+  mode?: 'worker' | 'architect';
 }
+
+

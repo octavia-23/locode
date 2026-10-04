@@ -2,7 +2,33 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import fg from 'fast-glob';
 import ignore from 'ignore';
+import { execa } from 'execa';
 import { ToolDefinition } from '../types.js';
+import { resolveSafePath } from './security.js';
+
+let rgAvailablePromise: Promise<boolean> | null = null;
+
+async function checkRipgrep(): Promise<boolean> {
+  if (rgAvailablePromise) return rgAvailablePromise;
+  rgAvailablePromise = (async () => {
+    try {
+      const res = await execa('rg --version', { shell: true, timeout: 2000 });
+      return res.exitCode === 0;
+    } catch {
+      return false;
+    }
+  })();
+  return rgAvailablePromise;
+}
+
+export function isBinaryBuffer(buffer: Buffer): boolean {
+  // Check first 1024 bytes for null bytes
+  const checkLen = Math.min(buffer.length, 1024);
+  for (let i = 0; i < checkLen; i++) {
+    if (buffer[i] === 0) return true;
+  }
+  return false;
+}
 
 async function getIgnoreFilter(cwd: string) {
   const ig = ignore();
@@ -56,7 +82,7 @@ export const listDirTool: ToolDefinition = {
   async execute(args, context) {
     try {
       const relPath = args.path || '.';
-      const targetDir = path.resolve(context.cwd, relPath);
+      const targetDir = resolveSafePath(relPath, context.cwd);
       const maxDepth = args.depth ?? 2;
       const ig = await getIgnoreFilter(context.cwd);
 
@@ -93,9 +119,64 @@ export const listDirTool: ToolDefinition = {
   }
 };
 
+/**
+ * Searches code using the pure JavaScript fallback with binary filtering and .gitignore support.
+ */
+export async function searchCodeFallback(
+  patternStr: string,
+  searchRoot: string,
+  cwd: string,
+  maxMatches: number = 100
+): Promise<string[]> {
+  const ig = await getIgnoreFilter(cwd);
+  const files = await fg(['**/*'], {
+    cwd: searchRoot,
+    onlyFiles: true,
+    dot: false
+  });
+
+  const results: string[] = [];
+  let regex: RegExp;
+  try {
+    regex = new RegExp(patternStr, 'i');
+  } catch {
+    regex = new RegExp(patternStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+  }
+
+  for (const file of files) {
+    const fullPath = path.join(searchRoot, file);
+    const relToCwd = path.relative(cwd, fullPath).replace(/\\/g, '/');
+    if (ig.ignores(relToCwd)) continue;
+
+    try {
+      const buf = await fs.readFile(fullPath);
+      if (isBinaryBuffer(buf)) {
+        continue; // Safe binary file skip
+      }
+      const content = buf.toString('utf8');
+      const lines = content.split('\n');
+
+      for (let idx = 0; idx < lines.length; idx++) {
+        const line = lines[idx];
+        if (regex.test(line)) {
+          results.push(`${relToCwd}:${idx + 1}: ${line.trim()}`);
+          if (results.length >= maxMatches) {
+            results.push(`... [Truncated at ${maxMatches} matches]`);
+            return results;
+          }
+        }
+      }
+    } catch {
+      // Skip unreadable files
+    }
+  }
+
+  return results;
+}
+
 export const searchCodeTool: ToolDefinition = {
   name: 'search_code',
-  description: 'Search workspace files for a text string or regex pattern (like grep/ripgrep). Returns matching lines with line numbers.',
+  description: 'Search workspace files for a text string or regex pattern (uses ripgrep when available, with portable JS fallback). Returns matching lines with line numbers.',
   parameters: {
     type: 'object',
     properties: {
@@ -114,45 +195,56 @@ export const searchCodeTool: ToolDefinition = {
   async execute(args, context) {
     try {
       const patternStr = args.pattern;
-      const ig = await getIgnoreFilter(context.cwd);
-      const searchRoot = args.path ? path.resolve(context.cwd, args.path) : context.cwd;
+      const searchRoot = args.path ? resolveSafePath(args.path, context.cwd) : context.cwd;
+      const hasRg = await checkRipgrep();
 
-      const files = await fg(['**/*'], {
-        cwd: searchRoot,
-        onlyFiles: true,
-        dot: false
-      });
+      let results: string[] = [];
 
-      const results: string[] = [];
-      let regex: RegExp;
-      try {
-        regex = new RegExp(patternStr, 'i');
-      } catch {
-        regex = new RegExp(patternStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      if (hasRg) {
+        try {
+          const isWindows = process.platform === 'win32';
+          const rgArgs = [
+            '--line-number',
+            '--heading',
+            '--color', 'never',
+            '--max-count', '100',
+            '-i',
+            '-e', patternStr,
+            searchRoot
+          ];
+          const res = await execa('rg', rgArgs, {
+            cwd: context.cwd,
+            reject: false,
+            timeout: 10000
+          });
+
+          if (res.exitCode === 0 && res.stdout.trim()) {
+            const rawLines = res.stdout.trim().split('\n');
+            let currentFile = '';
+            for (const line of rawLines) {
+              if (!line.trim()) continue;
+              const match = /^(\d+):(.*)$/.exec(line);
+              if (match && currentFile) {
+                const relFile = path.relative(context.cwd, currentFile).replace(/\\/g, '/');
+                results.push(`${relFile}:${match[1]}: ${match[2].trim()}`);
+              } else {
+                currentFile = line.trim();
+              }
+              if (results.length >= 100) {
+                results.push('... [Truncated at 100 matches]');
+                break;
+              }
+            }
+          }
+        } catch {
+          // Fall back to JS implementation if rg encounters an issue
+          results = [];
+        }
       }
 
-      for (const file of files) {
-        const fullPath = path.join(searchRoot, file);
-        const relToCwd = path.relative(context.cwd, fullPath).replace(/\\/g, '/');
-        if (ig.ignores(relToCwd)) continue;
-
-        try {
-          const content = await fs.readFile(fullPath, 'utf8');
-          const lines = content.split('\n');
-
-          lines.forEach((line, idx) => {
-            if (regex.test(line)) {
-              results.push(`${relToCwd}:${idx + 1}: ${line.trim()}`);
-            }
-          });
-        } catch {
-          // Skip binary or unreadable files
-        }
-
-        if (results.length > 100) {
-          results.push(`... [Truncated at 100 matches]`);
-          break;
-        }
+      // If ripgrep wasn't available or produced empty/failed fallback
+      if (!hasRg || results.length === 0) {
+        results = await searchCodeFallback(patternStr, searchRoot, context.cwd);
       }
 
       if (results.length === 0) {

@@ -1,4 +1,5 @@
 import { ToolDefinition } from '../types.js';
+import { isSsrfSafeUrl } from './security.js';
 
 function stripHtml(html: string): string {
   return html
@@ -27,7 +28,11 @@ export const fetchWebTool: ToolDefinition = {
     },
     required: ['url']
   },
-  needsApproval: false,
+  needsApproval(args: any) {
+    // If URL is flagged or not safe, require approval
+    const check = isSsrfSafeUrl(args.url || '');
+    return !check.safe;
+  },
   async execute(args) {
     try {
       const url = args.url;
@@ -35,18 +40,62 @@ export const fetchWebTool: ToolDefinition = {
         return { result: 'Invalid URL. Must begin with http:// or https://', isError: true };
       }
 
+      // Check SSRF protection
+      const ssrfCheck = isSsrfSafeUrl(url);
+      if (!ssrfCheck.safe) {
+        return { result: `Security Error: ${ssrfCheck.reason}`, isError: true };
+      }
+
+      // Safe fetch with redirect manual inspection and size limit
+      const maxBytes = 2 * 1024 * 1024; // 2MB max download
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+
       const res = await fetch(url, {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         },
-        signal: AbortSignal.timeout(15000)
+        redirect: 'follow',
+        signal: controller.signal
       });
+      clearTimeout(timeoutId);
+
+      // Verify final redirected URL for SSRF
+      const finalUrl = res.url;
+      if (finalUrl) {
+        const finalCheck = isSsrfSafeUrl(finalUrl);
+        if (!finalCheck.safe) {
+          return { result: `Security Error after redirect: ${finalCheck.reason}`, isError: true };
+        }
+      }
 
       if (!res.ok) {
         return { result: `HTTP request failed with status ${res.status}: ${res.statusText}`, isError: true };
       }
 
-      const raw = await res.text();
+      // Read with stream limit
+      const reader = res.body?.getReader();
+      let raw = '';
+      let receivedBytes = 0;
+
+      if (reader) {
+        const decoder = new TextDecoder();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          receivedBytes += value.length;
+          if (receivedBytes > maxBytes) {
+            reader.cancel();
+            raw += decoder.decode(value);
+            raw += '\n[Response truncated: Exceeded maximum allowed size of 2MB]';
+            break;
+          }
+          raw += decoder.decode(value, { stream: true });
+        }
+      } else {
+        raw = await res.text();
+      }
+
       const clean = stripHtml(raw);
 
       // Truncate to ~4,000 characters to keep local model context budget safe

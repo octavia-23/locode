@@ -1,5 +1,6 @@
 import { execa } from 'execa';
 import { ToolDefinition } from '../types.js';
+import { resolveSafePath, isDangerousCommand } from './security.js';
 
 export const runCommandTool: ToolDefinition = {
   name: 'run_command',
@@ -18,10 +19,18 @@ export const runCommandTool: ToolDefinition = {
     },
     required: ['command']
   },
-  needsApproval: true,
+  needsApproval(args: any) {
+    // If command is dangerous, strictly require approval
+    return true;
+  },
   async execute(args, context) {
     try {
-      const workingDir = args.cwd ? args.cwd : context.cwd;
+      const workingDir = args.cwd ? resolveSafePath(args.cwd, context.cwd) : context.cwd;
+      const check = isDangerousCommand(args.command);
+      if (check.dangerous && !context.autoApprove) {
+        // High risk command detected
+      }
+
       const isWindows = process.platform === 'win32';
 
       // Run via shell (powershell / cmd on windows, sh on unix)

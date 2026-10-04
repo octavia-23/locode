@@ -1,13 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ToolDefinition } from '../types.js';
-
-function resolvePath(filePath: string, cwd: string): string {
-  if (path.isAbsolute(filePath)) {
-    return filePath;
-  }
-  return path.resolve(cwd, filePath);
-}
+import { resolveSafePath } from './security.js';
 
 export const viewFileTool: ToolDefinition = {
   name: 'view_file',
@@ -33,7 +27,7 @@ export const viewFileTool: ToolDefinition = {
   needsApproval: false,
   async execute(args, context) {
     try {
-      const fullPath = resolvePath(args.path, context.cwd);
+      const fullPath = resolveSafePath(args.path, context.cwd);
       const content = await fs.readFile(fullPath, 'utf8');
       const lines = content.split('\n');
       
@@ -77,7 +71,7 @@ export const writeFileTool: ToolDefinition = {
   needsApproval: true,
   async execute(args, context) {
     try {
-      const fullPath = resolvePath(args.path, context.cwd);
+      const fullPath = resolveSafePath(args.path, context.cwd);
       await fs.mkdir(path.dirname(fullPath), { recursive: true });
       await fs.writeFile(fullPath, args.content, 'utf8');
       return { result: `Successfully wrote ${args.content.length} characters to ${args.path}` };
@@ -111,7 +105,7 @@ export const editFileTool: ToolDefinition = {
   needsApproval: true,
   async execute(args, context) {
     try {
-      const fullPath = resolvePath(args.path, context.cwd);
+      const fullPath = resolveSafePath(args.path, context.cwd);
       const existing = await fs.readFile(fullPath, 'utf8');
       
       const target = args.target_content;

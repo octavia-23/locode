@@ -4,6 +4,8 @@ import { AgentLoop } from '../agent/loop.js';
 import { ILLMProvider } from '../providers/types.js';
 import { allTools } from '../tools/index.js';
 import { TerminalRenderer } from './renderer.js';
+import { HardwareDetector } from '../hardware/detector.js';
+import { CodeVerifier } from '../agent/verifier.js';
 
 export async function handleSlashCommand(
   input: string,
@@ -20,15 +22,21 @@ export async function handleSlashCommand(
     case '/help':
       console.log(`\n${chalk.bold.cyan('Available Slash Commands:')}`);
       console.log(`  ${chalk.yellow('/undo')}          - ⏪ Rollback workspace to state before the last agent turn`);
+      console.log(`  ${chalk.yellow('/verify [cmd]')}   - 🧪 Run background typecheck & test suite to verify code health`);
       console.log(`  ${chalk.yellow('/commit [msg]')}  - 🤖 Auto-generate or apply a git commit for current changes`);
+      console.log(`  ${chalk.yellow('/hardware')}      - ⚡ Inspect GPU, VRAM allocation, and layer offload stats`);
       console.log(`  ${chalk.yellow('/mcp')}           - 🔌 List connected Model Context Protocol (MCP) servers & tools`);
       console.log(`  ${chalk.yellow('/diff')}          - 📝 Show git status and pending changes in workspace`);
       console.log(`  ${chalk.yellow('/stats')}         - 📊 Display session token metrics and speed`);
       console.log(`  ${chalk.yellow('/model [name]')}  - 🔄 View current model or switch on the fly`);
+      console.log(`  ${chalk.yellow('/mode [type]')}   - 🔀 Toggle execution mode ('worker' fast lane vs 'architect' deep lane)`);
       console.log(`  ${chalk.yellow('/clear')}         - 🧹 Clear conversation memory and reset context`);
+
       console.log(`  ${chalk.yellow('/tools')}         - 🛠️ List all registered agent tools`);
       console.log(`  ${chalk.yellow('/exit')}          - 🚪 Exit Locode CLI\n`);
       return true;
+
+
 
     case '/mcp': {
       const mcp = agent.getMCPManager();
@@ -50,7 +58,43 @@ export async function handleSlashCommand(
       return true;
     }
 
+    case '/hardware': {
+
+      const hw = await HardwareDetector.getProfile();
+      const ctx = agent.getContext();
+      const activeCtx = ctx.numCtx || hw.recommendedCtx;
+
+      console.log(`\n${chalk.bold.cyan('⚡ Hardware & Inference Architecture (Truthful Telemetry):')}`);
+      console.log(`  • Compute Device:       ${chalk.white.bold(hw.deviceName)} [${chalk.magenta(hw.type.toUpperCase())}] (Detected)`);
+      if (hw.totalVramMb > 0) {
+        const usedVram = Math.max(0, hw.totalVramMb - hw.freeVramMb);
+        console.log(`  • Dedicated VRAM:       ${chalk.yellow(`${hw.totalVramMb} MB`)} (Free: ${chalk.green(`${hw.freeVramMb} MB`)}, In-use: ${chalk.gray(`${usedVram} MB`)}) (Detected)`);
+      }
+      console.log(`  • System Memory:        ${chalk.yellow(`${hw.totalRamMb} MB`)} (Free: ${chalk.green(`${hw.freeRamMb} MB`)}) (Detected)`);
+      console.log(`  • Inference Backend:    ${chalk.cyan(hw.backend)} (Configured)`);
+      console.log(`  • Selected Model:       ${chalk.cyan(ctx.model)} (Runtime Selected)`);
+      console.log(`  • Context Window:       ${chalk.cyan(activeCtx.toLocaleString())} tokens (Tuned: ${hw.recommendedCtx.toLocaleString()})`);
+
+      const offloadStatus = hw.measuredGpuOffloadVerified
+        ? chalk.green.bold('✔ Measured 100% GPU Offload (Verified via runtime telemetry)')
+        : (hw.estimatedFullOffload7B
+          ? chalk.blue.bold('ℹ Recommended Full GPU Offload (Heuristic memory budget calculation)')
+          : chalk.yellow.bold('⚠ Hybrid Offload (Layers likely split across GPU & CPU)'));
+      console.log(`  • Offload Status:       ${offloadStatus}`);
+      console.log(`  • KV Cache Target:      ${chalk.gray(hw.recommendedKvCache)} (Recommended heuristic, runtime enforcement: ${hw.isKvCacheRuntimeEnforced ? 'active' : 'unsupported without custom Modelfile'})`);
+
+      if (hw.notes.length > 0) {
+        console.log(`\n${chalk.bold('Architecture Notes:')}`);
+        for (const note of hw.notes) {
+          console.log(`  ${chalk.dim('→')} ${chalk.gray(note)}`);
+        }
+      }
+      console.log();
+      return true;
+    }
+
     case '/undo': {
+
       renderer.startSpinner('Rolling back to previous checkpoint...');
       const result = await agent.undo();
       renderer.stopSpinner();
@@ -62,7 +106,29 @@ export async function handleSlashCommand(
       return true;
     }
 
+    case '/verify': {
+      renderer.startSpinner('Detecting and running workspace health check...');
+      const vResult = await CodeVerifier.run(cwd, arg || undefined);
+      renderer.stopSpinner();
+
+      if (!vResult.command) {
+        console.log(chalk.gray('\nNo automated test or typecheck suite detected in current workspace.\n'));
+        return true;
+      }
+
+      console.log(`\n${chalk.bold.cyan('🧪 Workspace Health & Verification Report:')}`);
+      console.log(`  • Tool/Command: ${chalk.yellow(vResult.command)}`);
+      if (vResult.passed) {
+        console.log(`  • Status:       ${chalk.green.bold('✔ PASSED (0 errors, build clean)')}\n`);
+      } else {
+        console.log(`  • Status:       ${chalk.red.bold('✖ FAILED')}`);
+        console.log(chalk.red(`\n${vResult.errorOutput}\n`));
+      }
+      return true;
+    }
+
     case '/commit': {
+
       try {
         const diffRes = await execa('git diff HEAD', { cwd, shell: true });
         const statusRes = await execa('git status -s', { cwd, shell: true });
@@ -133,10 +199,43 @@ export async function handleSlashCommand(
       }
       return true;
 
-    case '/clear':
+    case '/mode': {
+      const currentMode = agent.getContext().mode || 'worker';
+      const architectModel = agent.getContext().architectModel || agent.getContext().model;
+
+      if (!arg) {
+        console.log(`\n${chalk.bold.cyan('🔀 Agent Execution Mode:')}`);
+        console.log(`  • Active Mode:      ${currentMode === 'architect' ? chalk.magenta.bold('🏛️ ARCHITECT (Deep Reasoning & Contract Planning)') : chalk.green.bold('⚡ WORKER (Fast Lane @ ~50 tok/s)')}`);
+        console.log(`  • Worker Model:     ${chalk.cyan(agent.getContext().model)}`);
+        console.log(`  • Architect Model:  ${chalk.magenta(architectModel)}`);
+        console.log(chalk.gray(`\n  Switch with: ${chalk.yellow('/mode worker')} or ${chalk.yellow('/mode architect [optional-model]')}\n`));
+        return true;
+      }
+
+      const modeLower = arg.toLowerCase().split(' ')[0];
+      const modelArg = arg.split(' ')[1];
+
+      if (modeLower === 'architect' || modeLower === 'deep') {
+        agent.setContext({
+          mode: 'architect',
+          ...(modelArg ? { architectModel: modelArg } : {})
+        });
+        renderer.printSuccess(`Switched to Architect Mode (Deep structural planning active).`);
+      } else if (modeLower === 'worker' || modeLower === 'fast') {
+        agent.setContext({ mode: 'worker' });
+        renderer.printSuccess(`Switched to Worker Mode (Fast lane active @ ~50 tok/s).`);
+      } else {
+        renderer.printError(`Unknown mode "${arg}". Choose 'worker' or 'architect'.`);
+      }
+      return true;
+    }
+
+    case '/clear': {
       await agent.clearHistory();
       renderer.printSuccess('Conversation context reset.');
       return true;
+    }
+
 
     case '/diff':
       try {

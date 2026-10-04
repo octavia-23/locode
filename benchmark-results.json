@@ -1,0 +1,76 @@
+{
+  "timestamp": "2026-10-04T18:37:11.589Z",
+  "platform": "win32 (x64)",
+  "totalDurationSeconds": 8.13,
+  "hardware": {
+    "device": "NVIDIA GeForce RTX 4050 Laptop GPU",
+    "ramMb": 16025,
+    "vramMb": 6141,
+    "recommendedCtx": 8192,
+    "measuredGpuOffloadVerified": false,
+    "estimatedFullOffload7B": true
+  },
+  "selfRepair": {
+    "totalCases": 5,
+    "successfulRepairs": 5,
+    "failedRepairs": 0,
+    "successRate": 100,
+    "avgRepairAttempts": 1.2,
+    "avgVerificationRuns": 3,
+    "architectEscalations": 1,
+    "avgTimeMs": 1508,
+    "caseResults": [
+      {
+        "id": "ts-type-error",
+        "name": "TypeScript Interface Property Mismatch (TS2339)",
+        "category": "TypeScript Type Error",
+        "success": true,
+        "repairAttempts": 1,
+        "verificationRuns": 3,
+        "architectEscalated": false,
+        "elapsedMs": 1438
+      },
+      {
+        "id": "broken-contract",
+        "name": "Async API Contract Mismatch (Missing Promise Resolution)",
+        "category": "Function/API Contract",
+        "success": true,
+        "repairAttempts": 1,
+        "verificationRuns": 3,
+        "architectEscalated": false,
+        "elapsedMs": 1487
+      },
+      {
+        "id": "failing-unit-test",
+        "name": "Math Calculator Off-By-One Logic Error",
+        "category": "Failing Unit Test",
+        "success": true,
+        "repairAttempts": 1,
+        "verificationRuns": 3,
+        "architectEscalated": false,
+        "elapsedMs": 1425
+      },
+      {
+        "id": "missing-import",
+        "name": "Unresolved Dependency Symbol (ReferenceError)",
+        "category": "Missing Import",
+        "success": true,
+        "repairAttempts": 1,
+        "verificationRuns": 3,
+        "architectEscalated": false,
+        "elapsedMs": 1381
+      },
+      {
+        "id": "incorrect-return-value",
+        "name": "Authentication Status Return Value Reversal",
+        "category": "Incorrect Return Value",
+        "success": true,
+        "repairAttempts": 2,
+        "verificationRuns": 3,
+        "architectEscalated": true,
+        "elapsedMs": 1808
+      }
+    ]
+  },
+  "liveInferenceSpeed": "38.3 tok/s"
+}

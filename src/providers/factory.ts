@@ -13,5 +13,6 @@ export function createLLMProvider(context: AgentContext): ILLMProvider {
   }
 
   // Default: Ollama
-  return new OllamaProvider(context.model, context.ollamaHost);
+  return new OllamaProvider(context.model, context.ollamaHost, context.numCtx);
 }
+

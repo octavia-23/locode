@@ -7,7 +7,7 @@ export class OllamaProvider implements ILLMProvider {
   private host: string;
   private numCtx: number;
 
-  constructor(model: string = 'qwen2.5-coder:7b', host: string = 'http://127.0.0.1:11434', numCtx: number = 16384) {
+  constructor(model: string = 'qwen2.5-coder:7b', host: string = 'http://127.0.0.1:11434', numCtx: number = 8192) {
     this.model = model;
     this.host = host;
     this.numCtx = numCtx;
@@ -20,6 +20,15 @@ export class OllamaProvider implements ILLMProvider {
   getModel(): string {
     return this.model;
   }
+
+  getNumCtx(): number {
+    return this.numCtx;
+  }
+
+  setNumCtx(numCtx: number): void {
+    this.numCtx = numCtx;
+  }
+
 
   async isHealthy(): Promise<boolean> {
     try {

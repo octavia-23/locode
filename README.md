@@ -5,7 +5,7 @@
 > *A private, local-first alternative to Claude Code engineered specifically to maximize throughput and agent reliability on 6GB–8GB GPUs.*
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Non--Commercial](https://img.shields.io/badge/License-Non--Commercial-orange.svg)](#-license)
 [![Hardware: NVIDIA RTX | Apple Silicon](https://img.shields.io/badge/Hardware-NVIDIA%20RTX%20%7C%20Apple%20Silicon-green.svg)](#-hardware-aware-engine)
 [![Tests: 26/26 Passing](https://img.shields.io/badge/Tests-26%20Passing-brightgreen.svg)](#-testing)
 
@@ -229,4 +229,4 @@ npm run benchmark
 ---
 
 ## 📜 License
-MIT License. Created for local-first AI developer agent research and engineering.
+Source-Available Non-Commercial License. Copyright (c) 2026 Akshat Yadav. All rights reserved. Free for personal, educational, research, and non-commercial development. Commercial use, resale, or deployment requires written permission (see [LICENSE](LICENSE)).

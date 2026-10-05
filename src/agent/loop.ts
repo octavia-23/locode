@@ -540,10 +540,19 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
       if (duplicateCallCount >= 4) {
         this.stats.progressLoopsDetected++;
         this.renderer.printWarning('Detected repetitive identical tool execution loop. Intervening with recovery directive...');
-        this.messages.push({
-          role: 'user',
-          content: `[PROGRESS GUARD WARNING] You have executed the exact same tool action ${duplicateCallCount} times without progressing. Please assess alternate files, verify your changes with 'run_command', or provide your final conclusion.`
-        });
+        
+        // Reset recent signature history so the model has a chance to execute the new directive without immediately re-triggering
+        progress.recentToolSignatures = [];
+
+        // Return a tool result warning for each requested tool call so conversation invariants and tool_call pairings remain valid
+        for (const call of toolCalls) {
+          this.messages.push({
+            role: 'tool',
+            name: call.function.name,
+            tool_call_id: call.id,
+            content: `[PROGRESS GUARD WARNING] This exact tool action has been called ${duplicateCallCount} times without making new progress. Do not repeat this identical call. Please inspect an alternate file, run verification via run_command, or provide your final response.`
+          });
+        }
         continue;
       }
 

@@ -10,12 +10,14 @@ export interface HardwareProfile {
   freeVramMb: number;
   totalRamMb: number;
   freeRamMb: number;
+  cpuModel?: string;
+  cpuThreads?: number;
   recommendedCtx: number;
   // Truthful breakdown:
-  backend: 'ollama' | 'openai-compatible' | 'cpu';
+  backend: 'ollama' | 'openai-compatible' | 'llamacpp' | 'cpu';
   selectedModel: string;
   selectedCtx: number;
-  recommendedKvCache: 'f16' | 'q8_0' | 'q4_0';
+  recommendedKvCache: 'turbo4' | 'f16' | 'q8_0' | 'q4_0';
   isKvCacheRuntimeEnforced: boolean; // Indicates if runtime directly enforces KV quantization
   estimatedFullOffload7B: boolean; // Truthful: estimated recommendation based on memory budget
   measuredGpuOffloadVerified: boolean; // Truthful: true ONLY if confirmed via runtime API/logs
@@ -44,6 +46,9 @@ export class HardwareDetector {
 
     const totalRamMb = Math.round(os.totalmem() / (1024 * 1024));
     const freeRamMb = Math.round(os.freemem() / (1024 * 1024));
+    const cpus = os.cpus();
+    const cpuModel = cpus.length > 0 ? cpus[0].model.trim() : 'Generic CPU';
+    const cpuThreads = cpus.length;
 
     // 1. Try detecting NVIDIA GPU via nvidia-smi
     const nvidia = await this.detectNvidia();
@@ -51,15 +56,22 @@ export class HardwareDetector {
       const { name, totalVram, freeVram } = nvidia;
       const notes: string[] = [];
       let recommendedCtx = 8192;
-      let recommendedKvCache: 'f16' | 'q8_0' | 'q4_0' = 'f16';
+      let recommendedKvCache: 'turbo4' | 'f16' | 'q8_0' | 'q4_0' = 'f16';
       let estimatedFullOffload7B = true;
 
       // 6GB cards (e.g. RTX 4050 Laptop / RTX 3060 Laptop 6GB)
       if (totalVram <= 6500) {
-        recommendedCtx = 8192;
+        // If 35B A3B Qwen model is used, TurboQuant enables 32768 context comfortably
+        const isQwen35B = activeModel.toLowerCase().includes('35b') || activeModel.toLowerCase().includes('a3b');
+        recommendedCtx = isQwen35B ? 32768 : 8192;
+        recommendedKvCache = isQwen35B ? 'turbo4' : 'f16';
         estimatedFullOffload7B = true;
-        notes.push('Heuristic: Context tuned to 8,192 to prevent 7B weights from spilling to system RAM.');
-        notes.push('Estimated: 29/29 layers fit in VRAM with FP16 KV-cache under 8k context.');
+        notes.push('Heuristic: 6GB VRAM detected (RTX 4050 Laptop). Auto-tuning TurboQuant profile.');
+        if (isQwen35B) {
+          notes.push('TurboQuant + MoE offload enables 32K context with MoE layers shared with system RAM.');
+        } else {
+          notes.push('Context tuned to 8,192 to prevent 7B weights from spilling to system RAM.');
+        }
       } else if (totalVram <= 8500) {
         recommendedCtx = 16384;
         estimatedFullOffload7B = true;
@@ -79,14 +91,16 @@ export class HardwareDetector {
         freeVramMb: freeVram,
         totalRamMb,
         freeRamMb,
+        cpuModel,
+        cpuThreads,
         recommendedCtx,
-        backend: 'ollama',
+        backend: 'llamacpp',
         selectedModel: activeModel,
         selectedCtx: requestedCtx || recommendedCtx,
         recommendedKvCache,
-        isKvCacheRuntimeEnforced: false, // Truthful: Ollama CLI does not expose direct KV flag without custom Modelfile
+        isKvCacheRuntimeEnforced: recommendedKvCache === 'turbo4',
         estimatedFullOffload7B,
-        measuredGpuOffloadVerified: false, // Truthful: Heuristic until runtime telemetry is read
+        measuredGpuOffloadVerified: false,
         notes
       };
 
@@ -107,6 +121,8 @@ export class HardwareDetector {
             freeVramMb: freeRamMb,
             totalRamMb,
             freeRamMb,
+            cpuModel,
+            cpuThreads,
             recommendedCtx,
             backend: 'ollama',
             selectedModel: activeModel,
@@ -124,8 +140,6 @@ export class HardwareDetector {
     }
 
     // 3. Fallback: CPU Only
-    const cpus = os.cpus();
-    const cpuModel = cpus.length > 0 ? cpus[0].model : 'Generic CPU';
     const profile: HardwareProfile = {
       type: 'cpu',
       deviceName: `${cpuModel} (${cpus.length} cores)`,
@@ -133,6 +147,8 @@ export class HardwareDetector {
       freeVramMb: 0,
       totalRamMb,
       freeRamMb,
+      cpuModel,
+      cpuThreads,
       recommendedCtx: 4096,
       backend: 'cpu',
       selectedModel: activeModel,

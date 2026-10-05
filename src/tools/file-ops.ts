@@ -44,6 +44,10 @@ export const viewFileTool: ToolDefinition = {
         header += `[Note: Truncated to line ${end}. Use start_line=${end + 1} to read more]\n`;
       }
 
+      if (context.contextEngine?.recordFileRead) {
+        context.contextEngine.recordFileRead(args.path, content);
+      }
+
       return { result: header + formatted };
     } catch (err: any) {
       return { result: `Failed to read file "${args.path}": ${err.message}`, isError: true };
@@ -74,6 +78,9 @@ export const writeFileTool: ToolDefinition = {
       const fullPath = resolveSafePath(args.path, context.cwd);
       await fs.mkdir(path.dirname(fullPath), { recursive: true });
       await fs.writeFile(fullPath, args.content, 'utf8');
+      if (context.contextEngine?.invalidateFile) {
+        context.contextEngine.invalidateFile(args.path);
+      }
       return { result: `Successfully wrote ${args.content.length} characters to ${args.path}` };
     } catch (err: any) {
       return { result: `Failed to write file "${args.path}": ${err.message}`, isError: true };
@@ -147,6 +154,9 @@ export const editFileTool: ToolDefinition = {
       }
 
       await fs.writeFile(fullPath, newContent, 'utf8');
+      if (context.contextEngine?.invalidateFile) {
+        context.contextEngine.invalidateFile(args.path);
+      }
       return { result: `Successfully updated ${args.path}` };
     } catch (err: any) {
       return { result: `Failed to edit file "${args.path}": ${err.message}`, isError: true };

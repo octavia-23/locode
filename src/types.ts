@@ -25,6 +25,7 @@ export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   name?: string;
+  tool_call_id?: string;
   tool_calls?: Array<{
     id?: string;
     type?: string;
@@ -36,19 +37,20 @@ export interface ChatMessage {
 }
 
 import { HardwareProfile } from './hardware/detector.js';
+import { LlamaRuntimeConfig } from './runtime/profiles.js';
 
 export interface AgentContext {
   cwd: string;
   autoApprove: boolean;
   model: string;
   ollamaHost: string;
-  provider?: 'ollama' | 'openai' | 'lmstudio' | 'vllm';
+  provider?: 'ollama' | 'openai' | 'lmstudio' | 'vllm' | 'llamacpp';
   apiBase?: string;
   apiKey?: string;
   numCtx?: number;
   hardwareProfile?: HardwareProfile;
   architectModel?: string;
   mode?: 'worker' | 'architect';
+  llamaConfig?: Partial<LlamaRuntimeConfig>;
+  contextEngine?: any;
 }
-
-

@@ -29,6 +29,8 @@ export async function handleSlashCommand(
       console.log(`  ${chalk.yellow('/diff')}          - 📝 Show git status and pending changes in workspace`);
       console.log(`  ${chalk.yellow('/stats')}         - 📊 Display session token metrics and speed`);
       console.log(`  ${chalk.yellow('/model [name]')}  - 🔄 View current model or switch on the fly`);
+      console.log(`  ${chalk.yellow('/context [size]')} - 📏 Switch context window (e.g. 32k, 64k, 16k)`);
+      console.log(`  ${chalk.yellow('/profile [name]')} - ⚙️ Switch inference profile (performance, large-context, balanced)`);
       console.log(`  ${chalk.yellow('/mode [type]')}   - 🔀 Toggle execution mode ('worker' fast lane vs 'architect' deep lane)`);
       console.log(`  ${chalk.yellow('/clear')}         - 🧹 Clear conversation memory and reset context`);
 
@@ -164,11 +166,22 @@ export async function handleSlashCommand(
         : '0.0';
       const sec = (stats.totalDurationMs / 1000).toFixed(1);
 
-      console.log(`\n${chalk.bold.cyan('📊 Locode Session Statistics:')}`);
-      console.log(`  • Turns completed:     ${chalk.yellow(stats.turns)}`);
+      console.log(`\n${chalk.bold.cyan('📊 Locode Session Statistics & Context Efficiency:')}`);
+      console.log(`  • User turns:          ${chalk.yellow(stats.turns)}`);
+      console.log(`  • Model calls:         ${chalk.yellow(stats.modelCalls)}`);
+      console.log(`  • Tool executions:     ${chalk.cyan(stats.toolCalls)} (${chalk.green(`${stats.successfulToolCalls} ok`)}, ${chalk.red(`${stats.failedToolCalls} fail`)})`);
+      console.log(`  • Empty recoveries:    ${chalk.yellow(stats.recoveries)} (out of ${stats.emptyGenerations} empty gens)`);
+      if (stats.progressLoopsDetected > 0) {
+        console.log(`  • Progress loop traps: ${chalk.magenta(stats.progressLoopsDetected)}`);
+      }
+      if (stats.verificationRuns > 0) {
+        console.log(`  • Verification runs:   ${chalk.green(stats.verificationRuns)}`);
+      }
       console.log(`  • Total tokens:        ${chalk.yellow(stats.totalTokens.toLocaleString())}`);
       console.log(`  • Prompt tokens:       ${chalk.gray(stats.promptTokens.toLocaleString())}`);
       console.log(`  • Generated tokens:    ${chalk.green(stats.completionTokens.toLocaleString())}`);
+      console.log(`  • Compressed tokens:   ${chalk.greenBright(`+${stats.tokensSavedByCompression.toLocaleString()} saved`)}`);
+      console.log(`  • Avoided dedupe:      ${chalk.cyanBright(`+${stats.tokensAvoidedByDeduplication.toLocaleString()} saved`)}`);
       console.log(`  • Total runtime:       ${chalk.cyan(`${sec}s`)}`);
       console.log(`  • Average speed:       ${chalk.magenta(`${avgTps} tok/s`)}\n`);
       return true;
@@ -198,6 +211,65 @@ export async function handleSlashCommand(
         renderer.printSuccess(`Model switched to ${chalk.cyan(arg)}`);
       }
       return true;
+
+    case '/context':
+    case '/ctx': {
+      const currentCtx = agent.getContext().numCtx || 32768;
+      if (!arg) {
+        console.log(`\n${chalk.bold.cyan('📏 Active Context Window:')} ${chalk.yellow(currentCtx.toLocaleString())} tokens`);
+        console.log(chalk.gray(`  Switch context window on the fly:`));
+        console.log(`  • ${chalk.yellow('/context 8k')}   (8,192 tokens)`);
+        console.log(`  • ${chalk.yellow('/context 16k')}  (16,384 tokens)`);
+        console.log(`  • ${chalk.yellow('/context 32k')}  (32,768 tokens - Default TurboQuant Profile)`);
+        console.log(`  • ${chalk.yellow('/context 64k')}  (65,536 tokens - Extended Context Profile)\n`);
+        return true;
+      }
+
+      let parsed = parseInt(arg.toLowerCase().replace(/k$/, '000').replace(/kb$/, '000'), 10);
+      if (arg.toLowerCase() === '8k') parsed = 8192;
+      else if (arg.toLowerCase() === '16k') parsed = 16384;
+      else if (arg.toLowerCase() === '32k') parsed = 32768;
+      else if (arg.toLowerCase() === '64k') parsed = 65536;
+
+      if (!parsed || isNaN(parsed) || parsed < 1024) {
+        renderer.printError(`Invalid context size "${arg}". Choose 8k, 16k, 32k, or 64k.`);
+        return true;
+      }
+
+      agent.setContext({ numCtx: parsed });
+      renderer.printSuccess(`Context window switched to ${chalk.cyan(parsed.toLocaleString())} tokens.`);
+      return true;
+    }
+
+    case '/profile': {
+      const ctx = agent.getContext();
+      const currentProfile = (ctx.llamaConfig as any)?.profileName || 'performance';
+      if (!arg) {
+        console.log(`\n${chalk.bold.cyan('⚙️ Inference Profiles:')}`);
+        console.log(`  Active: ${chalk.green.bold(currentProfile)}`);
+        console.log(`  Available:`);
+        console.log(`  • ${chalk.yellow('performance')}   - 32K context, MoE 24, Turbo4 KV (Default RTX 4050 6GB)`);
+        console.log(`  • ${chalk.yellow('large-context')} - 64K context, MoE 24, Turbo4 KV (Extended long-range)`);
+        console.log(`  • ${chalk.yellow('balanced')}      - 16K context, MoE 28, safer RAM/VRAM footprint`);
+        console.log(chalk.dim(`\nSwitch with: /profile <name>\n`));
+        return true;
+      }
+
+      const pName = arg.trim().toLowerCase();
+      if (pName === 'performance') {
+        agent.setContext({ numCtx: 32768, llamaConfig: { profileName: 'performance', contextSize: 32768 } });
+        renderer.printSuccess(`Switched to Performance profile (32K context, Turbo4 KV, 24 MoE layers).`);
+      } else if (pName === 'large-context' || pName === '64k') {
+        agent.setContext({ numCtx: 65536, llamaConfig: { profileName: 'large-context', contextSize: 65536 } });
+        renderer.printSuccess(`Switched to Large Context profile (64K context, Turbo4 KV).`);
+      } else if (pName === 'balanced') {
+        agent.setContext({ numCtx: 16384, llamaConfig: { profileName: 'balanced', contextSize: 16384 } });
+        renderer.printSuccess(`Switched to Balanced profile (16K context, 28 MoE layers).`);
+      } else {
+        renderer.printError(`Unknown profile "${arg}". Available: performance, large-context, balanced.`);
+      }
+      return true;
+    }
 
     case '/mode': {
       const currentMode = agent.getContext().mode || 'worker';

@@ -29,12 +29,13 @@ export class TerminalRenderer {
     }
   }
 
-  printHeader(model: string, cwd: string, autoApprove: boolean, hardwareProfile?: HardwareProfile, numCtx?: number) {
+  printHeader(model: string, cwd: string, autoApprove: boolean, hardwareProfile?: HardwareProfile, numCtx?: number, providerName?: string) {
     const title = chalk.bold.hex('#61afef')('╔═══════════════════════════════════════════════════════╗');
     const name  = chalk.bold.hex('#61afef')('║   🤖 LOCODE - Local-First AI Developer CLI (Node.js)  ║');
     const foot  = chalk.bold.hex('#61afef')('╚═══════════════════════════════════════════════════════╝');
     console.log(`\n${title}\n${name}\n${foot}`);
-    console.log(chalk.gray(`  Model:     ${chalk.cyan(model)} (via Ollama)`));
+    const provDisplay = providerName === 'llamacpp' ? 'TurboQuant (llama.cpp)' : (providerName || 'Ollama');
+    console.log(chalk.gray(`  Model:     ${chalk.cyan(model)} (via ${provDisplay})`));
     if (hardwareProfile) {
       const memStr = hardwareProfile.totalVramMb > 0
         ? `${(hardwareProfile.totalVramMb / 1024).toFixed(1)} GB VRAM`

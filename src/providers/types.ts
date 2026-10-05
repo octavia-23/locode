@@ -3,6 +3,8 @@ import { ChatMessage, ToolDefinition } from '../types.js';
 export interface ChatProviderResponse {
   content: string;
   tool_calls?: Array<{
+    id?: string;
+    type?: string;
     function: {
       name: string;
       arguments: Record<string, any>;

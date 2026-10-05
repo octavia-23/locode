@@ -1,12 +1,13 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { confirm } from '@inquirer/prompts';
 import chalk from 'chalk';
 import { AgentContext, ChatMessage } from '../types.js';
 import { allTools, toolRegistry } from '../tools/index.js';
 import { ILLMProvider } from '../providers/types.js';
 import { createLLMProvider } from '../providers/factory.js';
-import { ContextManager } from './context.js';
+import { ContextEngine } from './context.js';
 import { TerminalRenderer } from '../ui/renderer.js';
 import { buildSystemPrompt } from './prompt.js';
 import { CheckpointManager } from '../git/checkpoint.js';
@@ -15,41 +16,101 @@ import { MCPManager } from '../mcp/manager.js';
 import { CodeVerifier } from './verifier.js';
 import { ArchitectEngine } from './architect.js';
 
-
-
 export interface SessionStats {
   turns: number;
   totalTokens: number;
   promptTokens: number;
   completionTokens: number;
   totalDurationMs: number;
+  modelCalls: number;
+  toolCalls: number;
+  successfulToolCalls: number;
+  failedToolCalls: number;
+  emptyGenerations: number;
+  recoveries: number;
+  retries: number;
+  progressLoopsDetected: number;
+  verificationRuns: number;
+  tokensSavedByCompression: number;
+  tokensAvoidedByDeduplication: number;
+}
+
+export type GenerationOutcomeType =
+  | 'TOOL_CALLS'
+  | 'TEXT_FINAL'
+  | 'EMPTY_RESPONSE'
+  | 'MALFORMED_TOOL_CALL'
+  | 'PROVIDER_ERROR_RETRYABLE'
+  | 'PROVIDER_ERROR_FATAL';
+
+export interface NormalizedGeneration {
+  type: GenerationOutcomeType;
+  rawContent: string;
+  cleanedText: string;
+  toolCalls?: Array<{
+    id?: string;
+    type?: string;
+    function: {
+      name: string;
+      arguments: Record<string, any>;
+    };
+  }>;
+  errorMessage?: string;
+  usage?: {
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    durationMs: number;
+    tokensPerSecond: number;
+  };
+}
+
+export interface ProgressTracker {
+  recentToolSignatures: string[];
+  recentFailureSignatures: string[];
+  filesModified: Set<string>;
+  successfulToolCount: number;
+  failedToolCount: number;
+  consecutiveNoProgressCount: number;
+  consecutiveEmptyResponses: number;
 }
 
 export class AgentLoop {
   private messages: ChatMessage[] = [];
   private provider: ILLMProvider;
   private renderer: TerminalRenderer;
-  private contextManager: ContextManager;
+  private contextEngine: ContextEngine;
   private context: AgentContext;
   private checkpointManager: CheckpointManager;
+  private mcpManager: MCPManager;
   private stats: SessionStats = {
     turns: 0,
     totalTokens: 0,
     promptTokens: 0,
     completionTokens: 0,
-    totalDurationMs: 0
+    totalDurationMs: 0,
+    modelCalls: 0,
+    toolCalls: 0,
+    successfulToolCalls: 0,
+    failedToolCalls: 0,
+    emptyGenerations: 0,
+    recoveries: 0,
+    retries: 0,
+    progressLoopsDetected: 0,
+    verificationRuns: 0,
+    tokensSavedByCompression: 0,
+    tokensAvoidedByDeduplication: 0
   };
 
   constructor(context: AgentContext, renderer: TerminalRenderer, customProvider?: ILLMProvider) {
     this.context = context;
     this.renderer = renderer;
     this.provider = customProvider || createLLMProvider(context);
-    this.contextManager = new ContextManager(context.numCtx || 8192);
+    this.contextEngine = new ContextEngine(context.numCtx || 8192, context.cwd);
+    this.context.contextEngine = this.contextEngine;
     this.checkpointManager = new CheckpointManager(context.cwd);
     this.mcpManager = new MCPManager(context.cwd);
   }
-
-  private mcpManager: MCPManager;
 
   async init() {
     this.messages = [{
@@ -76,6 +137,10 @@ export class AgentLoop {
     return this.mcpManager;
   }
 
+  getContextEngine(): ContextEngine {
+    return this.contextEngine;
+  }
+
   async close() {
     await this.mcpManager.closeAll();
   }
@@ -85,6 +150,13 @@ export class AgentLoop {
     if (context.model) {
       this.provider.setModel(context.model);
     }
+    if (context.numCtx) {
+      if (this.provider.setNumCtx) {
+        this.provider.setNumCtx(context.numCtx);
+      }
+      this.contextEngine.setMaxTokens(context.numCtx);
+    }
+    this.context.contextEngine = this.contextEngine;
   }
 
   getProvider(): ILLMProvider {
@@ -95,9 +167,13 @@ export class AgentLoop {
     return this.context;
   }
 
-
   getStats(): SessionStats {
-    return this.stats;
+    const engineStats = this.contextEngine.getStats();
+    return {
+      ...this.stats,
+      tokensSavedByCompression: engineStats.tokensSavedByCompression,
+      tokensAvoidedByDeduplication: engineStats.tokensAvoidedByDeduplication
+    };
   }
 
   async clearHistory() {
@@ -131,6 +207,105 @@ export class AgentLoop {
     }
   }
 
+  /**
+   * Normalizes raw LLM generation results into structured outcomes,
+   * cleanly distinguishing text responses, tool calls, empty responses, and provider errors.
+   */
+  private normalizeResponse(response: any, rawError?: any): NormalizedGeneration {
+    if (rawError) {
+      const msg = rawError.message || String(rawError);
+      const isRetryable = /timeout|econnreset|econnrefused|fetch failed|network|socket|503|502|429/i.test(msg);
+      return {
+        type: isRetryable ? 'PROVIDER_ERROR_RETRYABLE' : 'PROVIDER_ERROR_FATAL',
+        rawContent: '',
+        cleanedText: '',
+        errorMessage: msg
+      };
+    }
+
+    const content = response.content || '';
+    let toolCalls = response.tool_calls;
+
+    // Standardize tool calls if present
+    let formattedToolCalls: Array<{ id?: string; type?: string; function: { name: string; arguments: Record<string, any> } }> | undefined;
+    if (toolCalls && Array.isArray(toolCalls) && toolCalls.length > 0) {
+      formattedToolCalls = toolCalls.map((tc: any, idx: number) => {
+        let args = tc.function?.arguments;
+        if (typeof args === 'string') {
+          try {
+            args = JSON.parse(args);
+          } catch {
+            args = {};
+          }
+        }
+        return {
+          id: tc.id || `call_${Date.now()}_${idx}`,
+          type: 'function',
+          function: {
+            name: tc.function?.name || '',
+            arguments: args || {}
+          }
+        };
+      });
+    }
+
+    // Clean text by stripping embedded tool call tags/blocks
+    let cleanedText = content.trim();
+    if (formattedToolCalls && formattedToolCalls.length > 0) {
+      cleanedText = cleanedText
+        .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+        .replace(/```(?:json)?\s*\{\s*"name"\s*:\s*"[^"]+".*?\}\s*```/gis, '')
+        .trim();
+    }
+
+    const isJustJson = (cleanedText.startsWith('{') && cleanedText.endsWith('}')) ||
+                       (cleanedText.startsWith('<tool_call>') && cleanedText.endsWith('</tool_call>'));
+    if (isJustJson && (!formattedToolCalls || formattedToolCalls.length === 0)) {
+      // Check if text was a malformed tool call attempt
+      try {
+        const parsed = JSON.parse(cleanedText);
+        if (parsed.name) {
+          formattedToolCalls = [{
+            id: `call_${Date.now()}_0`,
+            type: 'function',
+            function: {
+              name: parsed.name,
+              arguments: parsed.arguments || {}
+            }
+          }];
+          cleanedText = '';
+        }
+      } catch {}
+    }
+
+    if (formattedToolCalls && formattedToolCalls.length > 0) {
+      return {
+        type: 'TOOL_CALLS',
+        rawContent: content,
+        cleanedText: isJustJson ? '' : cleanedText,
+        toolCalls: formattedToolCalls,
+        usage: response.usage
+      };
+    }
+
+    // If completely empty or whitespace only
+    if (!content.trim()) {
+      return {
+        type: 'EMPTY_RESPONSE',
+        rawContent: '',
+        cleanedText: '',
+        usage: response.usage
+      };
+    }
+
+    return {
+      type: 'TEXT_FINAL',
+      rawContent: content,
+      cleanedText: isJustJson ? '' : cleanedText,
+      usage: response.usage
+    };
+  }
+
   async run(userInput: string) {
     if (this.messages.length === 0) {
       await this.init();
@@ -145,62 +320,128 @@ export class AgentLoop {
       this.renderer.printMentionedFiles(injectedFiles);
     }
 
+    this.contextEngine.setObjective(userInput);
+
     this.messages.push({
       role: 'user',
       content: processedPrompt
     });
 
-    const maxSteps = 25;
+    // Adaptive execution budget instead of a tiny rigid step ceiling:
+    // A complex refactor can legitimately take dozens of tool calls,
+    // while non-progress loops or pathological repetitions terminate deterministically.
+    const safetyCeiling = 150;
     let stepCount = 0;
     let hasModifiedCode = false;
     let repairAttempts = 0;
     const maxRepairAttempts = 3;
 
-    while (stepCount < maxSteps) {
+    const progress: ProgressTracker = {
+      recentToolSignatures: [],
+      recentFailureSignatures: [],
+      filesModified: new Set<string>(),
+      successfulToolCount: 0,
+      failedToolCount: 0,
+      consecutiveNoProgressCount: 0,
+      consecutiveEmptyResponses: 0
+    };
+
+    while (stepCount < safetyCeiling) {
       stepCount++;
 
       // Compact context if history grows large
-      const compacted = this.contextManager.compactMessages(this.messages);
+      const compacted = this.contextEngine.compactMessages(this.messages);
 
       this.renderer.startSpinner(`Thinking with ${chalk.cyan(this.context.model)}...`);
 
-      let response;
+      let rawResponse: any;
+      let rawError: any;
       try {
-        response = await this.provider.chat(compacted, allTools);
+        rawResponse = await this.provider.chat(compacted, allTools);
       } catch (err: any) {
-        this.renderer.printError(`Model request failed: ${err.message}`);
-        break;
+        rawError = err;
+      } finally {
+        // Guarantee spinner is ALWAYS stopped upon completion of model invocation
+        this.renderer.stopSpinner();
       }
 
-      this.renderer.stopSpinner();
+      this.stats.modelCalls++;
 
-      // Accumulate telemetry
-      if (response.usage) {
+      // Normalize generation outcome
+      const outcome = this.normalizeResponse(rawResponse, rawError);
+
+      // Accumulate usage telemetry
+      if (outcome.usage) {
         this.stats.turns++;
-        this.stats.totalTokens += response.usage.totalTokens;
-        this.stats.promptTokens += response.usage.promptTokens;
-        this.stats.completionTokens += response.usage.completionTokens;
-        this.stats.totalDurationMs += response.usage.durationMs;
+        this.stats.totalTokens += outcome.usage.totalTokens;
+        this.stats.promptTokens += outcome.usage.promptTokens;
+        this.stats.completionTokens += outcome.usage.completionTokens;
+        this.stats.totalDurationMs += outcome.usage.durationMs;
       }
 
-      const { content, tool_calls } = response;
+      // STATE MACHINE ROUTING
 
-      // If the model spoke some thoughts (and not just raw tool JSON), display them
-      const trimmedContent = content ? content.trim() : '';
-      const isJustJson = (trimmedContent.startsWith('{') && trimmedContent.endsWith('}')) ||
-                         (trimmedContent.startsWith('<tool_call>') && trimmedContent.endsWith('</tool_call>'));
-
-      if (trimmedContent && (!tool_calls || tool_calls.length === 0 || !isJustJson)) {
-        this.renderer.printAssistantMessage(trimmedContent);
+      // Outcome A: Provider Error
+      if (outcome.type === 'PROVIDER_ERROR_RETRYABLE' || outcome.type === 'PROVIDER_ERROR_FATAL') {
+        if (outcome.type === 'PROVIDER_ERROR_RETRYABLE' && progress.consecutiveNoProgressCount < 3) {
+          progress.consecutiveNoProgressCount++;
+          this.stats.retries++;
+          this.renderer.printWarning(`Model connection interrupted (${outcome.errorMessage}). Retrying (${progress.consecutiveNoProgressCount}/3)...`);
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        } else {
+          this.renderer.printError(`Model request failed: ${outcome.errorMessage}`);
+          break;
+        }
       }
 
-      // If no tool calls were requested, verify code or finish turn
-      if (!tool_calls || tool_calls.length === 0) {
+      // Outcome B: Empty / Quiet Generation Recovery
+      if (outcome.type === 'EMPTY_RESPONSE') {
+        progress.consecutiveEmptyResponses++;
+        this.stats.emptyGenerations++;
+
+        if (progress.consecutiveEmptyResponses <= 3) {
+          this.stats.recoveries++;
+          this.renderer.printWarning(
+            `Model generated an empty response without tool calls. Issuing bounded continuation directive (${progress.consecutiveEmptyResponses}/3)...`
+          );
+
+          const lastToolMsg = [...this.messages].reverse().find(m => m.role === 'tool');
+          const recoveryPrompt = `[CONTINUATION INSTRUCTION]
+Your previous response contained no text or tool actions.
+Current Objective: ${userInput}
+${lastToolMsg ? `Most recent tool outcome: ${typeof lastToolMsg.content === 'string' ? lastToolMsg.content.slice(0, 300) : ''}` : ''}
+Please proceed with the next tool call (e.g., view_file, edit_file, run_command) to complete the task, or provide your final answer if finished.`;
+
+          this.messages.push({
+            role: 'user',
+            content: recoveryPrompt
+          });
+          continue;
+        } else {
+          this.renderer.printError('Model returned empty responses repeatedly without progressing. Terminating turn cleanly.');
+          break;
+        }
+      }
+
+      // Reset empty response counter on productive generation
+      progress.consecutiveEmptyResponses = 0;
+
+      // Print assistant textual thoughts if available
+      if (outcome.cleanedText) {
+        this.renderer.printAssistantMessage(outcome.cleanedText);
+      }
+
+      // Outcome C: Text Only (No Tool Calls Requested)
+      if (outcome.type === 'TEXT_FINAL' || !outcome.toolCalls || outcome.toolCalls.length === 0) {
         // Autonomous Verification & Self-Repair Gate
         if (hasModifiedCode && repairAttempts < maxRepairAttempts) {
           this.renderer.startSpinner('Running automated verification & health check...');
+          this.stats.verificationRuns++;
           const vResult = await CodeVerifier.run(this.context.cwd);
           this.renderer.stopSpinner();
+
+          this.contextEngine.recordVerificationResult(vResult.passed, vResult.command || 'verify', vResult.errorOutput);
 
           if (!vResult.passed) {
             repairAttempts++;
@@ -231,7 +472,7 @@ export class AgentLoop {
 
             this.messages.push({
               role: 'assistant',
-              content: content || ''
+              content: outcome.rawContent || ''
             });
 
             const errorPrompt = architectPlan
@@ -260,49 +501,67 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
               role: 'user',
               content: errorPrompt
             });
-            continue; // Continue loop to repair!
+            continue; // Continue loop to repair
           } else if (vResult.command) {
             this.renderer.printSuccess(`Verification passed: \`${vResult.command}\` exited with 0 errors.`);
           }
-
         }
 
+        // Clean completion
         this.messages.push({
           role: 'assistant',
-          content: content || ''
+          content: outcome.rawContent || ''
         });
-        this.renderer.printTelemetry(response.usage);
+        this.renderer.printTelemetry(outcome.usage);
         break;
       }
 
+      // Outcome D: Tool Calls
+      const toolCalls = outcome.toolCalls;
 
-      // Add the assistant's action to message history
+      // Add assistant's action to message history
       this.messages.push({
         role: 'assistant',
-        content: content || '',
-        tool_calls: tool_calls
+        content: outcome.rawContent || '',
+        tool_calls: toolCalls
       });
 
-      // Execute each tool call sequentially
-      for (const call of tool_calls) {
-        const toolName = call.function.name;
-        let toolArgs = call.function.arguments;
+      // Progress Guard: Detect repetitive non-progress loops
+      const currentCallSignature = toolCalls
+        .map(tc => `${tc.function.name}:${JSON.stringify(tc.function.arguments)}`)
+        .join(';');
 
-        if (typeof toolArgs === 'string') {
-          try {
-            toolArgs = JSON.parse(toolArgs);
-          } catch {
-            toolArgs = {};
-          }
-        }
+      progress.recentToolSignatures.push(currentCallSignature);
+      if (progress.recentToolSignatures.length > 8) {
+        progress.recentToolSignatures.shift();
+      }
+
+      const duplicateCallCount = progress.recentToolSignatures.filter(sig => sig === currentCallSignature).length;
+      if (duplicateCallCount >= 4) {
+        this.stats.progressLoopsDetected++;
+        this.renderer.printWarning('Detected repetitive identical tool execution loop. Intervening with recovery directive...');
+        this.messages.push({
+          role: 'user',
+          content: `[PROGRESS GUARD WARNING] You have executed the exact same tool action ${duplicateCallCount} times without progressing. Please assess alternate files, verify your changes with 'run_command', or provide your final conclusion.`
+        });
+        continue;
+      }
+
+      // Execute each tool call sequentially
+      for (const call of toolCalls) {
+        this.stats.toolCalls++;
+        const toolName = call.function.name;
+        const toolArgs = call.function.arguments;
 
         const tool = toolRegistry.get(toolName);
         if (!tool) {
+          this.stats.failedToolCalls++;
           const errMsg = `Tool "${toolName}" is not registered. Available tools: ${Array.from(toolRegistry.keys()).join(', ')}`;
           this.renderer.printError(errMsg);
           this.messages.push({
             role: 'tool',
             name: toolName,
+            tool_call_id: call.id,
             content: errMsg
           });
           continue;
@@ -356,6 +615,7 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
           this.messages.push({
             role: 'tool',
             name: toolName,
+            tool_call_id: call.id,
             content: rejectedMsg
           });
           continue;
@@ -366,26 +626,42 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         if ((toolName === 'edit_file' || toolName === 'write_file') && toolArgs.path) {
           await this.checkpointManager.recordPreEditFile(toolArgs.path);
         }
-        const executionResult = await tool.execute(toolArgs, this.context);
-        this.renderer.stopSpinner();
+
+        let executionResult: { result: string; isError?: boolean };
+        try {
+          executionResult = await tool.execute(toolArgs, this.context);
+        } catch (err: any) {
+          executionResult = { result: `Tool execution threw error: ${err.message}`, isError: true };
+        } finally {
+          // Guarantee spinner is stopped even if tool execution crashes
+          this.renderer.stopSpinner();
+        }
 
         this.renderer.printToolResult(toolName, executionResult.result, executionResult.isError);
 
-        if ((toolName === 'edit_file' || toolName === 'write_file') && !executionResult.isError) {
-          hasModifiedCode = true;
+        if (executionResult.isError) {
+          this.stats.failedToolCalls++;
+          progress.failedToolCount++;
+        } else {
+          this.stats.successfulToolCalls++;
+          progress.successfulToolCount++;
+          if ((toolName === 'edit_file' || toolName === 'write_file') && toolArgs.path) {
+            hasModifiedCode = true;
+            progress.filesModified.add(toolArgs.path);
+          }
         }
 
         this.messages.push({
-
           role: 'tool',
           name: toolName,
+          tool_call_id: call.id,
           content: executionResult.result
         });
       }
     }
 
-    if (stepCount >= maxSteps) {
-      this.renderer.printError(`Reached maximum reasoning steps (${maxSteps}) for this turn.`);
+    if (stepCount >= safetyCeiling) {
+      this.renderer.printWarning(`Safety ceiling reached (${safetyCeiling} steps) to prevent runaway execution.`);
     }
   }
 }

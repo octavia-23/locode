@@ -66,6 +66,7 @@ export class OpenAICompatibleProvider implements ILLMProvider {
       const msg: any = { role: m.role, content: m.content };
       if (m.tool_calls) msg.tool_calls = m.tool_calls;
       if (m.name) msg.name = m.name;
+      if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
       return msg;
     });
 

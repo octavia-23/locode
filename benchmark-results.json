@@ -1,7 +1,7 @@
 {
-  "timestamp": "2026-10-04T18:37:11.589Z",
+  "timestamp": "2026-10-05T18:48:22.616Z",
   "platform": "win32 (x64)",
-  "totalDurationSeconds": 8.13,
+  "totalDurationSeconds": 12.91,
   "hardware": {
     "device": "NVIDIA GeForce RTX 4050 Laptop GPU",
     "ramMb": 16025,
@@ -18,7 +18,7 @@
     "avgRepairAttempts": 1.2,
     "avgVerificationRuns": 3,
     "architectEscalations": 1,
-    "avgTimeMs": 1508,
+    "avgTimeMs": 1361,
     "caseResults": [
       {
         "id": "ts-type-error",
@@ -28,7 +28,7 @@
         "repairAttempts": 1,
         "verificationRuns": 3,
         "architectEscalated": false,
-        "elapsedMs": 1438
+        "elapsedMs": 1246
       },
       {
         "id": "broken-contract",
@@ -38,7 +38,7 @@
         "repairAttempts": 1,
         "verificationRuns": 3,
         "architectEscalated": false,
-        "elapsedMs": 1487
+        "elapsedMs": 1237
       },
       {
         "id": "failing-unit-test",
@@ -48,7 +48,7 @@
         "repairAttempts": 1,
         "verificationRuns": 3,
         "architectEscalated": false,
-        "elapsedMs": 1425
+        "elapsedMs": 1273
       },
       {
         "id": "missing-import",
@@ -58,7 +58,7 @@
         "repairAttempts": 1,
         "verificationRuns": 3,
         "architectEscalated": false,
-        "elapsedMs": 1381
+        "elapsedMs": 1314
       },
       {
         "id": "incorrect-return-value",
@@ -68,9 +68,9 @@
         "repairAttempts": 2,
         "verificationRuns": 3,
         "architectEscalated": true,
-        "elapsedMs": 1808
+        "elapsedMs": 1736
       }
     ]
   },
-  "liveInferenceSpeed": "38.3 tok/s"
+  "liveInferenceSpeed": "37.4 tok/s"
 }

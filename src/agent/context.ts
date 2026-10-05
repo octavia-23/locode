@@ -1,3 +1,6 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import crypto from 'node:crypto';
 import { ChatMessage } from '../types.js';
 
 export interface CompactionConfig {
@@ -6,16 +9,192 @@ export interface CompactionConfig {
   preserveTailChars?: number;
 }
 
-export class ContextManager {
-  private maxTokens: number;
+export { ContextEngine as ContextManager };
 
-  constructor(maxTokens: number = 16384) {
+export interface RepositoryMap {
+  projectType: string;
+  entryPoints: string[];
+  packageManager?: string;
+  buildCommands: string[];
+  keyDirectories: string[];
+  configFiles: string[];
+  dependencies: string[];
+}
+
+export interface CachedFile {
+  path: string;
+  content: string;
+  hash: string;
+  lineCount: number;
+  timestamp: number;
+}
+
+export interface TaskState {
+  objective: string;
+  currentSubtask?: string;
+  completedObjectives: string[];
+  pendingObjectives: string[];
+  decisions: string[];
+  unresolvedErrors: string[];
+  lastVerification?: {
+    passed: boolean;
+    command: string;
+    summary: string;
+  };
+  relevantFiles: string[];
+}
+
+export interface ContextStats {
+  totalTokensEstimated: number;
+  budgetTokens: number;
+  compactionRuns: number;
+  tokensSavedByCompression: number;
+  tokensAvoidedByDeduplication: number;
+}
+
+/**
+ * Production-grade Context Engine for autonomous coding agent.
+ *
+ * Implements 7 structured context layers:
+ * Layer A — System invariants (rules, roles, tool contracts)
+ * Layer B — Current user objective (durable goal, requirements)
+ * Layer C — Task state (progress, unresolved errors, verification, decisions)
+ * Layer D — Repository understanding (cached repo map, package info, commands)
+ * Layer E — Relevant code context (file cache with content-hash invalidation)
+ * Layer F — Recent execution state (normalized, deduplicated tool observations)
+ * Layer G — Durable session memory (architectural decisions, confirmed findings)
+ */
+export class ContextEngine {
+  private maxTokens: number;
+  private cwd: string;
+  private fileCache: Map<string, CachedFile> = new Map();
+  private toolResultCache: Map<string, { hash: string; callCount: number; summary: string }> = new Map();
+  private repoMap: RepositoryMap | null = null;
+  private repoMapCachedAt: number = 0;
+  private taskState: TaskState;
+  private durableDecisions: string[] = [];
+  private stats: ContextStats = {
+    totalTokensEstimated: 0,
+    budgetTokens: 0,
+    compactionRuns: 0,
+    tokensSavedByCompression: 0,
+    tokensAvoidedByDeduplication: 0
+  };
+
+  constructor(maxTokens: number = 32768, cwd: string = process.cwd()) {
     this.maxTokens = maxTokens;
+    this.cwd = cwd;
+    this.taskState = {
+      objective: '',
+      completedObjectives: [],
+      pendingObjectives: [],
+      decisions: [],
+      unresolvedErrors: [],
+      relevantFiles: []
+    };
   }
 
+  setMaxTokens(tokens: number) {
+    this.maxTokens = tokens;
+  }
+
+  getMaxTokens(): number {
+    return this.maxTokens;
+  }
+
+  getStats(): ContextStats {
+    return { ...this.stats };
+  }
+
+  setObjective(objective: string) {
+    if (!this.taskState.objective || this.taskState.objective !== objective) {
+      this.taskState.objective = objective;
+    }
+  }
+
+  getTaskState(): TaskState {
+    return this.taskState;
+  }
+
+  addDecision(decision: string) {
+    if (!this.durableDecisions.includes(decision)) {
+      this.durableDecisions.push(decision);
+      this.taskState.decisions = [...this.durableDecisions];
+    }
+  }
+
+  recordVerificationResult(passed: boolean, command: string, output?: string) {
+    const summary = passed
+      ? `PASSED: \`${command}\` (0 errors)`
+      : `FAILED: \`${command}\` - ${this.extractTopErrorLine(output || '')}`;
+    
+    this.taskState.lastVerification = {
+      passed,
+      command,
+      summary
+    };
+
+    if (passed) {
+      // Clear unresolved errors if verification passed
+      this.taskState.unresolvedErrors = [];
+    } else if (output) {
+      const topError = this.extractTopErrorLine(output);
+      if (topError && !this.taskState.unresolvedErrors.includes(topError)) {
+        this.taskState.unresolvedErrors.push(topError);
+      }
+    }
+  }
+
+  private extractTopErrorLine(output: string): string {
+    const lines = output.split('\n');
+    for (const line of lines) {
+      const t = line.trim();
+      if (/error\s+ts\d+|syntaxerror|typeerror|referenceerror|failed|assertionerror/i.test(t)) {
+        return t.slice(0, 200);
+      }
+    }
+    return lines[0]?.trim().slice(0, 200) || 'Unknown verification error';
+  }
+
+  /**
+   * File Invalidation Hook: Called immediately whenever write_file or edit_file occurs.
+   * Invalidates stale cache and forces fresh inspection.
+   */
+  invalidateFile(filePath: string) {
+    const norm = this.normalizePath(filePath);
+    this.fileCache.delete(norm);
+    if (!this.taskState.relevantFiles.includes(norm)) {
+      this.taskState.relevantFiles.push(norm);
+    }
+  }
+
+  /**
+   * Tracks file reads in cache with content hashing.
+   */
+  recordFileRead(filePath: string, content: string) {
+    const norm = this.normalizePath(filePath);
+    const hash = crypto.createHash('sha256').update(content).digest('hex').slice(0, 16);
+    this.fileCache.set(norm, {
+      path: norm,
+      content,
+      hash,
+      lineCount: content.split('\n').length,
+      timestamp: Date.now()
+    });
+    if (!this.taskState.relevantFiles.includes(norm)) {
+      this.taskState.relevantFiles.push(norm);
+    }
+  }
+
+  private normalizePath(p: string): string {
+    return path.relative(this.cwd, path.resolve(this.cwd, p)).replace(/\\/g, '/');
+  }
+
+  /**
+   * Accurate fast token estimation (~3.8 chars per token).
+   */
   estimateTokens(text: string): number {
     if (!text) return 0;
-    // Heuristic: ~3.8 chars per token for code/text
     return Math.ceil(text.length / 3.8);
   }
 
@@ -31,42 +210,51 @@ export class ContextManager {
   }
 
   /**
-   * Intelligently compacts tool output while preserving high-value signals:
-   * - Compiler errors / test failures
-   * - Stack traces (at ... / Error:)
-   * - File paths & line numbers
-   * - Head and tail of output
+   * Computes available context budget reserving space for model response and safety slack.
    */
-  compactToolOutput(content: string, maxLen: number = 600): string {
+  getAvailableContextBudget(): number {
+    if (this.maxTokens <= 8192) {
+      return Math.floor(this.maxTokens * 0.75); // 75% budget for smaller contexts (e.g. 500, 1000, 8192)
+    }
+    // For larger contexts, reserve 20% or up to 4096 tokens
+    const responseReserve = Math.min(4096, Math.floor(this.maxTokens * 0.2));
+    const safetySlack = Math.min(1024, Math.floor(this.maxTokens * 0.05));
+    return Math.max(1024, this.maxTokens - responseReserve - safetySlack);
+  }
+
+  /**
+   * Compresses large tool output deterministically:
+   * - Preserves exit codes, command names, compiler diagnostic sections, stack traces, paths, line numbers
+   * - Strips repetitive build noise, progress bars, and duplicate output
+   */
+  compactToolOutput(content: string, maxLen: number = 700): string {
     if (!content || content.length <= maxLen) {
       return content;
     }
 
     const lines = content.split('\n');
-
-    // 1. Identify high-value lines (errors, stack traces, paths, exit codes)
     const criticalIndices = new Set<number>();
+
     const isCritical = (line: string): boolean => {
       const l = line.trim();
       return (
         /error|fail|exception|panic|fatal|ts\d{4}|warning/i.test(l) ||
-        /^\s*at\s+[\w\s.<>$]+\(.*:\d+:\d+\)/.test(l) || // Stack trace format
-        /:\d+:\d+:/.test(l) || // File:line:col
+        /^\s*at\s+[\w\s.<>$]+\(.*:\d+:\d+\)/.test(l) ||
+        /:\d+:\d+:/.test(l) ||
         /\berr!|status\s+code\s+\d+/i.test(l) ||
-        /^>\s+/.test(l) // Test runner runner line
+        /^>\s+/.test(l) ||
+        /assert(ion)?/i.test(l)
       );
     };
 
     lines.forEach((line, idx) => {
       if (isCritical(line)) {
         criticalIndices.add(idx);
-        // Also keep immediate next line for context (e.g. error details)
         if (idx + 1 < lines.length) criticalIndices.add(idx + 1);
         if (idx > 0) criticalIndices.add(idx - 1);
       }
     });
 
-    // If critical lines exist, build a structured excerpt
     if (criticalIndices.size > 0) {
       const headCount = Math.min(4, lines.length);
       const tailCount = Math.min(4, lines.length);
@@ -87,32 +275,127 @@ export class ContextManager {
 
       const compactedResult = outputParts.join('\n');
       if (compactedResult.length < content.length) {
+        const saved = this.estimateTokens(content) - this.estimateTokens(compactedResult);
+        if (saved > 0) this.stats.tokensSavedByCompression += saved;
         return `[Compacted Output (${lines.length} lines total, preserving key errors & traces)]:\n${compactedResult}`;
       }
     }
 
-    // Default head/tail split if no explicit error lines
+    // Default head/tail split
     const headChars = Math.floor(maxLen * 0.6);
     const tailChars = Math.floor(maxLen * 0.3);
     const head = content.slice(0, headChars);
     const tail = content.slice(-tailChars);
+    const saved = this.estimateTokens(content) - this.estimateTokens(head + tail);
+    if (saved > 0) this.stats.tokensSavedByCompression += saved;
+
     return `[Output compacted: ${head} ... [${content.length - headChars - tailChars} characters collapsed] ... ${tail}]`;
   }
 
-  compactMessages(messages: ChatMessage[]): ChatMessage[] {
-    const totalTokens = this.estimateMessagesTokens(messages);
-    const budget = Math.floor(this.maxTokens * 0.75); // Leave 25% for generation
-
-    if (totalTokens <= budget || messages.length <= 4) {
-      return messages;
+  /**
+   * Discovers and caches high-level repository structure without expensive rescanning.
+   */
+  async getRepositoryMap(): Promise<RepositoryMap> {
+    const now = Date.now();
+    if (this.repoMap && now - this.repoMapCachedAt < 60000) {
+      return this.repoMap;
     }
 
-    // Clone messages so caller's array is not mutated unexpectedly
+    const map: RepositoryMap = {
+      projectType: 'unknown',
+      entryPoints: [],
+      buildCommands: [],
+      keyDirectories: [],
+      configFiles: [],
+      dependencies: []
+    };
+
+    try {
+      const pkgPath = path.join(this.cwd, 'package.json');
+      const pkgRaw = await fs.readFile(pkgPath, 'utf8').catch(() => null);
+      if (pkgRaw) {
+        const pkg = JSON.parse(pkgRaw);
+        map.projectType = 'Node.js / TypeScript';
+        map.packageManager = 'npm';
+        if (pkg.main) map.entryPoints.push(pkg.main);
+        if (pkg.bin) {
+          if (typeof pkg.bin === 'string') map.entryPoints.push(pkg.bin);
+          else Object.values(pkg.bin).forEach((b: any) => map.entryPoints.push(String(b)));
+        }
+        if (pkg.scripts) {
+          Object.keys(pkg.scripts).forEach(s => map.buildCommands.push(`npm run ${s}`));
+        }
+        if (pkg.dependencies) {
+          map.dependencies = Object.keys(pkg.dependencies).slice(0, 15);
+        }
+        map.configFiles.push('package.json');
+      }
+
+      // Check common directories
+      const dirs = ['src', 'lib', 'tests', 'test', 'dist', 'scripts'];
+      for (const d of dirs) {
+        try {
+          const s = await fs.stat(path.join(this.cwd, d));
+          if (s.isDirectory()) map.keyDirectories.push(d);
+        } catch {}
+      }
+    } catch {}
+
+    this.repoMap = map;
+    this.repoMapCachedAt = now;
+    return map;
+  }
+
+  /**
+   * Assembles optimized model context respecting token budget and layered priorities.
+   *
+   * Priority Ordering:
+   * 1. Layer A: System Invariants (index 0)
+   * 2. Layer B: Current user objective (never destroyed)
+   * 3. Layer C: Task state & unresolved errors (durable)
+   * 4. Layer E: Latest tool call & result (turn N)
+   * 5. Layer F: Recent execution window (turns N-1, N-2)
+   * 6. Lower: Historical turns compacted or pruned
+   */
+  compactMessages(messages: ChatMessage[]): ChatMessage[] {
+    const budget = this.getAvailableContextBudget();
+    this.stats.budgetTokens = budget;
+
+    const totalTokens = this.estimateMessagesTokens(messages);
+    this.stats.totalTokensEstimated = totalTokens;
+
+    this.stats.compactionRuns++;
     const compacted = messages.map(m => ({ ...m }));
 
-    // Priority ordering preserved:
-    // 1. System instructions (index 0)
-    // 2. Recent turn (last 2 messages: assistant/user)
+    // Find initial user prompt (Layer B)
+    const initialUserMsg = compacted.find(m => m.role === 'user');
+    if (initialUserMsg && !this.taskState.objective) {
+      this.taskState.objective = initialUserMsg.content.slice(0, 500);
+    }
+
+    // Step 1: Deduplicate identical tool outputs across the session
+    const seenToolOutputs = new Map<string, number>();
+    for (let i = 1; i < compacted.length; i++) {
+      const msg = compacted[i];
+      if (msg.role === 'tool' && msg.content) {
+        const hash = crypto.createHash('md5').update(msg.content.slice(0, 500)).digest('hex');
+        if (seenToolOutputs.has(hash)) {
+          const priorIdx = seenToolOutputs.get(hash)!;
+          const tokensSaved = this.estimateTokens(msg.content) - 15;
+          if (tokensSaved > 0) this.stats.tokensAvoidedByDeduplication += tokensSaved;
+          msg.content = `[Output identical to tool result at step ${priorIdx}; omitted for token budget]`;
+        } else {
+          seenToolOutputs.set(hash, i);
+        }
+      }
+    }
+
+    if (totalTokens <= budget && messages.length <= 4) {
+      return compacted;
+    }
+
+    // Step 2: Compress older tool outputs
+    // Keep the final turn (last 2 messages: assistant/user) intact; compact earlier turns
     const preserveLast = 2;
     const endIdx = compacted.length - preserveLast;
 
@@ -120,13 +403,54 @@ export class ContextManager {
       const msg = compacted[i];
       if (msg.role === 'tool' && msg.content && msg.content.length > 500) {
         msg.content = this.compactToolOutput(msg.content, 500);
-      } else if (msg.role === 'assistant' && msg.content && msg.content.length > 1200) {
-        // Compress older long assistant thoughts
-        const preview = msg.content.slice(0, 400).replace(/\s+/g, ' ');
+      } else if (msg.role === 'assistant' && msg.content && msg.content.length > 800) {
+        const preview = msg.content.slice(0, 300).replace(/\s+/g, ' ');
         msg.content = `${preview}...\n[Older assistant thought compacted for token budget]`;
       }
     }
 
+    // Step 3: If still over budget, retain structured task state and drop stale intermediate messages
+    let currentTokens = this.estimateMessagesTokens(compacted);
+    if (currentTokens > budget && compacted.length > 6) {
+      // Build a synthetic structured state message to replace older dropped turns
+      const stateSummary = this.buildTaskStateSummary();
+      const systemMsg = compacted[0];
+      const initialUser = compacted.find(m => m.role === 'user') || { role: 'user', content: this.taskState.objective };
+      const recentWindow = compacted.slice(-4);
+
+      const prunedMessages: ChatMessage[] = [
+        systemMsg,
+        initialUser,
+        {
+          role: 'user',
+          content: `[SESSION CONTEXT RESTORED FROM COMPACT STATE]\n${stateSummary}`
+        },
+        ...recentWindow.filter(m => m !== initialUser && m !== systemMsg)
+      ];
+
+      return prunedMessages;
+    }
+
     return compacted;
+  }
+
+  private buildTaskStateSummary(): string {
+    const parts: string[] = [];
+    if (this.taskState.objective) {
+      parts.push(`OBJECTIVE: ${this.taskState.objective}`);
+    }
+    if (this.taskState.relevantFiles.length > 0) {
+      parts.push(`RELEVANT FILES: ${this.taskState.relevantFiles.join(', ')}`);
+    }
+    if (this.taskState.unresolvedErrors.length > 0) {
+      parts.push(`CURRENT UNRESOLVED ERRORS:\n- ${this.taskState.unresolvedErrors.join('\n- ')}`);
+    }
+    if (this.taskState.lastVerification) {
+      parts.push(`VERIFICATION STATUS: ${this.taskState.lastVerification.summary}`);
+    }
+    if (this.durableDecisions.length > 0) {
+      parts.push(`KEY ARCHITECTURAL DECISIONS:\n- ${this.durableDecisions.join('\n- ')}`);
+    }
+    return parts.join('\n\n');
   }
 }

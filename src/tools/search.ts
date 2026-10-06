@@ -126,10 +126,12 @@ export async function searchCodeFallback(
   patternStr: string,
   searchRoot: string,
   cwd: string,
-  maxMatches: number = 100
+  maxMatches: number = 100,
+  fileGlob?: string | null
 ): Promise<string[]> {
   const ig = await getIgnoreFilter(cwd);
-  const files = await fg(['**/*'], {
+  const globPattern = fileGlob ? `**/${fileGlob}` : '**/*';
+  const files = await fg([globPattern], {
     cwd: searchRoot,
     onlyFiles: true,
     dot: false
@@ -137,10 +139,15 @@ export async function searchCodeFallback(
 
   const results: string[] = [];
   let regex: RegExp;
-  try {
-    regex = new RegExp(patternStr, 'i');
-  } catch {
-    regex = new RegExp(patternStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+  if (fileGlob) {
+    // If searching by file glob, match any non-empty line
+    regex = /./;
+  } else {
+    try {
+      regex = new RegExp(patternStr, 'i');
+    } catch {
+      regex = new RegExp(patternStr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+    }
   }
 
   for (const file of files) {
@@ -194,24 +201,40 @@ export const searchCodeTool: ToolDefinition = {
   needsApproval: false,
   async execute(args, context) {
     try {
-      const patternStr = args.pattern;
-      const searchRoot = args.path ? resolveSafePath(args.path, context.cwd) : context.cwd;
+      let patternStr = (args.pattern || '').trim();
+      const rawPath = args.path || '';
+      
+      // Reika Lesson: Small models often emit glob patterns as pattern (e.g. pattern="*.ts" or "*.json")
+      // instead of putting them in path or searching for content.
+      let fileGlobFilter: string | null = null;
+      if (/^\*\.[a-zA-Z0-9_-]+$/.test(patternStr)) {
+        fileGlobFilter = patternStr;
+      }
+
+      // Handle tilde paths or relative paths safely
+      const searchRoot = rawPath ? resolveSafePath(rawPath.replace(/^~[\\/]/, ''), context.cwd) : context.cwd;
       const hasRg = await checkRipgrep();
 
       let results: string[] = [];
 
       if (hasRg) {
         try {
-          const isWindows = process.platform === 'win32';
           const rgArgs = [
             '--line-number',
             '--heading',
             '--color', 'never',
             '--max-count', '100',
-            '-i',
-            '-e', patternStr,
-            searchRoot
+            '-i'
           ];
+
+          if (fileGlobFilter) {
+            rgArgs.push('--glob', fileGlobFilter);
+            rgArgs.push('-e', '.');
+          } else {
+            rgArgs.push('-e', patternStr);
+          }
+          rgArgs.push(searchRoot);
+
           const res = await execa('rg', rgArgs, {
             cwd: context.cwd,
             reject: false,
@@ -231,7 +254,7 @@ export const searchCodeTool: ToolDefinition = {
                 currentFile = line.trim();
               }
               if (results.length >= 100) {
-                results.push('... [Truncated at 100 matches]');
+                results.push('[Search output truncated at 100 matches for context length - command succeeded]');
                 break;
               }
             }
@@ -244,16 +267,17 @@ export const searchCodeTool: ToolDefinition = {
 
       // If ripgrep wasn't available or produced empty/failed fallback
       if (!hasRg || results.length === 0) {
-        results = await searchCodeFallback(patternStr, searchRoot, context.cwd);
+        results = await searchCodeFallback(fileGlobFilter || patternStr, searchRoot, context.cwd, 100, fileGlobFilter);
       }
 
       if (results.length === 0) {
-        return { result: `No matches found for "${patternStr}".` };
+        const pathNotice = rawPath ? ` in path "${rawPath}"` : '';
+        return { result: `[Search completed: 0 matches found for pattern "${patternStr}"${pathNotice}. The query executed properly, but no matching text exists in the workspace.]` };
       }
 
       return { result: `Matches for "${patternStr}":\n` + results.join('\n') };
     } catch (err: any) {
-      return { result: `Search failed: ${err.message}`, isError: true };
+      return { result: `Search failed to execute: ${err.message}`, isError: true };
     }
   }
 };

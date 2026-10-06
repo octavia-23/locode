@@ -51,7 +51,8 @@ export class OllamaProvider implements ILLMProvider {
   async chat(
     messages: ChatMessage[],
     tools: ToolDefinition[],
-    onToken?: (token: string) => void
+    onToken?: (token: string) => void,
+    options?: import('./types.js').ChatOptions
   ): Promise<ChatProviderResponse> {
     const formattedTools = tools.map(t => ({
       type: 'function' as const,

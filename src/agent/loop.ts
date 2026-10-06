@@ -349,8 +349,31 @@ export class AgentLoop {
     while (stepCount < safetyCeiling) {
       stepCount++;
 
-      // Compact context if history grows large
-      const compacted = this.contextEngine.compactMessages(this.messages);
+      // Reika Lesson: When compaction is due, run a quick synthesis turn to ask the model for its findings
+      // BEFORE dropping or folding older history.
+      // Use tool_choice: 'none' so the tool schema prefix remains byte-identical in the engine's KV cache!
+      let synthesizedFindings: string | undefined;
+      if (this.contextEngine.shouldCompact(this.messages) && this.messages.length > 6) {
+        this.renderer.startSpinner('Synthesizing working findings before context compaction...');
+        try {
+          const synthesisPrompt: ChatMessage = {
+            role: 'user',
+            content: '[SYNTHESIS DIRECTIVE] The context window is nearing its limit. In 2-3 concise sentences, summarize your key findings, inspected files, and pending action items so far. Do NOT call tools.'
+          };
+          const preFoldTurn = [...this.messages, synthesisPrompt];
+          const digest = await this.provider.chat(preFoldTurn, allTools, undefined, { toolChoice: 'none' });
+          if (digest.content && digest.content.trim()) {
+            synthesizedFindings = digest.content.trim();
+          }
+        } catch {
+          // Graceful fallback: continue standard compaction if synthesis fails
+        } finally {
+          this.renderer.stopSpinner();
+        }
+      }
+
+      // Compact context respecting prefix stability
+      const compacted = this.contextEngine.compactMessages(this.messages, synthesizedFindings);
 
       this.renderer.startSpinner(`Thinking with ${chalk.cyan(this.context.model)}...`);
 

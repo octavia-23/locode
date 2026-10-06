@@ -41,7 +41,7 @@ export const viewFileTool: ToolDefinition = {
 
       let header = `File: ${args.path} (lines ${start}-${end} of ${lines.length})\n`;
       if (end < lines.length && !args.end_line) {
-        header += `[Note: Truncated to line ${end}. Use start_line=${end + 1} to read more]\n`;
+        header += `[Context limit: output truncated at line ${end} of ${lines.length} - read succeeded. Use start_line=${end + 1} if you need further lines]\n`;
       }
 
       if (context.contextEngine?.recordFileRead) {

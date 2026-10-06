@@ -191,11 +191,18 @@ export class ContextEngine {
   }
 
   /**
-   * Accurate fast token estimation (~3.8 chars per token).
+   * Accurate token estimation calibrated against code & markdown.
+   * Prose: ~3.8 chars per token.
+   * Code / JSON / AST / paths: ~2.0 chars per token (pessimistic 1.8-2.2 range).
    */
   estimateTokens(text: string): number {
     if (!text) return 0;
-    return Math.ceil(text.length / 3.8);
+    // Check if snippet contains heavy code/syntax characters
+    const codePunctuation = (text.match(/[{}[\]()<>;:=/\\`"'_|&%^$#@!*~]/g) || []).length;
+    const ratio = codePunctuation / text.length;
+    // If heavily punctuated or indented (code/diff/json), use pessimistic 2.2 chars/tok
+    const charsPerToken = ratio > 0.08 ? 2.2 : 3.6;
+    return Math.ceil(text.length / charsPerToken);
   }
 
   estimateMessagesTokens(messages: ChatMessage[]): number {
@@ -207,6 +214,16 @@ export class ContextEngine {
       }
     }
     return total;
+  }
+
+  /**
+   * Reika-inspired Prefix-Stable watermark check:
+   * Returns true only when total tokens cross the compaction threshold (e.g. 75% of budget)
+   */
+  shouldCompact(messages: ChatMessage[]): boolean {
+    const budget = this.getAvailableContextBudget();
+    const currentTokens = this.estimateMessagesTokens(messages);
+    return currentTokens >= budget;
   }
 
   /**
@@ -357,12 +374,35 @@ export class ContextEngine {
    * 5. Layer F: Recent execution window (turns N-1, N-2)
    * 6. Lower: Historical turns compacted or pruned
    */
-  compactMessages(messages: ChatMessage[]): ChatMessage[] {
+  compactMessages(messages: ChatMessage[], synthesizedFindings?: string): ChatMessage[] {
     const budget = this.getAvailableContextBudget();
     this.stats.budgetTokens = budget;
 
     const totalTokens = this.estimateMessagesTokens(messages);
     this.stats.totalTokensEstimated = totalTokens;
+
+    // Check if there are duplicate identical tool outputs that should be deduplicated
+    let hasDuplicateTools = false;
+    const testSeen = new Set<string>();
+    for (const m of messages) {
+      if (m.role === 'tool' && m.content) {
+        const hash = crypto.createHash('md5').update(m.content.slice(0, 500)).digest('hex');
+        if (testSeen.has(hash)) {
+          hasDuplicateTools = true;
+          break;
+        }
+        testSeen.add(hash);
+      }
+    }
+
+    // PREFIX-STABILITY CHECK:
+    // If message history is within budget and has no duplicate tool spam,
+    // do NOT alter or rewrite middle message bytes!
+    // Returning identical messages allows llama.cpp and local LLM engines
+    // to achieve 100% KV cache hit rate for prompt prefill.
+    if (totalTokens <= budget && !hasDuplicateTools) {
+      return messages;
+    }
 
     this.stats.compactionRuns++;
     const compacted = messages.map(m => ({ ...m }));
@@ -390,10 +430,6 @@ export class ContextEngine {
       }
     }
 
-    if (totalTokens <= budget && messages.length <= 4) {
-      return compacted;
-    }
-
     // Step 2: Compress older tool outputs
     // Keep the final turn (last 2 messages: assistant/user) intact; compact earlier turns
     const preserveLast = 2;
@@ -413,7 +449,10 @@ export class ContextEngine {
     let currentTokens = this.estimateMessagesTokens(compacted);
     if (currentTokens > budget && compacted.length > 6) {
       // Build a synthetic structured state message to replace older dropped turns
-      const stateSummary = this.buildTaskStateSummary();
+      let stateSummary = this.buildTaskStateSummary();
+      if (synthesizedFindings) {
+        stateSummary = `WORKING FINDINGS & SYNTHESIS:\n${synthesizedFindings}\n\n` + stateSummary;
+      }
       const systemMsg = compacted[0];
       const initialUser = compacted.find(m => m.role === 'user') || { role: 'user', content: this.taskState.objective };
       const recentWindow = compacted.slice(-4);

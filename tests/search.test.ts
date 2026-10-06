@@ -57,6 +57,17 @@ test('Code Search - safely skips binary files and respects gitignore', async () 
     assert.ok(res.result.includes('text.txt:1: Hello world in text'));
     // Must NOT match inside binary file
     assert.ok(!res.result.includes('binary.dat'));
+
+    // Test glob pattern handling (*.txt)
+    const globRes = await searchCodeTool.execute({ pattern: '*.txt' }, ctx);
+    assert.equal(globRes.isError, undefined);
+    assert.ok(globRes.result.includes('text.txt'));
+
+    // Test unambiguous 0 matches diagnostic
+    const zeroRes = await searchCodeTool.execute({ pattern: 'NonExistentWord123' }, ctx);
+    assert.equal(zeroRes.isError, undefined);
+    assert.ok(zeroRes.result.includes('0 matches found for pattern'));
+    assert.ok(zeroRes.result.includes('The query executed properly'));
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }

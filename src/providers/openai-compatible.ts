@@ -51,7 +51,8 @@ export class OpenAICompatibleProvider implements ILLMProvider {
   async chat(
     messages: ChatMessage[],
     tools: ToolDefinition[],
-    onToken?: (token: string) => void
+    onToken?: (token: string) => void,
+    options?: import('./types.js').ChatOptions
   ): Promise<ChatProviderResponse> {
     const formattedTools = tools.map(t => ({
       type: 'function',
@@ -82,6 +83,7 @@ export class OpenAICompatibleProvider implements ILLMProvider {
         model: this.model,
         messages: formattedMessages,
         tools: formattedTools.length > 0 ? formattedTools : undefined,
+        tool_choice: options?.toolChoice,
         temperature: 0.1
       })
     });

@@ -19,6 +19,10 @@ export interface ChatProviderResponse {
   };
 }
 
+export interface ChatOptions {
+  toolChoice?: 'auto' | 'none' | 'required';
+}
+
 export interface ILLMProvider {
   getModel(): string;
   setModel(model: string): void;
@@ -27,7 +31,8 @@ export interface ILLMProvider {
   chat(
     messages: ChatMessage[],
     tools: ToolDefinition[],
-    onToken?: (token: string) => void
+    onToken?: (token: string) => void,
+    options?: ChatOptions
   ): Promise<ChatProviderResponse>;
   getNumCtx?(): number;
   setNumCtx?(numCtx: number): void;

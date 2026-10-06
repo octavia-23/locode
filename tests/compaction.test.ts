@@ -51,3 +51,39 @@ test('Context Compaction - message history respects token budget', () => {
   assert.ok(compacted[2].content.includes('TypeError'));
   assert.ok(compacted[2].content.includes('src/user.ts:42'));
 });
+
+test('Context Compaction - prefix stability preserves message identity when below budget', () => {
+  const cm = new ContextManager(8192);
+
+  const messages = [
+    { role: 'system' as const, content: 'You are Locode CLI.' },
+    { role: 'user' as const, content: 'Read package.json' },
+    { role: 'tool' as const, content: '{"name": "test"}' },
+    { role: 'assistant' as const, content: 'Package name is test.' }
+  ];
+
+  // Under budget: compactMessages must return exact same array reference for 100% KV cache hit
+  const result = cm.compactMessages(messages);
+  assert.equal(result, messages, 'Messages array should be returned untouched for KV cache stability');
+});
+
+test('Context Compaction - folds retain synthesized findings', () => {
+  const cm = new ContextManager(500);
+
+  const messages = [
+    { role: 'system' as const, content: 'System instruction' },
+    { role: 'user' as const, content: 'Initial user prompt' },
+    { role: 'tool' as const, content: 'Tool outcome line\n'.repeat(50) },
+    { role: 'assistant' as const, content: 'Thought line\n'.repeat(50) },
+    { role: 'user' as const, content: 'Followup user prompt' },
+    { role: 'tool' as const, content: 'Another tool result\n'.repeat(50) },
+    { role: 'assistant' as const, content: 'Recent assistant output' }
+  ];
+
+  const digest = 'Discovered auth bug in src/auth.ts at line 42.';
+  const compacted = cm.compactMessages(messages, digest);
+
+  const restored = compacted.find(m => m.content.includes('[SESSION CONTEXT RESTORED FROM COMPACT STATE]'));
+  assert.ok(restored, 'Should contain restored context message');
+  assert.ok(restored.content.includes(digest), 'Synthesized findings must be preserved in compact state');
+});

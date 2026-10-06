@@ -19,12 +19,15 @@ async function loadProjectRules(cwd: string): Promise<string> {
 
 export async function buildSystemPrompt(cwd: string): Promise<string> {
   const customRules = await loadProjectRules(cwd);
+  const isWindows = process.platform === 'win32';
 
   return `You are Locode, an elite autonomous AI developer assistant (pair programmer and terminal agent) running locally on the user's machine.
 You have direct access to tools that can inspect the filesystem, read files, edit files surgically, write files, search code, execute shell commands, and ACCESS THE LIVE INTERNET via 'search_web' (live web search) and 'fetch_web' (webpage scraper and documentation reader).
 
-Current Workspace Root:
-${cwd}
+Host Environment:
+- Operating System: ${isWindows ? 'Windows (cmd.exe / PowerShell)' : process.platform}
+- Workspace Root: ${cwd}
+${isWindows ? `- Windows Shell Notice: Do NOT use Linux/Unix CLI utilities like 'wc', 'cat', 'grep', 'ls -la', 'touch', or 'rm -rf' in 'run_command'. Use your built-in tools instead: 'view_file' (shows file content and total lines), 'search_code' (text/regex search), and 'list_dir' (directory listing).` : ''}
 ${customRules}
 Your core principles:
 1. LIVE INTERNET & WEB ACCESS:

@@ -89,3 +89,51 @@ test('ContextManager - token estimation & compaction', () => {
   assert.equal(compacted.length, msgs.length);
   assert.match(compacted[2].content, /\[Output compacted:/);
 });
+
+test('Terminal - runCommandTool executes git commands and Windows shims cleanly', async () => {
+  const ctx: AgentContext = {
+    cwd: process.cwd(),
+    autoApprove: true,
+    model: 'locode-qwen35b-a3b'
+  };
+
+  // 1. git status
+  const gitStatusRes = await runCommandTool.execute({ command: 'git status --short' }, ctx);
+  assert.equal(gitStatusRes.isError, undefined, 'git status should not return error');
+  assert.ok(typeof gitStatusRes.result === 'string');
+
+  // 2. git diff
+  const gitDiffRes = await runCommandTool.execute({ command: 'git diff --stat' }, ctx);
+  assert.equal(gitDiffRes.isError, undefined, 'git diff should not return error');
+
+  // 3. wc -l shim
+  const wcRes = await runCommandTool.execute({ command: 'wc -l package.json' }, ctx);
+  assert.equal(wcRes.isError, undefined, 'wc -l shim should succeed on Windows');
+  assert.match(wcRes.result, /\d+\s+package\.json/);
+});
+
+test('File Operations - edit_file strips accidental view_file line numbers and whitespace', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-fuzzy-test-'));
+  const ctx: AgentContext = {
+    cwd: tmpDir,
+    autoApprove: true,
+    model: 'locode-qwen35b-a3b'
+  };
+
+  const sampleFile = path.join(tmpDir, 'test.css');
+  await fs.writeFile(sampleFile, 'body {\n  margin: 0;\n  padding: 0;\n}\n', 'utf8');
+
+  // Model passes target with line numbers: "   2:   margin: 0;\n   3:   padding: 0;"
+  const editWithLineNumbers = await editFileTool.execute({
+    path: 'test.css',
+    target_content: '   2:   margin: 0;\n   3:   padding: 0;',
+    replacement_content: '   2:   margin: 10px;\n   3:   padding: 10px;'
+  }, ctx);
+
+  assert.equal(editWithLineNumbers.isError, undefined, 'edit_file should succeed despite line numbers');
+  const content = await fs.readFile(sampleFile, 'utf8');
+  assert.match(content, /margin: 10px;/);
+  assert.match(content, /padding: 10px;/);
+
+  await fs.rm(tmpDir, { recursive: true, force: true });
+});

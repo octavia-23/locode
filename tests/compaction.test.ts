@@ -87,3 +87,57 @@ test('Context Compaction - folds retain synthesized findings', () => {
   assert.ok(restored, 'Should contain restored context message');
   assert.ok(restored.content.includes(digest), 'Synthesized findings must be preserved in compact state');
 });
+
+test('Context Compaction - evicts older file inspections from prompt history while preserving references', () => {
+  const cm = new ContextManager(2000);
+
+  const messages = [
+    { role: 'system' as const, content: 'System instruction' },
+    { role: 'user' as const, content: 'Please inspect the files' },
+    {
+      role: 'tool' as const,
+      content: 'File: src/heavy.ts (lines 1-200 of 500)\n' + '1: const x = 1;\n'.repeat(200)
+    },
+    { role: 'assistant' as const, content: 'Now inspecting second file.' },
+    { role: 'user' as const, content: 'Proceed' },
+    {
+      role: 'tool' as const,
+      content: 'File: src/second.ts (lines 1-10 of 10)\n1: const y = 2;\n'
+    },
+    { role: 'assistant' as const, content: 'Analysis done.' }
+  ];
+
+  const compacted = cm.compactMessages(messages);
+  // Older file inspection at index 2 should have its raw code lines evicted into a compact pointer
+  assert.ok(compacted[2].content.includes('[File inspection: src/heavy.ts'), 'Old file inspection must be evicted to reference');
+  assert.ok(compacted[2].content.includes('raw code lines folded for token budget'), 'Fold explanation must be included');
+  assert.ok(!compacted[2].content.includes('const x = 1;\n1: const x = 1;'), 'Raw 200 lines of code must not be kept');
+  // Recent file at index 5 should remain intact
+  assert.ok(compacted[5].content.includes('src/second.ts'), 'Recent file must be preserved');
+});
+
+test('Context Compaction - tool schema overhead is factored into budget calculation', () => {
+  const cm = new ContextManager(32768);
+  const budgetDefault = cm.getAvailableContextBudget(2500);
+  const budgetNoTools = cm.getAvailableContextBudget(0);
+
+  assert.ok(budgetDefault < budgetNoTools, 'Budget with tool overhead must reserve room for tool schemas');
+  assert.ok(budgetDefault <= 32768 - 2500, 'Budget must not allow conversation to reach raw context limit');
+});
+
+test('Context Compaction - emergency ceiling cap guarantees total tokens fit within budget', () => {
+  const cm = new ContextManager(1000);
+
+  const messages = [
+    { role: 'system' as const, content: 'System instruction' },
+    { role: 'user' as const, content: 'Run command' },
+    { role: 'tool' as const, content: 'Extremely long log output line.\n'.repeat(300) },
+    { role: 'assistant' as const, content: 'Analysis' }
+  ];
+
+  const compacted = cm.compactMessages(messages);
+  const estimatedTokens = cm.estimateMessagesTokens(compacted);
+  const budget = cm.getAvailableContextBudget(0);
+
+  assert.ok(estimatedTokens <= budget, `Estimated tokens (${estimatedTokens}) must not exceed budget (${budget})`);
+});

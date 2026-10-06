@@ -32,7 +32,14 @@ export const viewFileTool: ToolDefinition = {
       const lines = content.split('\n');
       
       const start = args.start_line ? Math.max(1, Math.min(args.start_line, lines.length)) : 1;
-      const end = args.end_line ? Math.min(lines.length, Math.max(start, args.end_line)) : Math.min(lines.length, start + 300);
+      const defaultEnd = Math.min(lines.length, start + 250);
+      let end = args.end_line ? Math.min(lines.length, Math.max(start, args.end_line)) : defaultEnd;
+      const maxWindow = 350;
+      let wasWindowCapped = false;
+      if (end - start + 1 > maxWindow) {
+        end = start + maxWindow - 1;
+        wasWindowCapped = true;
+      }
 
       const sliced = lines.slice(start - 1, end);
       const formatted = sliced
@@ -40,7 +47,9 @@ export const viewFileTool: ToolDefinition = {
         .join('\n');
 
       let header = `File: ${args.path} (lines ${start}-${end} of ${lines.length})\n`;
-      if (end < lines.length && !args.end_line) {
+      if (wasWindowCapped) {
+        header += `[Window capped at ${maxWindow} lines to preserve context - read succeeded. Use start_line=${end + 1} to inspect further lines]\n`;
+      } else if (end < lines.length && !args.end_line) {
         header += `[Context limit: output truncated at line ${end} of ${lines.length} - read succeeded. Use start_line=${end + 1} if you need further lines]\n`;
       }
 
@@ -115,42 +124,80 @@ export const editFileTool: ToolDefinition = {
       const fullPath = resolveSafePath(args.path, context.cwd);
       const existing = await fs.readFile(fullPath, 'utf8');
       
-      const target = args.target_content;
-      const replacement = args.replacement_content;
+      let target = args.target_content;
+      let replacement = args.replacement_content;
 
-      // Check if target exists directly
-      let newContent: string;
-      if (existing.includes(target)) {
-        // Single replacement check
-        const firstIdx = existing.indexOf(target);
-        const secondIdx = existing.indexOf(target, firstIdx + target.length);
-        if (secondIdx !== -1) {
-          return {
-            result: `Target content appears multiple times in ${args.path}. Please provide a larger, unique block of context to replace.`,
-            isError: true
-          };
+      // Smart cleanup: If the model accidentally included view_file line numbers (e.g. "   1: " or "12 | "), strip them!
+      const stripLineNumbers = (text: string): string => {
+        const lines = text.split('\n');
+        const hasLineNumbers = lines.length > 0 && lines.every(l => !l.trim() || /^\s*\d+[:|]\s*/.test(l));
+        if (hasLineNumbers) {
+          return lines.map(l => l.replace(/^\s*\d+[:|]\s?/, '')).join('\n');
         }
-        newContent = existing.replace(target, replacement);
-      } else {
-        // Fallback: normalize line endings (CRLF vs LF)
-        const normalizedExisting = existing.replace(/\r\n/g, '\n');
-        const normalizedTarget = target.replace(/\r\n/g, '\n');
-        if (normalizedExisting.includes(normalizedTarget)) {
-          const firstIdx = normalizedExisting.indexOf(normalizedTarget);
-          const secondIdx = normalizedExisting.indexOf(normalizedTarget, firstIdx + normalizedTarget.length);
+        return text;
+      };
+
+      const cleanTarget = stripLineNumbers(target);
+      const cleanReplacement = stripLineNumbers(replacement);
+
+      // Helper function to find and replace in text with CRLF normalization
+      const attemptReplace = (fileText: string, searchTarget: string, searchReplacement: string): string | null => {
+        const normFile = fileText.replace(/\r\n/g, '\n');
+        const normTarget = searchTarget.replace(/\r\n/g, '\n');
+        const normReplacement = searchReplacement.replace(/\r\n/g, '\n');
+
+        if (normFile.includes(normTarget)) {
+          const firstIdx = normFile.indexOf(normTarget);
+          const secondIdx = normFile.indexOf(normTarget, firstIdx + normTarget.length);
           if (secondIdx !== -1) {
-            return {
-              result: `Target content appears multiple times in ${args.path} (with normalized line breaks). Provide more surrounding context.`,
-              isError: true
-            };
+            throw new Error(`Target content appears multiple times in ${args.path}. Please provide a larger, unique block of context to replace.`);
           }
-          newContent = normalizedExisting.replace(normalizedTarget, replacement.replace(/\r\n/g, '\n'));
-        } else {
-          return {
-            result: `Target content not found in ${args.path}. Make sure the target text matches the file lines exactly (use view_file first to see current lines).`,
-            isError: true
-          };
+          return normFile.replace(normTarget, normReplacement);
         }
+
+        // Fuzzy fallback: line-by-line whitespace-trimmed matching
+        const fileLines = normFile.split('\n');
+        const targetLines = normTarget.split('\n');
+
+        if (targetLines.length > 0) {
+          const trimmedTarget = targetLines.map(l => l.trim());
+          for (let i = 0; i <= fileLines.length - targetLines.length; i++) {
+            let matches = true;
+            for (let j = 0; j < targetLines.length; j++) {
+              if (fileLines[i + j].trim() !== trimmedTarget[j]) {
+                matches = false;
+                break;
+              }
+            }
+            if (matches) {
+              // Found matched block! Replace this exact range of lines
+              const before = fileLines.slice(0, i);
+              const after = fileLines.slice(i + targetLines.length);
+              return [...before, normReplacement, ...after].join('\n');
+            }
+          }
+        }
+
+        return null;
+      };
+
+      let newContent: string | null = null;
+      try {
+        // Try with original target first
+        newContent = attemptReplace(existing, target, replacement);
+        // If not found, try with line numbers stripped
+        if (!newContent && (cleanTarget !== target || cleanReplacement !== replacement)) {
+          newContent = attemptReplace(existing, cleanTarget, cleanReplacement);
+        }
+      } catch (err: any) {
+        return { result: err.message, isError: true };
+      }
+
+      if (!newContent) {
+        return {
+          result: `Target content not found in ${args.path}. Make sure the target text matches the file lines exactly (use view_file first to see current lines, without copying line numbers).`,
+          isError: true
+        };
       }
 
       await fs.writeFile(fullPath, newContent, 'utf8');

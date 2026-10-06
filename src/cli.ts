@@ -34,6 +34,7 @@ program
   .option('--api-base <url>', 'Base URL for OpenAI-compatible provider (e.g. http://localhost:1234/v1)')
   .option('--api-key <key>', 'API key for OpenAI-compatible provider', 'not-needed')
   .option('-y, --yes', 'Automatically approve all tool executions without prompting', false)
+  .option('--auto', 'Run in Autonomous Mode (alias for -y, --yes)', false)
   .option('-d, --dir <path>', 'Workspace directory', process.cwd())
   .option('--architect <model>', 'Secondary deep reasoning / architect model for complex bug escalation')
   .option('--mode <type>', 'Initial execution mode: worker | architect', 'worker')
@@ -54,6 +55,7 @@ function parseContextOption(ctxOpt?: string): number | undefined {
   if (lower === '16k') return 16384;
   if (lower === '32k') return 32768;
   if (lower === '64k') return 65536;
+  if (lower === '128k') return 131072;
   const num = parseInt(lower, 10);
   return isNaN(num) ? undefined : num;
 }
@@ -114,13 +116,15 @@ async function main() {
     serverPath: options.llamaServer || process.env.LOCODE_LLAMA_SERVER_PATH,
     port: options.port ? parseInt(options.port, 10) : (process.env.LOCODE_LOCAL_MODEL_PORT ? parseInt(process.env.LOCODE_LOCAL_MODEL_PORT, 10) : 8081),
     autoStart: options.autoStart !== false && process.env.LOCODE_LOCAL_MODEL_AUTO_START !== 'false',
-    contextSize: numCtx,
-    ...(INFERENCE_PROFILES[profileName] || INFERENCE_PROFILES.performance)
+    ...(INFERENCE_PROFILES[profileName] || INFERENCE_PROFILES.performance),
+    contextSize: numCtx // Explicitly ensure user-configured numCtx overrides profile default!
   };
+
+  const isAutoMode = Boolean(options.yes || (options as any).auto);
 
   const context: AgentContext = {
     cwd: targetCwd,
-    autoApprove: options.yes,
+    autoApprove: isAutoMode,
     model: modelName,
     ollamaHost: options.host,
     provider: chosenProvider as any,
@@ -150,7 +154,13 @@ async function main() {
       });
       renderer.stopSpinner();
       context.apiBase = readyResult.apiBase;
-      renderer.printSuccess(`Model loaded & ready at ${readyResult.apiBase}`);
+      // Synchronize context.numCtx with actual server context!
+      const activeCtx = runtime.getConfig().contextSize;
+      if (activeCtx) {
+        context.numCtx = activeCtx;
+        llamaConfig.contextSize = activeCtx;
+      }
+      renderer.printSuccess(`Model loaded & ready at ${readyResult.apiBase} (context: ${context.numCtx.toLocaleString()} tokens)`);
     } catch (err: any) {
       renderer.stopSpinner();
       renderer.printError(`Failed to initialize local model runtime:\n${err.message}`);
@@ -187,8 +197,12 @@ async function main() {
 
   while (true) {
     try {
+      const modeTag = context.autoApprove
+        ? chalk.hex('#e5c07b')('⚡auto')
+        : chalk.hex('#5c6370')('safe');
+
       const userInput = await input({
-        message: chalk.bold.cyan('locode >'),
+        message: `${chalk.bold.hex('#61afef')('❯')} ${chalk.hex('#5c6370')(`[${modeTag}]`)} `,
       });
 
       const trimmed = userInput.trim();

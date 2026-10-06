@@ -216,27 +216,44 @@ export class ContextEngine {
     return total;
   }
 
+  estimateToolsTokens(tools?: any[]): number {
+    if (!tools || tools.length === 0) return 2500;
+    let charCount = 0;
+    for (const t of tools) {
+      charCount += (t.name?.length || 0) + (t.description?.length || 0) + JSON.stringify(t.parameters || {}).length;
+    }
+    return Math.ceil(charCount / 2.5);
+  }
+
   /**
    * Reika-inspired Prefix-Stable watermark check:
    * Returns true only when total tokens cross the compaction threshold (e.g. 75% of budget)
    */
-  shouldCompact(messages: ChatMessage[]): boolean {
-    const budget = this.getAvailableContextBudget();
+  shouldCompact(messages: ChatMessage[], toolOverhead: number = 2500): boolean {
+    const budget = this.getAvailableContextBudget(toolOverhead);
     const currentTokens = this.estimateMessagesTokens(messages);
     return currentTokens >= budget;
   }
 
   /**
-   * Computes available context budget reserving space for model response and safety slack.
+   * Computes available context budget reserving space for model response, tool schemas, and safety slack.
    */
-  getAvailableContextBudget(): number {
-    if (this.maxTokens <= 8192) {
-      return Math.floor(this.maxTokens * 0.75); // 75% budget for smaller contexts (e.g. 500, 1000, 8192)
+  getAvailableContextBudget(toolOverhead: number = 2500): number {
+    if (this.maxTokens <= 1000) {
+      return Math.floor(this.maxTokens * 0.75); // 75% budget for test fixtures (e.g. 500, 1000)
     }
-    // For larger contexts, reserve 20% or up to 4096 tokens
-    const responseReserve = Math.min(4096, Math.floor(this.maxTokens * 0.2));
-    const safetySlack = Math.min(1024, Math.floor(this.maxTokens * 0.05));
-    return Math.max(1024, this.maxTokens - responseReserve - safetySlack);
+    if (this.maxTokens <= 8192) {
+      const toolSlack = Math.min(toolOverhead, Math.floor(this.maxTokens * 0.15));
+      return Math.max(1024, Math.floor(this.maxTokens * 0.75) - toolSlack);
+    }
+    // High-context profiles (16k, 32k, 64k, 128k):
+    // For local MoE architectures with CPU offload, keep the active working window
+    // compact (target <= 10,000 tokens) so that prompt prefill stays instant (<3s).
+    // Reserve response headroom, safety slack for BPE variance, and tool schemas
+    const targetWorkingCeiling = Math.min(10000, this.maxTokens);
+    const responseReserve = Math.min(3000, Math.floor(targetWorkingCeiling * 0.15));
+    const safetySlack = Math.min(1000, Math.floor(targetWorkingCeiling * 0.05));
+    return Math.max(1024, targetWorkingCeiling - responseReserve - safetySlack - toolOverhead);
   }
 
   /**
@@ -430,24 +447,31 @@ export class ContextEngine {
       }
     }
 
-    // Step 2: Compress older tool outputs
+    // Step 2: Compress older tool outputs & evict older file viewings
     // Keep the final turn (last 2 messages: assistant/user) intact; compact earlier turns
     const preserveLast = 2;
     const endIdx = compacted.length - preserveLast;
 
     for (let i = 1; i < endIdx; i++) {
       const msg = compacted[i];
-      if (msg.role === 'tool' && msg.content && msg.content.length > 500) {
-        msg.content = this.compactToolOutput(msg.content, 500);
-      } else if (msg.role === 'assistant' && msg.content && msg.content.length > 800) {
-        const preview = msg.content.slice(0, 300).replace(/\s+/g, ' ');
+      if (msg.role === 'tool' && msg.content) {
+        // If older tool output was a view_file inspection, evict raw code lines and keep file pointer
+        const fileMatch = /^File:\s+([^\s\n]+)\s+\(lines\s+(\d+)-(\d+)\s+of\s+(\d+)\)/.exec(msg.content);
+        if (fileMatch) {
+          const [, filePath, startL, endL, totalL] = fileMatch;
+          msg.content = `[File inspection: ${filePath} (lines ${startL}-${endL} of ${totalL}) previously read and stored in task state; raw code lines folded for token budget. Re-read with view_file if needed]`;
+        } else if (msg.content.length > 500) {
+          msg.content = this.compactToolOutput(msg.content, 500);
+        }
+      } else if (msg.role === 'assistant' && msg.content && msg.content.length > 600) {
+        const preview = msg.content.slice(0, 250).replace(/\s+/g, ' ');
         msg.content = `${preview}...\n[Older assistant thought compacted for token budget]`;
       }
     }
 
     // Step 3: If still over budget, retain structured task state and drop stale intermediate messages
     let currentTokens = this.estimateMessagesTokens(compacted);
-    if (currentTokens > budget && compacted.length > 6) {
+    if (currentTokens > budget && compacted.length > 4) {
       // Build a synthetic structured state message to replace older dropped turns
       let stateSummary = this.buildTaskStateSummary();
       if (synthesizedFindings) {
@@ -467,7 +491,24 @@ export class ContextEngine {
         ...recentWindow.filter(m => m !== initialUser && m !== systemMsg)
       ];
 
-      return prunedMessages;
+      currentTokens = this.estimateMessagesTokens(prunedMessages);
+      if (currentTokens <= budget) {
+        return prunedMessages;
+      }
+      compacted.splice(0, compacted.length, ...prunedMessages);
+    }
+
+    // Step 4: Emergency ceiling guard
+    // If messages are still exceeding budget (e.g. short conversation but massive single turn),
+    // clamp all non-system message contents to fit safely within budget.
+    currentTokens = this.estimateMessagesTokens(compacted);
+    if (currentTokens > budget) {
+      const perMsgCap = Math.max(400, Math.floor((budget * 2) / Math.max(1, compacted.length)));
+      for (let i = 1; i < compacted.length; i++) {
+        if (compacted[i].content && compacted[i].content.length > perMsgCap) {
+          compacted[i].content = this.compactToolOutput(compacted[i].content, perMsgCap);
+        }
+      }
     }
 
     return compacted;

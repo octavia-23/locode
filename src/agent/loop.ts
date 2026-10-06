@@ -353,7 +353,13 @@ export class AgentLoop {
       // BEFORE dropping or folding older history.
       // Use tool_choice: 'none' so the tool schema prefix remains byte-identical in the engine's KV cache!
       let synthesizedFindings: string | undefined;
-      if (this.contextEngine.shouldCompact(this.messages) && this.messages.length > 6) {
+      const currentMsgTokens = this.contextEngine.estimateMessagesTokens(this.messages);
+      const toolTokens = this.contextEngine.estimateToolsTokens(allTools);
+      const maxTokens = this.contextEngine.getMaxTokens();
+      // Ensure we have at least 2,500 tokens of headroom before attempting pre-fold synthesis turn
+      const hasSynthesisHeadroom = currentMsgTokens + toolTokens < maxTokens - 1500;
+
+      if (this.contextEngine.shouldCompact(this.messages, toolTokens) && this.messages.length > 4 && hasSynthesisHeadroom) {
         this.renderer.startSpinner('Synthesizing working findings before context compaction...');
         try {
           const synthesisPrompt: ChatMessage = {
@@ -361,7 +367,8 @@ export class AgentLoop {
             content: '[SYNTHESIS DIRECTIVE] The context window is nearing its limit. In 2-3 concise sentences, summarize your key findings, inspected files, and pending action items so far. Do NOT call tools.'
           };
           const preFoldTurn = [...this.messages, synthesisPrompt];
-          const digest = await this.provider.chat(preFoldTurn, allTools, undefined, { toolChoice: 'none' });
+          // Pass empty tools to avoid tool schema overhead during synthesis turn
+          const digest = await this.provider.chat(preFoldTurn, [], undefined, { toolChoice: 'none' });
           if (digest.content && digest.content.trim()) {
             synthesizedFindings = digest.content.trim();
           }
@@ -374,6 +381,9 @@ export class AgentLoop {
 
       // Compact context respecting prefix stability
       const compacted = this.contextEngine.compactMessages(this.messages, synthesizedFindings);
+      if (compacted !== this.messages) {
+        this.messages = compacted;
+      }
 
       this.renderer.startSpinner(`Thinking with ${chalk.cyan(this.context.model)}...`);
 
@@ -535,7 +545,12 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
           role: 'assistant',
           content: outcome.rawContent || ''
         });
-        this.renderer.printTelemetry(outcome.usage);
+        const estTokens = this.contextEngine.estimateMessagesTokens(this.messages);
+        const maxTokens = this.contextEngine.getMaxTokens();
+        this.renderer.printTelemetry(outcome.usage, {
+          usedTokens: estTokens,
+          maxTokens: maxTokens
+        });
         break;
       }
 
@@ -683,11 +698,19 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
           }
         }
 
+        let toolOutput = executionResult.result || '';
+        // Ingest-time safety ceiling: clamp oversized raw tool outputs immediately (max 4,000 characters)
+        // so that massive terminal logs or huge file dumps never blow out the context window.
+        const MAX_TOOL_INGEST_CHARS = 4000;
+        if (toolOutput.length > MAX_TOOL_INGEST_CHARS) {
+          toolOutput = this.contextEngine.compactToolOutput(toolOutput, MAX_TOOL_INGEST_CHARS);
+        }
+
         this.messages.push({
           role: 'tool',
           name: toolName,
           tool_call_id: call.id,
-          content: executionResult.result
+          content: toolOutput
         });
       }
     }

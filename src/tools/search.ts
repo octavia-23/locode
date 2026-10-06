@@ -166,7 +166,9 @@ export async function searchCodeFallback(
       for (let idx = 0; idx < lines.length; idx++) {
         const line = lines[idx];
         if (regex.test(line)) {
-          results.push(`${relToCwd}:${idx + 1}: ${line.trim()}`);
+          const trimmed = line.trim();
+          const displayLine = trimmed.length > 250 ? trimmed.slice(0, 250) + '...' : trimmed;
+          results.push(`${relToCwd}:${idx + 1}: ${displayLine}`);
           if (results.length >= maxMatches) {
             results.push(`... [Truncated at ${maxMatches} matches]`);
             return results;
@@ -249,7 +251,9 @@ export const searchCodeTool: ToolDefinition = {
               const match = /^(\d+):(.*)$/.exec(line);
               if (match && currentFile) {
                 const relFile = path.relative(context.cwd, currentFile).replace(/\\/g, '/');
-                results.push(`${relFile}:${match[1]}: ${match[2].trim()}`);
+                const lineText = match[2].trim();
+                const displayLine = lineText.length > 250 ? lineText.slice(0, 250) + '...' : lineText;
+                results.push(`${relFile}:${match[1]}: ${displayLine}`);
               } else {
                 currentFile = line.trim();
               }

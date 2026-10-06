@@ -30,39 +30,51 @@ export class TerminalRenderer {
   }
 
   printHeader(model: string, cwd: string, autoApprove: boolean, hardwareProfile?: HardwareProfile, numCtx?: number, providerName?: string) {
-    const title = chalk.bold.hex('#61afef')('╔═══════════════════════════════════════════════════════╗');
-    const name  = chalk.bold.hex('#61afef')('║   🤖 LOCODE - Local-First AI Developer CLI (Node.js)  ║');
-    const foot  = chalk.bold.hex('#61afef')('╚═══════════════════════════════════════════════════════╝');
-    console.log(`\n${title}\n${name}\n${foot}`);
     const provDisplay = providerName === 'llamacpp' ? 'TurboQuant (llama.cpp)' : (providerName || 'Ollama');
-    console.log(chalk.gray(`  Model:     ${chalk.cyan(model)} (via ${provDisplay})`));
+    const ctxVal = (numCtx || hardwareProfile?.selectedCtx || hardwareProfile?.recommendedCtx || 32768).toLocaleString();
+    
+    // Sleek mode badge
+    const modeBadge = autoApprove 
+      ? chalk.bgHex('#d19a66').hex('#1e1e2e').bold(' ⚡ AUTO-PILOT ') 
+      : chalk.bgHex('#98c379').hex('#1e1e2e').bold(' 🛡 SAFE-MODE ');
+
+    const topBorder    = chalk.hex('#3b4252')('╭────────────────────────────────────────────────────────────────────────╮');
+    const bottomBorder = chalk.hex('#3b4252')('╰────────────────────────────────────────────────────────────────────────╯');
+    const sideBorder   = chalk.hex('#3b4252')('│');
+
+    console.log();
+    console.log(topBorder);
+    console.log(`${sideBorder}  ${chalk.bold.hex('#61afef')('✦ LOCODE')} ${chalk.hex('#5c6370')('│')} ${chalk.hex('#abb2bf')('Local-First Autonomous AI Engineer')}             ${sideBorder}`);
+    console.log(chalk.hex('#3b4252')('├────────────────────────────────────────────────────────────────────────┤'));
+    console.log(`${sideBorder}  ${chalk.dim('model')}      ${chalk.bold.whiteBright(model)} ${chalk.hex('#5c6370')(`(${provDisplay})`)}`);
+    
     if (hardwareProfile) {
       const memStr = hardwareProfile.totalVramMb > 0
         ? `${(hardwareProfile.totalVramMb / 1024).toFixed(1)} GB VRAM`
         : `${(hardwareProfile.totalRamMb / 1024).toFixed(1)} GB RAM`;
       const offloadBadge = hardwareProfile.measuredGpuOffloadVerified
-        ? chalk.green.bold('Verified 100% GPU Offload')
+        ? chalk.hex('#98c379')('● 100% GPU')
         : (hardwareProfile.estimatedFullOffload7B
-          ? chalk.blue.bold('Estimated GPU Offload')
-          : chalk.yellow.bold('Hybrid CPU/GPU Offload'));
-      const ctxVal = (numCtx || hardwareProfile.selectedCtx || hardwareProfile.recommendedCtx).toLocaleString();
-      console.log(chalk.gray(`  Hardware:  ${chalk.white(hardwareProfile.deviceName)} [${chalk.magenta(memStr)}]`));
-      console.log(chalk.gray(`  Context:   ${chalk.cyan(ctxVal + ' tokens')} [${offloadBadge}]`));
+          ? chalk.hex('#61afef')('● GPU Offload')
+          : chalk.hex('#e5c07b')('● Hybrid MoE'));
+      console.log(`${sideBorder}  ${chalk.dim('hardware')}   ${chalk.hex('#abb2bf')(hardwareProfile.deviceName)} ${chalk.hex('#e06c75')(`[${memStr}]`)} ${offloadBadge}`);
     }
-    console.log(chalk.gray(`  Workspace: ${chalk.white(cwd)}`));
-    console.log(chalk.gray(`  Approvals: ${autoApprove ? chalk.yellow('Auto-approve (Danger mode enabled)') : chalk.green('Interactive (Safe mode)')}`));
-    console.log(chalk.gray(`  Commands:  Type ${chalk.yellow('/help')} for options, or type your goal.\n`));
-  }
 
+    console.log(`${sideBorder}  ${chalk.dim('context')}    ${chalk.hex('#61afef')(`${ctxVal} tokens`)} · ${modeBadge}`);
+    console.log(`${sideBorder}  ${chalk.dim('workspace')}  ${chalk.hex('#d19a66')(cwd)}`);
+    console.log(bottomBorder);
+    console.log(chalk.hex('#5c6370')(`  Type ${chalk.yellow('/help')} for commands · ${chalk.yellow('/auto')} to toggle permissionless mode\n`));
+  }
 
   startSpinner(text: string) {
     if (!this.spinner) {
       this.spinner = ora({
-        text: chalk.dim(text),
-        color: 'cyan'
+        text: chalk.hex('#abb2bf')(text),
+        color: 'magenta',
+        spinner: 'dots12'
       }).start();
     } else {
-      this.spinner.text = chalk.dim(text);
+      this.spinner.text = chalk.hex('#abb2bf')(text);
     }
   }
 
@@ -75,22 +87,23 @@ export class TerminalRenderer {
 
   printToolCall(name: string, args: Record<string, any>) {
     this.stopSpinner();
-    const badge = chalk.bgCyan.black.bold(` TOOL `);
-    const toolName = chalk.cyan.bold(name);
-    console.log(`\n${badge} ${toolName}`);
+    const toolBadge = chalk.bgHex('#61afef').hex('#1e1e2e').bold(` ⚙ ${name.toUpperCase()} `);
+    console.log(`\n${toolBadge}`);
     
-    // Highlight specific tool arguments cleanly
     if (name === 'view_file' || name === 'write_file' || name === 'edit_file') {
-      console.log(chalk.dim(`  Path: ${chalk.whiteBright(args.path || args.target_file || args.file_path)}`));
+      const p = args.path || args.target_file || args.file_path;
+      console.log(`  ${chalk.hex('#5c6370')('↳')} ${chalk.dim('target')}   ${chalk.whiteBright.bold(p)}`);
     } else if (name === 'run_command') {
-      console.log(chalk.dim(`  Command: ${chalk.greenBright(args.command)}`));
+      console.log(`  ${chalk.hex('#5c6370')('↳')} ${chalk.dim('command')}  ${chalk.hex('#98c379').bold(args.command)}`);
     } else if (name === 'search_code') {
-      console.log(chalk.dim(`  Query: "${chalk.yellow(args.pattern || args.query)}"`));
+      console.log(`  ${chalk.hex('#5c6370')('↳')} ${chalk.dim('query')}    "${chalk.hex('#e5c07b')(args.pattern || args.query)}"`);
+    } else if (name === 'list_dir') {
+      console.log(`  ${chalk.hex('#5c6370')('↳')} ${chalk.dim('dir')}      ${chalk.hex('#d19a66')(args.path || '.')}`);
     } else {
       const summary = JSON.stringify(args, null, 2)
         .split('\n')
         .slice(0, 5)
-        .map(line => `  ${chalk.dim(line)}`)
+        .map(line => `  ${chalk.hex('#5c6370')(line)}`)
         .join('\n');
       console.log(summary);
     }
@@ -99,18 +112,18 @@ export class TerminalRenderer {
   printDiff(filePath: string, oldContent: string, newContent: string) {
     this.stopSpinner();
     const patch = createTwoFilesPatch(filePath, filePath, oldContent, newContent, 'Original', 'Modified');
-    console.log(chalk.bold.yellow(`\n📝 Proposed Changes for: ${filePath}`));
+    console.log(chalk.hex('#e5c07b').bold(`\n📝 Proposed Changes: ${chalk.whiteBright(filePath)}`));
     
     const lines = patch.split('\n').slice(4); // Skip diff headers
     for (const line of lines) {
       if (line.startsWith('+')) {
-        console.log(chalk.green(line));
+        console.log(chalk.hex('#98c379')(line));
       } else if (line.startsWith('-')) {
-        console.log(chalk.red(line));
+        console.log(chalk.hex('#e06c75')(line));
       } else if (line.startsWith('@')) {
-        console.log(chalk.cyan(line));
+        console.log(chalk.hex('#61afef')(line));
       } else {
-        console.log(chalk.gray(line));
+        console.log(chalk.hex('#5c6370')(line));
       }
     }
     console.log();
@@ -118,60 +131,92 @@ export class TerminalRenderer {
 
   printToolResult(name: string, result: string, isError: boolean = false) {
     this.stopSpinner();
-    const tag = isError ? chalk.bgRed.white.bold(' ERROR ') : chalk.bgGreen.black.bold(' RESULT ');
-    console.log(`${tag} ${chalk.dim(name)}`);
+    const tag = isError 
+      ? chalk.bgHex('#e06c75').hex('#1e1e2e').bold(' FAIL ') 
+      : chalk.bgHex('#98c379').hex('#1e1e2e').bold(' DONE ');
+    console.log(`  ${chalk.hex('#5c6370')('↳')} ${tag} ${chalk.hex('#5c6370')(name)}`);
     
-    // Truncate long results for console display
+    // Truncate long results for clean console display
     const lines = result.trim().split('\n');
     if (lines.length > 20) {
-      const preview = lines.slice(0, 15).join('\n');
-      console.log(chalk.gray(preview));
-      console.log(chalk.yellow(`  ... [${lines.length - 15} more lines hidden, passed to LLM] ...\n`));
+      const preview = lines.slice(0, 15).map(l => `    ${chalk.hex('#5c6370')(l)}`).join('\n');
+      console.log(preview);
+      console.log(chalk.hex('#e5c07b')(`    ... [${lines.length - 15} more lines hidden, processed in context] ...\n`));
     } else {
-      console.log(chalk.gray(result.trim() ? result.trim() : '(empty output)') + '\n');
+      const formatted = lines.map(l => `    ${chalk.hex('#abb2bf')(l)}`).join('\n');
+      console.log(formatted ? formatted + '\n' : '    (empty output)\n');
     }
   }
 
   printAssistantMessage(content: string) {
     this.stopSpinner();
     if (!content.trim()) return;
-    console.log(chalk.dim('─'.repeat(60)));
+    console.log(chalk.hex('#3b4252')('─'.repeat(72)));
     console.log(this.renderMarkdown(content));
-    console.log(chalk.dim('─'.repeat(60)));
+    console.log(chalk.hex('#3b4252')('─'.repeat(72)));
   }
 
   printError(message: string) {
     this.stopSpinner();
-    console.log(chalk.red(`\n✖ ${message}`));
+    console.log(chalk.hex('#e06c75').bold(`\n✖ ${message}`));
   }
 
   printWarning(message: string) {
     this.stopSpinner();
-    console.log(chalk.yellow(`\n⚠ ${message}`));
+    console.log(chalk.hex('#e5c07b')(`\n⚠ ${message}`));
   }
 
   printSuccess(message: string) {
     this.stopSpinner();
-    console.log(chalk.green(`\n✔ ${message}`));
+    console.log(chalk.hex('#98c379').bold(`\n✔ ${message}`));
   }
-
 
   printMentionedFiles(files: string[]) {
     if (files.length === 0) return;
-    const formatted = files.map(f => chalk.cyan(`@${f}`)).join(', ');
+    const formatted = files.map(f => chalk.hex('#61afef').bold(`@${f}`)).join(', ');
     console.log(chalk.dim(`📎 Injected context: ${formatted}\n`));
   }
 
-  printTelemetry(usage?: { totalTokens: number; durationMs: number; tokensPerSecond: number; completionTokens: number }) {
+  printTelemetry(
+    usage?: { totalTokens: number; durationMs: number; tokensPerSecond: number; completionTokens: number },
+    contextInfo?: { usedTokens: number; maxTokens: number; cacheHitRate?: number }
+  ) {
     if (!usage) return;
     const sec = (usage.durationMs / 1000).toFixed(1);
     const tps = usage.tokensPerSecond > 0 ? `${usage.tokensPerSecond} tok/s` : '';
-    const stats = [
-      `${usage.totalTokens} tokens`,
-      tps,
-      `${sec}s`
-    ].filter(Boolean).join(' · ');
+    
+    // Format Reika-style pills
+    const speedPill = tps ? chalk.hex('#98c379').bold(`⚡ ${tps}`) : '';
+    const turnTokens = chalk.hex('#61afef')(`${usage.completionTokens || usage.totalTokens} tok`);
+    const duration = chalk.hex('#5c6370')(`${sec}s`);
 
-    console.log(chalk.dim(`\n  ⚡ [${stats}]`));
+    let contextGauge = '';
+    if (contextInfo && contextInfo.maxTokens > 0) {
+      const pct = Math.min(100, Math.round((contextInfo.usedTokens / contextInfo.maxTokens) * 100));
+      const usedK = (contextInfo.usedTokens / 1024).toFixed(1);
+      const maxK = (contextInfo.maxTokens / 1024).toFixed(1);
+      
+      // Mini visual progress bar [████░░░░░░]
+      const totalBars = 8;
+      const filledBars = Math.min(totalBars, Math.round((pct / 100) * totalBars));
+      const barStr = '█'.repeat(filledBars) + '░'.repeat(totalBars - filledBars);
+      
+      const barColor = pct > 80 ? chalk.hex('#e06c75') : pct > 60 ? chalk.hex('#e5c07b') : chalk.hex('#61afef');
+      contextGauge = `ctx [${barColor(barStr)}] ${pct}% · ${usedK}k/${maxK}k`;
+    }
+
+    const hitPill = contextInfo?.cacheHitRate !== undefined 
+      ? chalk.hex('#98c379')(`cache ${contextInfo.cacheHitRate}%`)
+      : '';
+
+    const telemetryItems = [
+      speedPill,
+      turnTokens,
+      duration,
+      contextGauge ? chalk.hex('#5c6370')(contextGauge) : '',
+      hitPill
+    ].filter(Boolean).join(chalk.hex('#3b4252')(' │ '));
+
+    console.log(`\n  ${telemetryItems}\n`);
   }
 }

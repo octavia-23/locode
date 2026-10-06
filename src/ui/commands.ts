@@ -32,6 +32,7 @@ export async function handleSlashCommand(
       console.log(`  ${chalk.yellow('/context [size]')} - 📏 Switch context window (e.g. 32k, 64k, 16k)`);
       console.log(`  ${chalk.yellow('/profile [name]')} - ⚙️ Switch inference profile (performance, large-context, balanced)`);
       console.log(`  ${chalk.yellow('/mode [type]')}   - 🔀 Toggle execution mode ('worker' fast lane vs 'architect' deep lane)`);
+      console.log(`  ${chalk.yellow('/auto')}          - 🚀 Toggle Autonomous Mode (run all tools without asking for permission)`);
       console.log(`  ${chalk.yellow('/clear')}         - 🧹 Clear conversation memory and reset context`);
 
       console.log(`  ${chalk.yellow('/tools')}         - 🛠️ List all registered agent tools`);
@@ -221,7 +222,8 @@ export async function handleSlashCommand(
         console.log(`  • ${chalk.yellow('/context 8k')}   (8,192 tokens)`);
         console.log(`  • ${chalk.yellow('/context 16k')}  (16,384 tokens)`);
         console.log(`  • ${chalk.yellow('/context 32k')}  (32,768 tokens - Default TurboQuant Profile)`);
-        console.log(`  • ${chalk.yellow('/context 64k')}  (65,536 tokens - Extended Context Profile)\n`);
+        console.log(`  • ${chalk.yellow('/context 64k')}  (65,536 tokens - Extended Context Profile)`);
+        console.log(`  • ${chalk.yellow('/context 128k')} (131,072 tokens - TurboQuant Max Profile)\n`);
         return true;
       }
 
@@ -230,9 +232,10 @@ export async function handleSlashCommand(
       else if (arg.toLowerCase() === '16k') parsed = 16384;
       else if (arg.toLowerCase() === '32k') parsed = 32768;
       else if (arg.toLowerCase() === '64k') parsed = 65536;
+      else if (arg.toLowerCase() === '128k') parsed = 131072;
 
       if (!parsed || isNaN(parsed) || parsed < 1024) {
-        renderer.printError(`Invalid context size "${arg}". Choose 8k, 16k, 32k, or 64k.`);
+        renderer.printError(`Invalid context size "${arg}". Choose 8k, 16k, 32k, 64k, or 128k.`);
         return true;
       }
 
@@ -298,6 +301,27 @@ export async function handleSlashCommand(
         renderer.printSuccess(`Switched to Worker Mode (Fast lane active @ ~50 tok/s).`);
       } else {
         renderer.printError(`Unknown mode "${arg}". Choose 'worker' or 'architect'.`);
+      }
+      return true;
+    }
+
+    case '/auto':
+    case '/yes': {
+      const currentAuto = Boolean(agent.getContext().autoApprove);
+      let newAuto: boolean;
+
+      if (!arg) {
+        newAuto = !currentAuto;
+      } else {
+        const val = arg.trim().toLowerCase();
+        newAuto = val === 'on' || val === 'true' || val === '1' || val === 'yes';
+      }
+
+      agent.setContext({ autoApprove: newAuto });
+      if (newAuto) {
+        renderer.printSuccess(`Autonomous Mode ${chalk.bold.yellow('ACTIVATED')}: Locode will execute all tools without asking for permission.`);
+      } else {
+        renderer.printSuccess(`Interactive Mode ${chalk.bold.green('ACTIVATED')}: Locode will ask for permission before editing files or running commands.`);
       }
       return true;
     }

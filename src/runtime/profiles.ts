@@ -21,6 +21,7 @@ export interface LlamaRuntimeConfig {
   mlock: boolean;     // --mlock
   threads: number;    // -t 12
   jinja: boolean;     // --jinja
+  cacheReuse: number; // --cache-reuse N (min chunk size to reuse from KV cache)
 }
 
 export const DEFAULT_QWEN_MODEL_PATH =
@@ -42,7 +43,8 @@ export const INFERENCE_PROFILES: Record<InferenceProfileName, Partial<LlamaRunti
     noMmap: true,
     mlock: true,
     threads: 12,
-    jinja: true
+    jinja: true,
+    cacheReuse: 256
   },
   'large-context': {
     profileName: 'large-context',
@@ -57,7 +59,8 @@ export const INFERENCE_PROFILES: Record<InferenceProfileName, Partial<LlamaRunti
     noMmap: true,
     mlock: true,
     threads: 12,
-    jinja: true
+    jinja: true,
+    cacheReuse: 256
   },
   balanced: {
     profileName: 'balanced',
@@ -72,7 +75,8 @@ export const INFERENCE_PROFILES: Record<InferenceProfileName, Partial<LlamaRunti
     noMmap: false,
     mlock: false,
     threads: 8,
-    jinja: true
+    jinja: true,
+    cacheReuse: 256
   },
   custom: {
     profileName: 'custom'

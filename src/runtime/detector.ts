@@ -10,6 +10,7 @@ export interface BinaryFlagSupport {
   supportsNoMmap: boolean;
   supportsMlock: boolean;
   supportsJinja: boolean;
+  supportsCacheReuse: boolean;
 }
 
 export class RuntimeDetector {
@@ -81,7 +82,8 @@ export class RuntimeDetector {
         supportsFlashAttn: /--flash-attn|-fa/i.test(text),
         supportsNoMmap: /--no-mmap/i.test(text),
         supportsMlock: /--mlock/i.test(text),
-        supportsJinja: /--jinja/i.test(text)
+        supportsJinja: /--jinja/i.test(text),
+        supportsCacheReuse: /--cache-reuse/i.test(text)
       };
     } catch {
       // Conservative defaults if --help inspection fails
@@ -91,7 +93,8 @@ export class RuntimeDetector {
         supportsFlashAttn: true,
         supportsNoMmap: true,
         supportsMlock: true,
-        supportsJinja: true
+        supportsJinja: true,
+        supportsCacheReuse: true
       };
     }
   }

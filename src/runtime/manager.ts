@@ -131,8 +131,27 @@ export class LlamaCppRuntime {
       if (!res.ok) return false;
       const data: any = await res.json();
       const models = (data.data || []).map((m: any) => m.id);
-      // If server is up and either serves our alias or any model, reuse it
-      return models.length > 0;
+      if (models.length === 0) return false;
+
+      // Inspect running server's actual context size from /props
+      try {
+        const propsUrl = `http://${this.config.host}:${this.config.port}/props`;
+        const propsRes = await fetch(propsUrl, { signal: AbortSignal.timeout(1500) });
+        if (propsRes.ok) {
+          const propsData: any = await propsRes.json();
+          const serverCtx = propsData.default_generation_settings?.n_ctx;
+          if (typeof serverCtx === 'number' && serverCtx > 0) {
+            // If the running server has a smaller context size than requested, do NOT reuse it!
+            if (this.config.contextSize && serverCtx < this.config.contextSize) {
+              return false; // Force starting or switching to a server with requested context size!
+            }
+            // Align our runtime config with the running server's actual context size
+            this.config.contextSize = serverCtx;
+          }
+        }
+      } catch {}
+
+      return true;
     } catch {
       return false;
     }
@@ -178,6 +197,13 @@ export class LlamaCppRuntime {
     if (flags.supportsJinja && this.config.jinja) {
       args.push('--jinja');
     }
+
+    if (flags.supportsCacheReuse && this.config.cacheReuse && this.config.cacheReuse > 0) {
+      args.push('--cache-reuse', this.config.cacheReuse.toString());
+    }
+
+    // Explicitly restrict to 1 parallel slot to prevent multi-slot KV cache splitting & cold slot thrashing
+    args.push('-np', '1');
 
     return args;
   }

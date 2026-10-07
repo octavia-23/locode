@@ -5,7 +5,7 @@ import { resolveSafePath } from './security.js';
 
 export const viewFileTool: ToolDefinition = {
   name: 'view_file',
-  description: 'View the contents of a file with line numbers. By default shows the whole file (up to 600 lines) or specify start_line and end_line.',
+  description: 'View the contents of a file with line numbers. By default shows the whole file (up to 600 lines) or specify start_line and end_line. For large files (>800 lines), use outline=true or use search_code to locate the exact functions or lines needed.',
   parameters: {
     type: 'object',
     properties: {
@@ -20,6 +20,10 @@ export const viewFileTool: ToolDefinition = {
       end_line: {
         type: 'number',
         description: 'Optional end line number (1-indexed, inclusive)'
+      },
+      outline: {
+        type: 'boolean',
+        description: 'If true, returns an structural outline of function/class/export signatures with their line numbers. Ideal for large files.'
       }
     },
     required: ['path']
@@ -30,6 +34,24 @@ export const viewFileTool: ToolDefinition = {
       const fullPath = resolveSafePath(args.path, context.cwd);
       const content = await fs.readFile(fullPath, 'utf8');
       const lines = content.split('\n');
+
+      // Outline Mode for large files
+      if (args.outline) {
+        const outlineLines: string[] = [];
+        for (let idx = 0; idx < lines.length; idx++) {
+          const l = lines[idx];
+          if (/^\s*(export\s+)?(function|class|interface|type|const|let|var|def|class|pub\s+fn|async\s+function)\b/.test(l) ||
+              /^\s*(public|private|protected|static|async)?\s*([a-zA-Z0-9_$]+)\s*\([^)]*\)\s*[:{]/.test(l) ||
+              /^[A-Za-z0-9_#.-]+:/.test(l)) {
+            outlineLines.push(`${(idx + 1).toString().padStart(4, ' ')}: ${l.trimEnd()}`);
+          }
+        }
+        return {
+          result: `Outline for ${args.path} (${outlineLines.length} symbols in ${lines.length} lines):\n` +
+            (outlineLines.length > 0 ? outlineLines.join('\n') : '(No top-level declarations detected)') +
+            `\n\nUse search_code to locate specific methods, or view_file with start_line/end_line around the target symbol.`
+        };
+      }
       
       const start = args.start_line ? Math.max(1, Math.min(args.start_line, lines.length)) : 1;
       const defaultEnd = Math.min(lines.length, start + 600);
@@ -47,10 +69,12 @@ export const viewFileTool: ToolDefinition = {
         .join('\n');
 
       let header = `File: ${args.path} (lines ${start}-${end} of ${lines.length})\n`;
-      if (wasWindowCapped) {
+      if (lines.length > 800) {
+        header += `[NOTICE: Large file (${lines.length} lines). Do NOT paginate the entire file with view_file! Use 'search_code' to find the relevant function/variable, or 'view_file' with outline=true to see declarations, then proceed directly to 'edit_file']\n`;
+      } else if (wasWindowCapped) {
         header += `[Window capped at ${maxWindow} lines - read succeeded. Use start_line=${end + 1} to inspect further lines]\n`;
       } else if (end < lines.length && !args.end_line) {
-        header += `[Context limit: output truncated at line ${end} of ${lines.length} - read succeeded. Use start_line=${end + 1} if you need further lines]\n`;
+        header += `[Context limit: output truncated at line ${end} of ${lines.length} - read succeeded. Use search_code to jump to specific functions or start_line=${end + 1}]\n`;
       }
 
       if (context.contextEngine?.recordFileRead) {

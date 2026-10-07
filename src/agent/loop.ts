@@ -70,6 +70,7 @@ export interface ProgressTracker {
   recentToolSignatures: string[];
   recentFailureSignatures: string[];
   filesModified: Set<string>;
+  fileReadTurns: Map<string, number>;
   successfulToolCount: number;
   failedToolCount: number;
   consecutiveNoProgressCount: number;
@@ -371,6 +372,7 @@ export class AgentLoop {
       recentToolSignatures: [],
       recentFailureSignatures: [],
       filesModified: new Set<string>(),
+      fileReadTurns: new Map<string, number>(),
       successfulToolCount: 0,
       failedToolCount: 0,
       consecutiveNoProgressCount: 0,
@@ -604,7 +606,7 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         tool_calls: toolCalls
       });
 
-      // Progress Guard: Detect repetitive non-progress loops
+      // Progress Guard 1: Detect repetitive identical tool calls
       const currentCallSignature = toolCalls
         .map(tc => `${tc.function.name}:${JSON.stringify(tc.function.arguments)}`)
         .join(';');
@@ -619,16 +621,48 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         this.stats.progressLoopsDetected++;
         this.renderer.printWarning('Detected repetitive identical tool execution loop. Intervening with recovery directive...');
         
-        // Reset recent signature history so the model has a chance to execute the new directive without immediately re-triggering
         progress.recentToolSignatures = [];
 
-        // Return a tool result warning for each requested tool call so conversation invariants and tool_call pairings remain valid
         for (const call of toolCalls) {
           this.messages.push({
             role: 'tool',
             name: call.function.name,
             tool_call_id: call.id,
             content: `[PROGRESS GUARD WARNING] This exact tool action has been called ${duplicateCallCount} times without making new progress. Do not repeat this identical call. Please inspect an alternate file, run verification via run_command, or provide your final response.`
+          });
+        }
+        continue;
+      }
+
+      // Progress Guard 2: Trap obsessive single-file read loops
+      // If the model reads lines from the same file more than 6 times without making any edits,
+      // intervene immediately and command it to use search_code or edit_file!
+      let singleFileObsession = false;
+      let obsessedFilePath = '';
+      for (const call of toolCalls) {
+        if (call.function.name === 'view_file' && call.function.arguments?.path) {
+          const p = String(call.function.arguments.path);
+          const currentReads = (progress.fileReadTurns.get(p) || 0) + 1;
+          progress.fileReadTurns.set(p, currentReads);
+          if (currentReads >= 6 && !hasModifiedCode) {
+            singleFileObsession = true;
+            obsessedFilePath = p;
+            break;
+          }
+        }
+      }
+
+      if (singleFileObsession) {
+        this.renderer.printWarning(`Detected excessive sequential reads on "${obsessedFilePath}". Redirecting model to search_code or edit_file...`);
+        // Reset counter so it has a fresh chance after instruction
+        progress.fileReadTurns.set(obsessedFilePath, 0);
+
+        for (const call of toolCalls) {
+          this.messages.push({
+            role: 'tool',
+            name: call.function.name,
+            tool_call_id: call.id,
+            content: `[PROGRESS GUARD DIRECTIVE] You have read "${obsessedFilePath}" multiple times without modifying code. Stop paginating this file! Use 'search_code' to pinpoint specific symbols, or use 'edit_file' directly to implement the required changes now.`
           });
         }
         continue;

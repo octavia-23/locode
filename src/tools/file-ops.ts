@@ -72,9 +72,9 @@ export const viewFileTool: ToolDefinition = {
       if (lines.length > 800) {
         header += `[NOTICE: Large file (${lines.length} lines). Do NOT paginate the entire file with view_file! Use 'search_code' to find the relevant function/variable, or 'view_file' with outline=true to see declarations, then proceed directly to 'edit_file']\n`;
       } else if (wasWindowCapped) {
-        header += `[Window capped at ${maxWindow} lines - read succeeded. Use start_line=${end + 1} to inspect further lines]\n`;
+        header += `[Window capped at ${maxWindow} lines. Do NOT page through the file. Use 'search_code' to locate specific functions or proceed directly to 'edit_file']\n`;
       } else if (end < lines.length && !args.end_line) {
-        header += `[Context limit: output truncated at line ${end} of ${lines.length} - read succeeded. Use search_code to jump to specific functions or start_line=${end + 1}]\n`;
+        header += `[Context limit: output truncated at line ${end} of ${lines.length}. Use 'search_code' to locate specific functions or proceed directly to 'edit_file']\n`;
       }
 
       if (context.contextEngine?.recordFileRead) {
@@ -129,7 +129,7 @@ export const batchReadFilesTool: ToolDefinition = {
           
           let fileHeader = `--- File: ${p} (${Math.min(lines.length, maxLines)} of ${lines.length} lines) ---\n`;
           if (lines.length > maxLines) {
-            fileHeader += `[Truncated at line ${maxLines}. Use view_file with start_line=${maxLines + 1} for more]\n`;
+            fileHeader += `[Truncated at line ${maxLines}. Proceed directly to 'edit_file' or use 'search_code' for specific symbols]\n`;
           }
 
           results.push(fileHeader + formatted);

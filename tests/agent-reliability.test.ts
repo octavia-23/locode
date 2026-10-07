@@ -277,3 +277,81 @@ test('Agent Loop - Long task execution allows > 25 steps when making real progre
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 });
+
+test('Agent Loop - Autonomous Action Gate blocks passive read tools after 2 reads and forces edit_file', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-action-gate-'));
+  try {
+    const context: AgentContext = {
+      cwd: tmpDir,
+      autoApprove: true,
+      model: 'qwen2.5-coder:7b',
+      ollamaHost: 'http://127.0.0.1:11434'
+    };
+
+    const targetFile = 'app.js';
+    await fs.writeFile(path.join(tmpDir, targetFile), 'console.log("hello world");', 'utf8');
+
+    let actionGateBlockedSeen = false;
+
+    const mockProvider = new MockTestProvider([
+      // Turn 1: read file
+      () => ({
+        content: 'Inspecting code',
+        tool_calls: [{
+          function: { name: 'view_file', arguments: { path: targetFile } }
+        }]
+      }),
+      // Turn 2: read file again
+      () => ({
+        content: 'Inspecting code again',
+        tool_calls: [{
+          function: { name: 'view_file', arguments: { path: targetFile } }
+        }]
+      }),
+      // Turn 3: Model tries passive view_file a 3rd time (should be blocked by Action Gate!)
+      () => ({
+        content: 'Trying to read a 3rd time',
+        tool_calls: [{
+          function: { name: 'view_file', arguments: { path: targetFile } }
+        }]
+      }),
+      // Turn 4: Model inspects tool error with directive and calls edit_file
+      (messages) => {
+        const lastToolMsg = messages.find(m => m.role === 'tool' && m.content.includes('[EXECUTION BLOCKED - ACTION REQUIRED]'));
+        if (lastToolMsg) {
+          actionGateBlockedSeen = true;
+        }
+        return {
+          content: 'Editing code now',
+          tool_calls: [{
+            function: {
+              name: 'edit_file',
+              arguments: {
+                path: targetFile,
+                target_content: 'hello world',
+                replacement_content: 'hello autonomous world'
+              }
+            }
+          }]
+        };
+      },
+      // Turn 5: Clean final response
+      () => ({
+        content: 'Successfully updated app.js.'
+      })
+    ]);
+
+    const renderer = new TerminalRenderer();
+    const agent = new AgentLoop(context, renderer, mockProvider);
+    await agent.init();
+
+    await agent.run('Update app.js to say hello autonomous world');
+
+    assert.equal(actionGateBlockedSeen, true, 'Action gate must intercept 3rd passive read and provide execution directive');
+    const updatedContent = await fs.readFile(path.join(tmpDir, targetFile), 'utf8');
+    assert.equal(updatedContent, 'console.log("hello autonomous world");', 'File must be modified by edit_file');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+

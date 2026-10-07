@@ -75,6 +75,7 @@ export interface ProgressTracker {
   failedToolCount: number;
   consecutiveNoProgressCount: number;
   consecutiveEmptyResponses: number;
+  actionNudgeGiven?: boolean;
 }
 
 export class AgentLoop {
@@ -376,14 +377,14 @@ export class AgentLoop {
       successfulToolCount: 0,
       failedToolCount: 0,
       consecutiveNoProgressCount: 0,
-      consecutiveEmptyResponses: 0
+      consecutiveEmptyResponses: 0,
+      actionNudgeGiven: false
     };
 
     while (stepCount < safetyCeiling) {
       stepCount++;
 
-      // Run working synthesis ONLY once per compaction cycle (not every step!)
-      // and only when approaching the true context boundary
+      // Run working synthesis ONLY when code has already been modified, approaching true context boundary
       let synthesizedFindings: string | undefined;
       const currentMsgTokens = this.contextEngine.estimateMessagesTokens(this.messages);
       const toolTokens = this.contextEngine.estimateToolsTokens(allTools);
@@ -391,11 +392,13 @@ export class AgentLoop {
       const hasSynthesisHeadroom = currentMsgTokens + toolTokens < maxTokens - 1500;
 
       if (
+        hasModifiedCode &&
+        stepCount >= 15 &&
         this.contextEngine.shouldCompact(this.messages, toolTokens) &&
         this.messages.length > 8 &&
         hasSynthesisHeadroom &&
         progress.consecutiveNoProgressCount === 0 &&
-        stepCount % 5 === 0 // Don't interrupt every single turn with synthesis
+        stepCount % 10 === 0
       ) {
         this.renderer.startSpinner('Saving working state before memory fold...');
         try {
@@ -512,6 +515,24 @@ Please proceed with the next tool call (e.g., view_file, edit_file, run_command)
 
       // Outcome C: Text Only (No Tool Calls Requested)
       if (outcome.type === 'TEXT_FINAL' || !outcome.toolCalls || outcome.toolCalls.length === 0) {
+        // Anti-Procrastination Nudge: If user requested code modification, but model only returned text without edits
+        if (!hasModifiedCode && readStepCount >= 1 && !progress.actionNudgeGiven) {
+          const isModificationRequest = /\b(add|fix|edit|modify|update|change|create|implement|style|improve|refactor|remove|delete|write|build|setup|redesign)\b/i.test(userInput);
+          if (isModificationRequest) {
+            progress.actionNudgeGiven = true;
+            this.renderer.printWarning('Model described modifications without invoking edit tools. Nudging to apply changes...');
+            this.messages.push({
+              role: 'assistant',
+              content: outcome.rawContent || ''
+            });
+            this.messages.push({
+              role: 'user',
+              content: `[ACTION DIRECTIVE] Do not just describe the plan or findings. Please execute 'edit_file' or 'write_file' now to apply these concrete changes to the codebase.`
+            });
+            continue;
+          }
+        }
+
         // Autonomous Verification & Self-Repair Gate
         if (hasModifiedCode && repairAttempts < maxRepairAttempts) {
           this.renderer.startSpinner('Running automated verification & health check...');
@@ -646,9 +667,7 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         continue;
       }
 
-      // Progress Guard 2: Trap obsessive single-file read loops & force action
-      // If the model reads from the same file 3+ times without writing code, or has done >8 read steps with 0 edits,
-      // intervene immediately and force it to execute edit_file/write_file!
+      // Progress Guard 2: Trap obsessive single-file read loops & accelerate to action gate
       let singleFileObsession = false;
       let obsessedFilePath = '';
       for (const call of toolCalls) {
@@ -656,7 +675,7 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
           const p = String(call.function.arguments.path);
           const currentReads = (progress.fileReadTurns.get(p) || 0) + 1;
           progress.fileReadTurns.set(p, currentReads);
-          if (currentReads >= 3 && !hasModifiedCode) {
+          if (currentReads >= 2 && !hasModifiedCode) {
             singleFileObsession = true;
             obsessedFilePath = p;
             break;
@@ -664,32 +683,48 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         }
       }
 
-      const totalExplorationOnlyTurns = readStepCount >= 8 && mutationStepCount === 0;
-
-      if (singleFileObsession || totalExplorationOnlyTurns) {
-        const reason = singleFileObsession
-          ? `You have read "${obsessedFilePath}" 3 times without writing code.`
-          : `You have spent ${readStepCount} turns exploring without writing any code.`;
-
-        this.renderer.printWarning(`${reason} Forcing transition to edit_file/write_file...`);
-        if (singleFileObsession) progress.fileReadTurns.set(obsessedFilePath, 0);
-
-        for (const call of toolCalls) {
-          this.messages.push({
-            role: 'tool',
-            name: call.function.name,
-            tool_call_id: call.id,
-            content: `[MANDATORY ACTION DIRECTIVE] ${reason} Stop reading and stop synthesizing. You already have enough context. You MUST now execute 'edit_file' or 'write_file' to apply the concrete code changes, or provide your final solution.`
-          });
-        }
-        continue;
+      if (singleFileObsession) {
+        readStepCount = Math.max(readStepCount, 2);
+        progress.fileReadTurns.set(obsessedFilePath, 0);
       }
+
+      const isPassiveTool = (name: string) =>
+        name === 'view_file' ||
+        name === 'search_code' ||
+        name === 'batch_read_files' ||
+        name === 'list_dir' ||
+        name === 'find_by_name';
 
       // Execute each tool call sequentially
       for (const call of toolCalls) {
         this.stats.toolCalls++;
         const toolName = call.function.name;
-        const toolArgs = call.function.arguments;
+        const toolArgs = call.function.arguments || {};
+
+        // RUNTIME ACTION GATE:
+        // If shouldForceMutationTools is true, passive inspection tools are strictly blocked at runtime.
+        // Provide the model an exact edit_file syntax template targeting the file it attempted to inspect.
+        if (shouldForceMutationTools && isPassiveTool(toolName)) {
+          this.stats.failedToolCalls++;
+          const targetFile = toolArgs.path || (toolArgs.paths && toolArgs.paths[0]) || obsessedFilePath || '';
+          const targetHint = targetFile ? ` on "${targetFile}"` : '';
+          const directive = `[EXECUTION BLOCKED - ACTION REQUIRED] You have completed code exploration (${readStepCount} reads). Tool "${toolName}" is DISABLED in execution mode.
+You MUST execute 'edit_file' or 'write_file' now${targetHint} to apply your code changes.
+Example 'edit_file' invocation:
+{
+  "path": "${targetFile || 'path/to/file'}",
+  "target_content": "<exact code to replace>",
+  "replacement_content": "<new updated code>"
+}`;
+          this.renderer.printWarning(`Blocked passive tool "${toolName}" — forcing 'edit_file' / 'write_file' execution.`);
+          this.messages.push({
+            role: 'tool',
+            name: toolName,
+            tool_call_id: call.id,
+            content: directive
+          });
+          continue;
+        }
 
         const tool = toolRegistry.get(toolName);
         if (!tool) {

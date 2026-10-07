@@ -15,6 +15,7 @@ import { resolveFileMentions } from './mentions.js';
 import { MCPManager } from '../mcp/manager.js';
 import { CodeVerifier } from './verifier.js';
 import { ArchitectEngine } from './architect.js';
+import { SessionMemory } from './memory.js';
 
 export interface SessionStats {
   turns: number;
@@ -102,6 +103,8 @@ export class AgentLoop {
     tokensAvoidedByDeduplication: 0
   };
 
+  private sessionMemory: SessionMemory;
+
   constructor(context: AgentContext, renderer: TerminalRenderer, customProvider?: ILLMProvider) {
     this.context = context;
     this.renderer = renderer;
@@ -110,6 +113,7 @@ export class AgentLoop {
     this.context.contextEngine = this.contextEngine;
     this.checkpointManager = new CheckpointManager(context.cwd);
     this.mcpManager = new MCPManager(context.cwd);
+    this.sessionMemory = new SessionMemory(context.cwd);
   }
 
   async init() {
@@ -117,6 +121,26 @@ export class AgentLoop {
       role: 'system',
       content: await buildSystemPrompt(this.context.cwd)
     }];
+
+    // Restore previous session memory if available
+    const prevSession = await this.sessionMemory.loadSession();
+    if (prevSession && prevSession.messages.length > 0) {
+      // Rehydrate durable decisions and task state
+      if (prevSession.lastDecisions && prevSession.lastDecisions.length > 0) {
+        for (const dec of prevSession.lastDecisions) {
+          this.contextEngine.addDecision(dec);
+        }
+      }
+
+      // Rehydrate previous non-system messages into context
+      this.messages.push(...prevSession.messages);
+
+      const turnCount = prevSession.messages.filter(m => m.role === 'user').length;
+      const fileCount = prevSession.recentFiles?.length || 0;
+      this.renderer.printSuccess(
+        `Restored session memory: ${turnCount} previous turns reloaded (${fileCount} relevant files tracked)`
+      );
+    }
 
     // Connect MCP servers if configured
     const mcpTools = await this.mcpManager.init();
@@ -181,6 +205,11 @@ export class AgentLoop {
       role: 'system',
       content: await buildSystemPrompt(this.context.cwd)
     }];
+    await this.sessionMemory.clearSession();
+  }
+
+  getSessionMemory(): SessionMemory {
+    return this.sessionMemory;
   }
 
   getMessages(): ChatMessage[] {
@@ -327,11 +356,13 @@ export class AgentLoop {
       content: processedPrompt
     });
 
-    // Adaptive execution budget instead of a tiny rigid step ceiling:
-    // A complex refactor can legitimately take dozens of tool calls,
-    // while non-progress loops or pathological repetitions terminate deterministically.
-    const safetyCeiling = 150;
+    // Adaptive execution budget:
+    // Decouple read/inspection actions from active mutations so the model never exhausts its budget
+    // while researching code. When active modifications occur, the leash dynamically extends.
+    let safetyCeiling = 150;
     let stepCount = 0;
+    let readStepCount = 0;
+    let mutationStepCount = 0;
     let hasModifiedCode = false;
     let repairAttempts = 0;
     const maxRepairAttempts = 3;
@@ -551,6 +582,15 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
           usedTokens: estTokens,
           maxTokens: maxTokens
         });
+
+        // Save session memory for instant recall next time
+        await this.sessionMemory.saveSession({
+          model: this.context.model,
+          messages: this.messages,
+          lastDecisions: this.contextEngine.getTaskState().decisions,
+          recentFiles: this.contextEngine.getTaskState().relevantFiles,
+          summary: outcome.rawContent
+        });
         break;
       }
 
@@ -686,6 +726,13 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
 
         this.renderer.printToolResult(toolName, executionResult.result, executionResult.isError);
 
+        const isMutation = toolName === 'edit_file' || toolName === 'write_file' || toolName === 'run_command';
+        if (isMutation) {
+          mutationStepCount++;
+        } else {
+          readStepCount++;
+        }
+
         if (executionResult.isError) {
           this.stats.failedToolCalls++;
           progress.failedToolCount++;
@@ -695,6 +742,11 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
           if ((toolName === 'edit_file' || toolName === 'write_file') && toolArgs.path) {
             hasModifiedCode = true;
             progress.filesModified.add(toolArgs.path);
+            // DYNAMIC LEASH EXTENSION: When the model makes a successful file edit,
+            // ensure it always has at least 80 steps remaining from now so it never gets throttled mid-refactor!
+            if (safetyCeiling - stepCount < 80) {
+              safetyCeiling = stepCount + 80;
+            }
           }
         }
 

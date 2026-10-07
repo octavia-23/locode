@@ -93,6 +93,10 @@ export class TerminalRenderer {
     if (name === 'view_file' || name === 'write_file' || name === 'edit_file') {
       const p = args.path || args.target_file || args.file_path;
       console.log(`  ${chalk.hex('#5c6370')('↳')} ${chalk.dim('target')}   ${chalk.whiteBright.bold(p)}`);
+    } else if (name === 'batch_read_files') {
+      const count = Array.isArray(args.paths) ? args.paths.length : 0;
+      const preview = Array.isArray(args.paths) ? args.paths.slice(0, 3).join(', ') : '';
+      console.log(`  ${chalk.hex('#5c6370')('↳')} ${chalk.dim('files')}    ${chalk.whiteBright.bold(`${count} files`)} (${chalk.hex('#d19a66')(preview)}${count > 3 ? '...' : ''})`);
     } else if (name === 'run_command') {
       console.log(`  ${chalk.hex('#5c6370')('↳')} ${chalk.dim('command')}  ${chalk.hex('#98c379').bold(args.command)}`);
     } else if (name === 'search_code') {

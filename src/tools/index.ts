@@ -1,11 +1,12 @@
 import { ToolDefinition } from '../types.js';
-import { viewFileTool, writeFileTool, editFileTool } from './file-ops.js';
+import { viewFileTool, batchReadFilesTool, writeFileTool, editFileTool } from './file-ops.js';
 import { listDirTool, searchCodeTool } from './search.js';
 import { runCommandTool } from './terminal.js';
 import { fetchWebTool, searchWebTool } from './web.js';
 
 export const allTools: ToolDefinition[] = [
   viewFileTool,
+  batchReadFilesTool,
   writeFileTool,
   editFileTool,
   listDirTool,

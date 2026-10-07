@@ -328,7 +328,37 @@ export async function handleSlashCommand(
 
     case '/clear': {
       await agent.clearHistory();
-      renderer.printSuccess('Conversation context reset.');
+      renderer.printSuccess('Conversation context & saved session memory reset.');
+      return true;
+    }
+
+    case '/memory': {
+      const mem = agent.getSessionMemory();
+      const has = await mem.hasPreviousSession();
+      if (!has) {
+        console.log(chalk.gray('\nNo persisted session memory saved yet in .locode/session.json.\n'));
+        return true;
+      }
+      const data = await mem.loadSession();
+      if (!data) {
+        console.log(chalk.gray('\nSession memory file is empty or invalid.\n'));
+        return true;
+      }
+
+      console.log(`\n${chalk.bold.cyan('🧠 Persisted Session Memory (.locode/session.json):')}`);
+      console.log(`  • Last updated:   ${chalk.yellow(data.updatedAt)}`);
+      console.log(`  • Model:          ${chalk.green(data.model)}`);
+      console.log(`  • Saved messages: ${chalk.white(data.messages.length)}`);
+      if (data.recentFiles && data.recentFiles.length > 0) {
+        console.log(`  • Tracked files:  ${chalk.cyan(data.recentFiles.join(', '))}`);
+      }
+      if (data.lastDecisions && data.lastDecisions.length > 0) {
+        console.log(`  • Decisions:`);
+        for (const d of data.lastDecisions) {
+          console.log(`    - ${chalk.gray(d)}`);
+        }
+      }
+      console.log(chalk.dim('\n  Use /clear to purge persisted memory.\n'));
       return true;
     }
 

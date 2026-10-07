@@ -5,7 +5,7 @@ import { resolveSafePath } from './security.js';
 
 export const viewFileTool: ToolDefinition = {
   name: 'view_file',
-  description: 'View the contents of a file with line numbers. You can specify start_line and end_line (1-indexed).',
+  description: 'View the contents of a file with line numbers. By default shows the whole file (up to 600 lines) or specify start_line and end_line.',
   parameters: {
     type: 'object',
     properties: {
@@ -32,9 +32,9 @@ export const viewFileTool: ToolDefinition = {
       const lines = content.split('\n');
       
       const start = args.start_line ? Math.max(1, Math.min(args.start_line, lines.length)) : 1;
-      const defaultEnd = Math.min(lines.length, start + 250);
+      const defaultEnd = Math.min(lines.length, start + 600);
       let end = args.end_line ? Math.min(lines.length, Math.max(start, args.end_line)) : defaultEnd;
-      const maxWindow = 350;
+      const maxWindow = 700;
       let wasWindowCapped = false;
       if (end - start + 1 > maxWindow) {
         end = start + maxWindow - 1;
@@ -48,7 +48,7 @@ export const viewFileTool: ToolDefinition = {
 
       let header = `File: ${args.path} (lines ${start}-${end} of ${lines.length})\n`;
       if (wasWindowCapped) {
-        header += `[Window capped at ${maxWindow} lines to preserve context - read succeeded. Use start_line=${end + 1} to inspect further lines]\n`;
+        header += `[Window capped at ${maxWindow} lines - read succeeded. Use start_line=${end + 1} to inspect further lines]\n`;
       } else if (end < lines.length && !args.end_line) {
         header += `[Context limit: output truncated at line ${end} of ${lines.length} - read succeeded. Use start_line=${end + 1} if you need further lines]\n`;
       }
@@ -60,6 +60,67 @@ export const viewFileTool: ToolDefinition = {
       return { result: header + formatted };
     } catch (err: any) {
       return { result: `Failed to read file "${args.path}": ${err.message}`, isError: true };
+    }
+  }
+};
+
+export const batchReadFilesTool: ToolDefinition = {
+  name: 'batch_read_files',
+  description: 'Inspect multiple files in a single tool call to understand architecture or dependencies without wasting individual turns.',
+  parameters: {
+    type: 'object',
+    properties: {
+      paths: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Array of file paths to read'
+      },
+      max_lines_per_file: {
+        type: 'number',
+        description: 'Maximum lines to read per file (default: 200)'
+      }
+    },
+    required: ['paths']
+  },
+  needsApproval: false,
+  async execute(args, context) {
+    try {
+      const paths: string[] = args.paths || [];
+      if (paths.length === 0) {
+        return { result: 'No file paths provided.', isError: true };
+      }
+
+      const maxLines = args.max_lines_per_file || 200;
+      const results: string[] = [];
+
+      for (const p of paths.slice(0, 10)) { // limit to 10 files per batch
+        try {
+          const fullPath = resolveSafePath(p, context.cwd);
+          const content = await fs.readFile(fullPath, 'utf8');
+          const lines = content.split('\n');
+          const displayLines = lines.slice(0, maxLines);
+          const formatted = displayLines
+            .map((line, idx) => `${(idx + 1).toString().padStart(4, ' ')}: ${line}`)
+            .join('\n');
+          
+          let fileHeader = `--- File: ${p} (${Math.min(lines.length, maxLines)} of ${lines.length} lines) ---\n`;
+          if (lines.length > maxLines) {
+            fileHeader += `[Truncated at line ${maxLines}. Use view_file with start_line=${maxLines + 1} for more]\n`;
+          }
+
+          results.push(fileHeader + formatted);
+
+          if (context.contextEngine?.recordFileRead) {
+            context.contextEngine.recordFileRead(p, content);
+          }
+        } catch (err: any) {
+          results.push(`--- File: ${p} ---\n[Error reading file: ${err.message}]`);
+        }
+      }
+
+      return { result: results.join('\n\n') };
+    } catch (err: any) {
+      return { result: `Failed to batch read files: ${err.message}`, isError: true };
     }
   }
 };

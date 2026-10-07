@@ -137,3 +137,60 @@ test('File Operations - edit_file strips accidental view_file line numbers and w
 
   await fs.rm(tmpDir, { recursive: true, force: true });
 });
+
+test('File Operations - batch_read_files inspects multiple files in one call', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-batch-read-'));
+  const ctx: AgentContext = {
+    cwd: tmpDir,
+    autoApprove: true,
+    model: 'locode-qwen35b-a3b'
+  };
+
+  await fs.writeFile(path.join(tmpDir, 'fileA.ts'), 'export const a = 1;\n', 'utf8');
+  await fs.writeFile(path.join(tmpDir, 'fileB.ts'), 'export const b = 2;\n', 'utf8');
+
+  const { batchReadFilesTool } = await import('../src/tools/file-ops.js');
+  const res = await batchReadFilesTool.execute({
+    paths: ['fileA.ts', 'fileB.ts']
+  }, ctx);
+
+  assert.equal(res.isError, undefined);
+  assert.match(res.result, /fileA\.ts/);
+  assert.match(res.result, /export const a = 1;/);
+  assert.match(res.result, /fileB\.ts/);
+  assert.match(res.result, /export const b = 2;/);
+
+  await fs.rm(tmpDir, { recursive: true, force: true });
+});
+
+test('SessionMemory - persists and restores conversation and decisions', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-memory-'));
+  const { SessionMemory } = await import('../src/agent/memory.js');
+  const memory = new SessionMemory(tmpDir);
+
+  assert.equal(await memory.hasPreviousSession(), false);
+
+  await memory.saveSession({
+    model: 'qwen2.5-coder:7b',
+    messages: [
+      { role: 'user', content: 'Fix the login bug' },
+      { role: 'assistant', content: 'Fixed the login bug in auth.ts' }
+    ],
+    lastDecisions: ['Used JWT token expiration'],
+    recentFiles: ['src/auth.ts']
+  });
+
+  assert.equal(await memory.hasPreviousSession(), true);
+
+  const restored = await memory.loadSession();
+  assert.ok(restored);
+  assert.equal(restored.messages.length, 2);
+  assert.equal(restored.messages[0].content, 'Fix the login bug');
+  assert.deepEqual(restored.lastDecisions, ['Used JWT token expiration']);
+  assert.deepEqual(restored.recentFiles, ['src/auth.ts']);
+
+  await memory.clearSession();
+  assert.equal(await memory.hasPreviousSession(), false);
+
+  await fs.rm(tmpDir, { recursive: true, force: true });
+});

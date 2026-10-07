@@ -247,13 +247,11 @@ export class ContextEngine {
       return Math.max(1024, Math.floor(this.maxTokens * 0.75) - toolSlack);
     }
     // High-context profiles (16k, 32k, 64k, 128k):
-    // For local MoE architectures with CPU offload, keep the active working window
-    // compact (target <= 10,000 tokens) so that prompt prefill stays instant (<3s).
-    // Reserve response headroom, safety slack for BPE variance, and tool schemas
-    const targetWorkingCeiling = Math.min(10000, this.maxTokens);
-    const responseReserve = Math.min(3000, Math.floor(targetWorkingCeiling * 0.15));
-    const safetySlack = Math.min(1000, Math.floor(targetWorkingCeiling * 0.05));
-    return Math.max(1024, targetWorkingCeiling - responseReserve - safetySlack - toolOverhead);
+    // Allow the model to actually use its full allocated context window.
+    // Reserve response headroom (15%), tool schemas, and safety slack (5%).
+    const responseReserve = Math.min(4096, Math.floor(this.maxTokens * 0.15));
+    const safetySlack = Math.min(2048, Math.floor(this.maxTokens * 0.05));
+    return Math.max(4096, Math.floor(this.maxTokens * 0.80) - responseReserve - safetySlack - toolOverhead);
   }
 
   /**

@@ -382,31 +382,34 @@ export class AgentLoop {
     while (stepCount < safetyCeiling) {
       stepCount++;
 
-      // Reika Lesson: When compaction is due, run a quick synthesis turn to ask the model for its findings
-      // BEFORE dropping or folding older history.
-      // Use tool_choice: 'none' so the tool schema prefix remains byte-identical in the engine's KV cache!
+      // Run working synthesis ONLY once per compaction cycle (not every step!)
+      // and only when approaching the true context boundary
       let synthesizedFindings: string | undefined;
       const currentMsgTokens = this.contextEngine.estimateMessagesTokens(this.messages);
       const toolTokens = this.contextEngine.estimateToolsTokens(allTools);
       const maxTokens = this.contextEngine.getMaxTokens();
-      // Ensure we have at least 2,500 tokens of headroom before attempting pre-fold synthesis turn
       const hasSynthesisHeadroom = currentMsgTokens + toolTokens < maxTokens - 1500;
 
-      if (this.contextEngine.shouldCompact(this.messages, toolTokens) && this.messages.length > 4 && hasSynthesisHeadroom) {
-        this.renderer.startSpinner('Synthesizing working findings before context compaction...');
+      if (
+        this.contextEngine.shouldCompact(this.messages, toolTokens) &&
+        this.messages.length > 8 &&
+        hasSynthesisHeadroom &&
+        progress.consecutiveNoProgressCount === 0 &&
+        stepCount % 5 === 0 // Don't interrupt every single turn with synthesis
+      ) {
+        this.renderer.startSpinner('Saving working state before memory fold...');
         try {
           const synthesisPrompt: ChatMessage = {
             role: 'user',
-            content: '[SYNTHESIS DIRECTIVE] The context window is nearing its limit. In 2-3 concise sentences, summarize your key findings, inspected files, and pending action items so far. Do NOT call tools.'
+            content: '[DIRECTIVE] Working state fold. State in 1 sentence what code modification you will apply next. Then immediately apply it with edit_file or write_file.'
           };
           const preFoldTurn = [...this.messages, synthesisPrompt];
-          // Pass empty tools to avoid tool schema overhead during synthesis turn
           const digest = await this.provider.chat(preFoldTurn, [], undefined, { toolChoice: 'none' });
           if (digest.content && digest.content.trim()) {
             synthesizedFindings = digest.content.trim();
           }
         } catch {
-          // Graceful fallback: continue standard compaction if synthesis fails
+          // Graceful fallback
         } finally {
           this.renderer.stopSpinner();
         }
@@ -634,9 +637,9 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         continue;
       }
 
-      // Progress Guard 2: Trap obsessive single-file read loops
-      // If the model reads lines from the same file more than 6 times without making any edits,
-      // intervene immediately and command it to use search_code or edit_file!
+      // Progress Guard 2: Trap obsessive single-file read loops & force action
+      // If the model reads from the same file 3+ times without writing code, or has done >8 read steps with 0 edits,
+      // intervene immediately and force it to execute edit_file/write_file!
       let singleFileObsession = false;
       let obsessedFilePath = '';
       for (const call of toolCalls) {
@@ -644,7 +647,7 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
           const p = String(call.function.arguments.path);
           const currentReads = (progress.fileReadTurns.get(p) || 0) + 1;
           progress.fileReadTurns.set(p, currentReads);
-          if (currentReads >= 6 && !hasModifiedCode) {
+          if (currentReads >= 3 && !hasModifiedCode) {
             singleFileObsession = true;
             obsessedFilePath = p;
             break;
@@ -652,17 +655,22 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         }
       }
 
-      if (singleFileObsession) {
-        this.renderer.printWarning(`Detected excessive sequential reads on "${obsessedFilePath}". Redirecting model to search_code or edit_file...`);
-        // Reset counter so it has a fresh chance after instruction
-        progress.fileReadTurns.set(obsessedFilePath, 0);
+      const totalExplorationOnlyTurns = readStepCount >= 8 && mutationStepCount === 0;
+
+      if (singleFileObsession || totalExplorationOnlyTurns) {
+        const reason = singleFileObsession
+          ? `You have read "${obsessedFilePath}" 3 times without writing code.`
+          : `You have spent ${readStepCount} turns exploring without writing any code.`;
+
+        this.renderer.printWarning(`${reason} Forcing transition to edit_file/write_file...`);
+        if (singleFileObsession) progress.fileReadTurns.set(obsessedFilePath, 0);
 
         for (const call of toolCalls) {
           this.messages.push({
             role: 'tool',
             name: call.function.name,
             tool_call_id: call.id,
-            content: `[PROGRESS GUARD DIRECTIVE] You have read "${obsessedFilePath}" multiple times without modifying code. Stop paginating this file! Use 'search_code' to pinpoint specific symbols, or use 'edit_file' directly to implement the required changes now.`
+            content: `[MANDATORY ACTION DIRECTIVE] ${reason} Stop reading and stop synthesizing. You already have enough context. You MUST now execute 'edit_file' or 'write_file' to apply the concrete code changes, or provide your final solution.`
           });
         }
         continue;

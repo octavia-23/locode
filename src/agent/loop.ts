@@ -421,12 +421,21 @@ export class AgentLoop {
         this.messages = compacted;
       }
 
+      // AGGRESSIVE AUTONOMOUS ACTION GATE:
+      // If the model has completed 2+ exploration calls without editing code,
+      // temporarily withdraw passive read tools so the ONLY available actions are edit_file, write_file, and run_command!
+      // This makes it physically impossible for the local model to procrastinate or get stuck in read loops.
+      const shouldForceMutationTools = readStepCount >= 2 && mutationStepCount === 0;
+      const activeTools = shouldForceMutationTools
+        ? allTools.filter(t => t.name === 'edit_file' || t.name === 'write_file' || t.name === 'run_command')
+        : allTools;
+
       this.renderer.startSpinner(`Thinking with ${chalk.cyan(this.context.model)}...`);
 
       let rawResponse: any;
       let rawError: any;
       try {
-        rawResponse = await this.provider.chat(compacted, allTools);
+        rawResponse = await this.provider.chat(compacted, activeTools);
       } catch (err: any) {
         rawError = err;
       } finally {

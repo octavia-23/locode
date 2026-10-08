@@ -11,6 +11,7 @@ export interface BinaryFlagSupport {
   supportsMlock: boolean;
   supportsJinja: boolean;
   supportsCacheReuse: boolean;
+  supportsFitOff: boolean;
 }
 
 export class RuntimeDetector {
@@ -30,6 +31,7 @@ export class RuntimeDetector {
     // 2. Check known dedicated Windows TurboQuant build in Downloads or local dirs
     const userHome = os.homedir();
     const candidateDirs = [
+      path.join(userHome, 'Downloads', 'llama-turboquant-windows-x64-cuda-12.4', 'build', 'bin'),
       path.join(userHome, 'Downloads', 'turboquant-plus-tqp-v0.4.0-windows-x64-cuda12.4'),
       path.join(userHome, 'Downloads', 'llama-server'),
       path.join(userHome, 'AppData', 'Local', 'llama.cpp'),
@@ -83,7 +85,8 @@ export class RuntimeDetector {
         supportsNoMmap: /--no-mmap/i.test(text),
         supportsMlock: /--mlock/i.test(text),
         supportsJinja: /--jinja/i.test(text),
-        supportsCacheReuse: /--cache-reuse/i.test(text)
+        supportsCacheReuse: /--cache-reuse/i.test(text),
+        supportsFitOff: /--fit\b|-fit\b/i.test(text)
       };
     } catch {
       // Conservative defaults if --help inspection fails
@@ -94,7 +97,8 @@ export class RuntimeDetector {
         supportsNoMmap: true,
         supportsMlock: true,
         supportsJinja: true,
-        supportsCacheReuse: true
+        supportsCacheReuse: true,
+        supportsFitOff: true
       };
     }
   }

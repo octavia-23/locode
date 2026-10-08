@@ -215,15 +215,17 @@ export async function handleSlashCommand(
 
     case '/context':
     case '/ctx': {
-      const currentCtx = agent.getContext().numCtx || 32768;
+      const currentCtx = agent.getContext().numCtx || 262144;
       if (!arg) {
         console.log(`\n${chalk.bold.cyan('📏 Active Context Window:')} ${chalk.yellow(currentCtx.toLocaleString())} tokens`);
         console.log(chalk.gray(`  Switch context window on the fly:`));
         console.log(`  • ${chalk.yellow('/context 8k')}   (8,192 tokens)`);
         console.log(`  • ${chalk.yellow('/context 16k')}  (16,384 tokens)`);
-        console.log(`  • ${chalk.yellow('/context 32k')}  (32,768 tokens - Default TurboQuant Profile)`);
+        console.log(`  • ${chalk.yellow('/context 32k')}  (32,768 tokens - Peak Speed Benchmark Profile)`);
         console.log(`  • ${chalk.yellow('/context 64k')}  (65,536 tokens - Extended Context Profile)`);
-        console.log(`  • ${chalk.yellow('/context 128k')} (131,072 tokens - TurboQuant Max Profile)\n`);
+        console.log(`  • ${chalk.yellow('/context 128k')} (131,072 tokens - TurboQuant 128K Profile)`);
+        console.log(`  • ${chalk.yellow('/context 192k')} (196,608 tokens - TurboQuant 192K Profile)`);
+        console.log(`  • ${chalk.yellow('/context 262k')} (262,144 tokens - Ultra-Context 262K Proven Profile)\n`);
         return true;
       }
 
@@ -233,9 +235,11 @@ export async function handleSlashCommand(
       else if (arg.toLowerCase() === '32k') parsed = 32768;
       else if (arg.toLowerCase() === '64k') parsed = 65536;
       else if (arg.toLowerCase() === '128k') parsed = 131072;
+      else if (arg.toLowerCase() === '192k') parsed = 196608;
+      else if (arg.toLowerCase() === '256k' || arg.toLowerCase() === '262k') parsed = 262144;
 
       if (!parsed || isNaN(parsed) || parsed < 1024) {
-        renderer.printError(`Invalid context size "${arg}". Choose 8k, 16k, 32k, 64k, or 128k.`);
+        renderer.printError(`Invalid context size "${arg}". Choose 8k, 16k, 32k, 64k, 128k, 192k, or 262k.`);
         return true;
       }
 
@@ -246,12 +250,13 @@ export async function handleSlashCommand(
 
     case '/profile': {
       const ctx = agent.getContext();
-      const currentProfile = (ctx.llamaConfig as any)?.profileName || 'performance';
+      const currentProfile = (ctx.llamaConfig as any)?.profileName || 'ultra-context';
       if (!arg) {
         console.log(`\n${chalk.bold.cyan('⚙️ Inference Profiles:')}`);
         console.log(`  Active: ${chalk.green.bold(currentProfile)}`);
         console.log(`  Available:`);
-        console.log(`  • ${chalk.yellow('performance')}   - 32K context, MoE 24, Turbo4 KV (Default RTX 4050 6GB)`);
+        console.log(`  • ${chalk.yellow('ultra-context')} - 262K context, MoE 34, Turbo4 K / Turbo3 V (Proven 262K Baseline on RTX 4050 6GB)`);
+        console.log(`  • ${chalk.yellow('performance')}   - 32K context, MoE 24, Turbo4 KV (Peak Speed 35 tok/s)`);
         console.log(`  • ${chalk.yellow('large-context')} - 64K context, MoE 24, Turbo4 KV (Extended long-range)`);
         console.log(`  • ${chalk.yellow('balanced')}      - 16K context, MoE 28, safer RAM/VRAM footprint`);
         console.log(chalk.dim(`\nSwitch with: /profile <name>\n`));
@@ -259,17 +264,20 @@ export async function handleSlashCommand(
       }
 
       const pName = arg.trim().toLowerCase();
-      if (pName === 'performance') {
-        agent.setContext({ numCtx: 32768, llamaConfig: { profileName: 'performance', contextSize: 32768 } });
+      if (pName === 'ultra-context' || pName === '262k') {
+        agent.setContext({ numCtx: 262144, llamaConfig: { profileName: 'ultra-context', contextSize: 262144, nCpuMoe: 34 } });
+        renderer.printSuccess(`Switched to Ultra-Context profile (262K context, Turbo4 K / Turbo3 V, 34 MoE layers).`);
+      } else if (pName === 'performance') {
+        agent.setContext({ numCtx: 32768, llamaConfig: { profileName: 'performance', contextSize: 32768, nCpuMoe: 24 } });
         renderer.printSuccess(`Switched to Performance profile (32K context, Turbo4 KV, 24 MoE layers).`);
       } else if (pName === 'large-context' || pName === '64k') {
-        agent.setContext({ numCtx: 65536, llamaConfig: { profileName: 'large-context', contextSize: 65536 } });
+        agent.setContext({ numCtx: 65536, llamaConfig: { profileName: 'large-context', contextSize: 65536, nCpuMoe: 24 } });
         renderer.printSuccess(`Switched to Large Context profile (64K context, Turbo4 KV).`);
       } else if (pName === 'balanced') {
-        agent.setContext({ numCtx: 16384, llamaConfig: { profileName: 'balanced', contextSize: 16384 } });
+        agent.setContext({ numCtx: 16384, llamaConfig: { profileName: 'balanced', contextSize: 16384, nCpuMoe: 28 } });
         renderer.printSuccess(`Switched to Balanced profile (16K context, 28 MoE layers).`);
       } else {
-        renderer.printError(`Unknown profile "${arg}". Available: performance, large-context, balanced.`);
+        renderer.printError(`Unknown profile "${arg}". Available: ultra-context, performance, large-context, balanced.`);
       }
       return true;
     }

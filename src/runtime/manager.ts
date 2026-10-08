@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import net from 'node:net';
+import { execa } from 'execa';
 import { spawn, ChildProcess } from 'node:child_process';
 import {
   LlamaRuntimeConfig,
@@ -34,9 +35,10 @@ export class LlamaCppRuntime {
   private flagSupport?: BinaryFlagSupport;
 
   constructor(customConfig?: Partial<LlamaRuntimeConfig>) {
-    const profile = INFERENCE_PROFILES.performance;
+    const requestedProfile = customConfig?.profileName || 'ultra-context';
+    const profile = INFERENCE_PROFILES[requestedProfile] || INFERENCE_PROFILES['ultra-context'] || INFERENCE_PROFILES.performance;
     this.config = {
-      profileName: 'performance',
+      profileName: 'ultra-context',
       modelPath: process.env.LOCODE_LOCAL_MODEL_PATH || DEFAULT_QWEN_MODEL_PATH,
       modelAlias: DEFAULT_QWEN_MODEL_ALIAS,
       serverPath: process.env.LOCODE_LLAMA_SERVER_PATH,
@@ -44,18 +46,19 @@ export class LlamaCppRuntime {
       port: process.env.LOCODE_LOCAL_MODEL_PORT ? parseInt(process.env.LOCODE_LOCAL_MODEL_PORT, 10) : 8081,
       autoPort: true,
       autoStart: process.env.LOCODE_LOCAL_MODEL_AUTO_START !== 'false',
-      contextSize: process.env.LOCODE_LOCAL_MODEL_CONTEXT ? parseInt(process.env.LOCODE_LOCAL_MODEL_CONTEXT, 10) : 32768,
-      nCpuMoe: 24,
+      contextSize: process.env.LOCODE_LOCAL_MODEL_CONTEXT ? parseInt(process.env.LOCODE_LOCAL_MODEL_CONTEXT, 10) : 262144,
+      nCpuMoe: 34,
       nGpuLayers: 999,
       batchSize: 2048,
       ubatchSize: 512,
       flashAttention: true,
       cacheTypeK: 'turbo4',
-      cacheTypeV: 'turbo4',
+      cacheTypeV: 'turbo3',
       noMmap: true,
       mlock: true,
       threads: 12,
       jinja: true,
+      cacheReuse: 256,
       ...profile,
       ...customConfig
     };
@@ -143,7 +146,8 @@ export class LlamaCppRuntime {
           if (typeof serverCtx === 'number' && serverCtx > 0) {
             // If the running server has a smaller context size than requested, do NOT reuse it!
             if (this.config.contextSize && serverCtx < this.config.contextSize) {
-              return false; // Force starting or switching to a server with requested context size!
+              await this.killProcessOnPort(this.config.port);
+              return false; // Force starting server with requested context size!
             }
             // Align our runtime config with the running server's actual context size
             this.config.contextSize = serverCtx;
@@ -155,6 +159,19 @@ export class LlamaCppRuntime {
     } catch {
       return false;
     }
+  }
+
+  async killProcessOnPort(port: number): Promise<void> {
+    try {
+      if (process.platform === 'win32') {
+        const { stdout } = await execa(`powershell -Command "(Get-NetTCPConnection -LocalPort ${port} -ErrorAction SilentlyContinue).OwningProcess"`, { shell: true });
+        const pid = parseInt(stdout.trim(), 10);
+        if (pid && !isNaN(pid) && pid > 0) {
+          process.kill(pid, 'SIGKILL');
+          await new Promise(r => setTimeout(r, 1000));
+        }
+      }
+    } catch {}
   }
 
   /**
@@ -200,6 +217,10 @@ export class LlamaCppRuntime {
 
     if (flags.supportsCacheReuse && this.config.cacheReuse && this.config.cacheReuse > 0) {
       args.push('--cache-reuse', this.config.cacheReuse.toString());
+    }
+
+    if (flags.supportsFitOff) {
+      args.push('--fit', 'off');
     }
 
     // Explicitly restrict to 1 parallel slot to prevent multi-slot KV cache splitting & cold slot thrashing

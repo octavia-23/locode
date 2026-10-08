@@ -1,5 +1,7 @@
 import os from 'node:os';
 import { execa } from 'execa';
+import { RuntimeDetector } from '../runtime/detector.js';
+import { DEFAULT_QWEN_MODEL_PATH, DEFAULT_QWEN_MODEL_ALIAS } from '../runtime/profiles.js';
 
 export type HardwareStatusType = 'detected' | 'recommended' | 'measured';
 
@@ -35,12 +37,14 @@ export interface RuntimeMetrics {
 export class HardwareDetector {
   private static cachedProfile: HardwareProfile | null = null;
 
-  static async getProfile(activeModel: string = 'qwen2.5-coder:7b', requestedCtx?: number): Promise<HardwareProfile> {
-    if (this.cachedProfile) {
+  static async getProfile(activeModel?: string, requestedCtx?: number): Promise<HardwareProfile> {
+    const is35bPresent = await RuntimeDetector.isExecutableValid(DEFAULT_QWEN_MODEL_PATH);
+    const modelToEvaluate = activeModel || (is35bPresent ? DEFAULT_QWEN_MODEL_ALIAS : 'qwen2.5-coder:7b');
+
+    if (this.cachedProfile && this.cachedProfile.selectedModel === modelToEvaluate) {
       if (requestedCtx) {
         this.cachedProfile.selectedCtx = requestedCtx;
       }
-      this.cachedProfile.selectedModel = activeModel;
       return this.cachedProfile;
     }
 
@@ -58,17 +62,17 @@ export class HardwareDetector {
       let recommendedCtx = 8192;
       let recommendedKvCache: 'turbo4' | 'f16' | 'q8_0' | 'q4_0' = 'f16';
       let estimatedFullOffload7B = true;
+      const isQwen35B = modelToEvaluate.toLowerCase().includes('35b') || modelToEvaluate.toLowerCase().includes('a3b');
 
       // 6GB cards (e.g. RTX 4050 Laptop / RTX 3060 Laptop 6GB)
       if (totalVram <= 6500) {
-        // If 35B A3B Qwen model is used, TurboQuant enables 32768 context comfortably
-        const isQwen35B = activeModel.toLowerCase().includes('35b') || activeModel.toLowerCase().includes('a3b');
-        recommendedCtx = isQwen35B ? 32768 : 8192;
+        // If 35B A3B Qwen model is used, TurboQuant enables 262144 context comfortably
+        recommendedCtx = isQwen35B ? 262144 : 8192;
         recommendedKvCache = isQwen35B ? 'turbo4' : 'f16';
         estimatedFullOffload7B = true;
         notes.push('Heuristic: 6GB VRAM detected (RTX 4050 Laptop). Auto-tuning TurboQuant profile.');
         if (isQwen35B) {
-          notes.push('TurboQuant + MoE offload enables 32K context with MoE layers shared with system RAM.');
+          notes.push('TurboQuant + MoE 34 CPU offload enables 262K (262,144) context with Turbo4 K / Turbo3 V within 5.8GB VRAM.');
         } else {
           notes.push('Context tuned to 8,192 to prevent 7B weights from spilling to system RAM.');
         }
@@ -94,8 +98,8 @@ export class HardwareDetector {
         cpuModel,
         cpuThreads,
         recommendedCtx,
-        backend: 'llamacpp',
-        selectedModel: activeModel,
+        backend: isQwen35B ? 'llamacpp' : 'ollama',
+        selectedModel: modelToEvaluate,
         selectedCtx: requestedCtx || recommendedCtx,
         recommendedKvCache,
         isKvCacheRuntimeEnforced: recommendedKvCache === 'turbo4',
@@ -125,7 +129,7 @@ export class HardwareDetector {
             cpuThreads,
             recommendedCtx,
             backend: 'ollama',
-            selectedModel: activeModel,
+            selectedModel: modelToEvaluate,
             selectedCtx: requestedCtx || recommendedCtx,
             recommendedKvCache: 'f16',
             isKvCacheRuntimeEnforced: false,
@@ -151,7 +155,7 @@ export class HardwareDetector {
       cpuThreads,
       recommendedCtx: 4096,
       backend: 'cpu',
-      selectedModel: activeModel,
+      selectedModel: modelToEvaluate,
       selectedCtx: requestedCtx || 4096,
       recommendedKvCache: 'q4_0',
       isKvCacheRuntimeEnforced: false,

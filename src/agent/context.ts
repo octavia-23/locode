@@ -81,7 +81,7 @@ export class ContextEngine {
     tokensAvoidedByDeduplication: 0
   };
 
-  constructor(maxTokens: number = 32768, cwd: string = process.cwd()) {
+  constructor(maxTokens: number = 262144, cwd: string = process.cwd()) {
     this.maxTokens = maxTokens;
     this.cwd = cwd;
     this.taskState = {

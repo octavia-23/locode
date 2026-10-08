@@ -1,4 +1,4 @@
-export type InferenceProfileName = 'performance' | 'large-context' | 'balanced' | 'custom';
+export type InferenceProfileName = 'ultra-context' | 'performance' | 'large-context' | 'balanced' | 'custom';
 
 export interface LlamaRuntimeConfig {
   profileName: InferenceProfileName;
@@ -30,6 +30,22 @@ export const DEFAULT_QWEN_MODEL_PATH =
 export const DEFAULT_QWEN_MODEL_ALIAS = 'locode-qwen35b-a3b';
 
 export const INFERENCE_PROFILES: Record<InferenceProfileName, Partial<LlamaRuntimeConfig>> = {
+  'ultra-context': {
+    profileName: 'ultra-context',
+    contextSize: 262144,
+    nCpuMoe: 34,
+    nGpuLayers: 999,
+    batchSize: 2048,
+    ubatchSize: 512,
+    flashAttention: true,
+    cacheTypeK: 'turbo4',
+    cacheTypeV: 'turbo3',
+    noMmap: true,
+    mlock: true,
+    threads: 12,
+    jinja: true,
+    cacheReuse: 256
+  },
   performance: {
     profileName: 'performance',
     contextSize: 32768,

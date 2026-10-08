@@ -8,6 +8,12 @@ import { RuntimeDetector } from '../src/runtime/detector.js';
 import { AgentContext, ToolDefinition } from '../src/types.js';
 
 test('RuntimeProfiles - contains performance, large-context, and balanced profiles', () => {
+  assert.ok(INFERENCE_PROFILES['ultra-context']);
+  assert.equal(INFERENCE_PROFILES['ultra-context'].contextSize, 262144);
+  assert.equal(INFERENCE_PROFILES['ultra-context'].nCpuMoe, 34);
+  assert.equal(INFERENCE_PROFILES['ultra-context'].cacheTypeK, 'turbo4');
+  assert.equal(INFERENCE_PROFILES['ultra-context'].cacheTypeV, 'turbo3');
+
   assert.ok(INFERENCE_PROFILES.performance);
   assert.equal(INFERENCE_PROFILES.performance.contextSize, 32768);
   assert.equal(INFERENCE_PROFILES.performance.nCpuMoe, 24);
@@ -47,7 +53,9 @@ test('LlamaCppRuntime - buildArgs generates exact optimized TurboQuant CLI argum
     supportsFlashAttn: true,
     supportsNoMmap: true,
     supportsMlock: true,
-    supportsJinja: true
+    supportsJinja: true,
+    supportsCacheReuse: true,
+    supportsFitOff: true
   };
 
   const args = runtime.buildArgs(flags);
@@ -90,7 +98,9 @@ test('LlamaCppRuntime - gracefully drops unsupported flags when binary lacks the
     supportsFlashAttn: false,
     supportsNoMmap: false,
     supportsMlock: false,
-    supportsJinja: true
+    supportsJinja: true,
+    supportsCacheReuse: false,
+    supportsFitOff: false
   };
 
   const args = runtime.buildArgs(limitedFlags);
@@ -99,6 +109,7 @@ test('LlamaCppRuntime - gracefully drops unsupported flags when binary lacks the
   assert.ok(!args.includes('--flash-attn'));
   assert.ok(!args.includes('--no-mmap'));
   assert.ok(!args.includes('--mlock'));
+  assert.ok(!args.includes('--fit'));
   assert.ok(args.includes('--jinja'));
 });
 

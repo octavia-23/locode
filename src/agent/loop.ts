@@ -244,7 +244,8 @@ export class AgentLoop {
    */
   private normalizeResponse(response: any, rawError?: any): NormalizedGeneration {
     if (rawError) {
-      const msg = rawError.message || String(rawError);
+      const cause = rawError.cause ? ` (${rawError.cause.code || rawError.cause.message || rawError.cause})` : '';
+      const msg = (rawError.message || String(rawError)) + cause;
       const isRetryable = /timeout|econnreset|econnrefused|fetch failed|network|socket|503|502|429/i.test(msg);
       return {
         type: isRetryable ? 'PROVIDER_ERROR_RETRYABLE' : 'PROVIDER_ERROR_FATAL',
@@ -437,8 +438,16 @@ export class AgentLoop {
 
       let rawResponse: any;
       let rawError: any;
+      let streamedTokens = 0;
       try {
-        rawResponse = await this.provider.chat(compacted, activeTools);
+        rawResponse = await this.provider.chat(compacted, activeTools, (token) => {
+          streamedTokens++;
+          if (streamedTokens === 1) {
+            this.renderer.startSpinner(`Generating response (${chalk.cyan(this.context.model)})...`);
+          } else if (streamedTokens % 15 === 0) {
+            this.renderer.startSpinner(`Generating response (${chalk.cyan(this.context.model)} · ${streamedTokens} tokens)...`);
+          }
+        });
       } catch (err: any) {
         rawError = err;
       } finally {
@@ -837,9 +846,9 @@ Example 'edit_file' invocation:
         }
 
         let toolOutput = executionResult.result || '';
-        // Ingest-time safety ceiling: clamp oversized raw tool outputs immediately (max 4,000 characters)
-        // so that massive terminal logs or huge file dumps never blow out the context window.
-        const MAX_TOOL_INGEST_CHARS = 4000;
+        // Ingest-time safety ceiling: on 262k/large contexts, allow up to 40,000 characters (~10,000 tokens)
+        // so full multi-file views and stack traces are ingested intact without premature truncation.
+        const MAX_TOOL_INGEST_CHARS = this.context.numCtx && this.context.numCtx >= 65536 ? 40000 : 4000;
         if (toolOutput.length > MAX_TOOL_INGEST_CHARS) {
           toolOutput = this.contextEngine.compactToolOutput(toolOutput, MAX_TOOL_INGEST_CHARS);
         }

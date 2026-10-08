@@ -1,5 +1,19 @@
 import path from 'node:path';
+import { Agent, setGlobalDispatcher } from 'undici';
 import { Command } from 'commander';
+
+// Remove Node.js default 300s fetch headers timeout for large-context local LLM prefill & generations
+try {
+  setGlobalDispatcher(
+    new Agent({
+      headersTimeout: 0,
+      bodyTimeout: 0,
+      connectTimeout: 60000,
+      keepAliveTimeout: 300000,
+      keepAliveMaxTimeout: 600000
+    })
+  );
+} catch {}
 import { input } from '@inquirer/prompts';
 import chalk from 'chalk';
 import { AgentContext } from './types.js';
@@ -25,8 +39,8 @@ program
   .argument('[prompt...]', 'Initial coding instruction to execute')
   .option('-m, --model <name>', 'Model to use (or alias for local TurboQuant model)')
   .option('-p, --provider <type>', 'Provider: llamacpp | ollama | openai | lmstudio | vllm')
-  .option('-c, --ctx <number_or_size>', 'Context window size (e.g. 32768, 65536, 32k, 64k)')
-  .option('--profile <name>', 'Inference profile: performance | large-context | balanced', 'performance')
+  .option('-c, --ctx <number_or_size>', 'Context window size (e.g. 32k, 64k, 128k, 262k)')
+  .option('--profile <name>', 'Inference profile: ultra-context | performance | large-context | balanced', 'ultra-context')
   .option('--model-path <path>', 'Absolute path to local .gguf model file')
   .option('--llama-server <path>', 'Path to llama-server.exe')
   .option('--port <number>', 'Port for local model server (default: 8081 or auto-selected)')
@@ -56,6 +70,8 @@ function parseContextOption(ctxOpt?: string): number | undefined {
   if (lower === '32k') return 32768;
   if (lower === '64k') return 65536;
   if (lower === '128k') return 131072;
+  if (lower === '192k') return 196608;
+  if (lower === '256k' || lower === '262k') return 262144;
   const num = parseInt(lower, 10);
   return isNaN(num) ? undefined : num;
 }
@@ -86,7 +102,7 @@ async function main() {
   const profileName: InferenceProfileName =
     (options.profile as InferenceProfileName) ||
     (process.env.LOCODE_INFERENCE_PROFILE as InferenceProfileName) ||
-    'performance';
+    (chosenProvider === 'llamacpp' ? 'ultra-context' : 'performance');
 
   const cliCtx = parseContextOption(options.ctx) || parseContextOption(process.env.LOCODE_LOCAL_MODEL_CONTEXT);
 
@@ -94,7 +110,15 @@ async function main() {
   if (cliCtx) {
     numCtx = cliCtx;
   } else if (chosenProvider === 'llamacpp') {
-    numCtx = profileName === 'large-context' ? 65536 : 32768;
+    if (profileName === 'ultra-context') {
+      numCtx = 262144;
+    } else if (profileName === 'large-context') {
+      numCtx = 65536;
+    } else if (profileName === 'performance') {
+      numCtx = 32768;
+    } else {
+      numCtx = hardwareProfile.recommendedCtx;
+    }
   } else {
     numCtx = hardwareProfile.recommendedCtx;
   }
@@ -160,7 +184,7 @@ async function main() {
         context.numCtx = activeCtx;
         llamaConfig.contextSize = activeCtx;
       }
-      renderer.printSuccess(`Model loaded & ready at ${readyResult.apiBase} (context: ${context.numCtx.toLocaleString()} tokens)`);
+      renderer.printSuccess(`Model loaded & ready at ${readyResult.apiBase} (context: ${(context.numCtx || 262144).toLocaleString()} tokens)`);
     } catch (err: any) {
       renderer.stopSpinner();
       renderer.printError(`Failed to initialize local model runtime:\n${err.message}`);

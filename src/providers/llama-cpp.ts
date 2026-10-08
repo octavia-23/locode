@@ -1,7 +1,21 @@
+import { Agent, setGlobalDispatcher } from 'undici';
 import { ChatMessage, ToolDefinition } from '../types.js';
 import { ILLMProvider, ChatProviderResponse } from './types.js';
 import { LlamaCppRuntime } from '../runtime/manager.js';
 import { LlamaRuntimeConfig } from '../runtime/profiles.js';
+
+// Ensure unlimited headers/body timeout globally for massive context windows
+try {
+  setGlobalDispatcher(
+    new Agent({
+      headersTimeout: 0,
+      bodyTimeout: 0,
+      connectTimeout: 60000,
+      keepAliveTimeout: 300000,
+      keepAliveMaxTimeout: 600000
+    })
+  );
+} catch {}
 
 export class LlamaCppTurboQuantProvider implements ILLMProvider {
   private model: string;
@@ -9,7 +23,7 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
   private runtime: LlamaCppRuntime;
   private numCtx: number;
 
-  constructor(runtime: LlamaCppRuntime, modelAlias: string = 'locode-qwen35b-a3b', numCtx: number = 32768) {
+  constructor(runtime: LlamaCppRuntime, modelAlias: string = 'locode-qwen35b-a3b', numCtx: number = 262144) {
     this.runtime = runtime;
     this.model = modelAlias;
     this.apiBase = runtime.getApiBase();
@@ -88,7 +102,7 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
     const startTime = Date.now();
     const endpoint = `${this.runtime.getApiBase()}/chat/completions`;
 
-    // 1. Streaming support if onToken is provided
+    // 1. Streaming support if onToken is provided (primary path in agent loop)
     if (onToken) {
       try {
         const streamResponse = await fetch(endpoint, {
@@ -112,6 +126,9 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
           const toolCallsAccumulator: Map<number, { id?: string; name: string; arguments: string }> = new Map();
           let usageTokens = { prompt: 0, completion: 0, total: 0 };
 
+          let firstTokenTime: number = 0;
+          let serverReportedTps: number = 0;
+
           let buffer = '';
           while (true) {
             const { done, value } = await reader.read();
@@ -128,8 +145,15 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
 
               try {
                 const json = JSON.parse(trimmed.slice(5).trim());
+                if (json.timings?.predicted_per_second) {
+                  serverReportedTps = json.timings.predicted_per_second;
+                }
+
                 const delta = json.choices?.[0]?.delta;
                 if (delta?.content) {
+                  if (!firstTokenTime) {
+                    firstTokenTime = Date.now();
+                  }
                   fullContent += delta.content;
                   onToken(delta.content);
                 }
@@ -179,9 +203,12 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
             ? parsedToolCalls
             : this.parseFallbackToolCalls(fullContent);
 
-          const tps = usageTokens.completion > 0 && durationMs > 0
-            ? usageTokens.completion / (durationMs / 1000)
-            : 0;
+          const generationMs = firstTokenTime > 0 ? (Date.now() - firstTokenTime) : durationMs;
+          const tps = serverReportedTps > 0
+            ? serverReportedTps
+            : (usageTokens.completion > 0 && generationMs > 0
+                ? usageTokens.completion / (generationMs / 1000)
+                : 0);
 
           return {
             content: fullContent,
@@ -194,13 +221,19 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
               tokensPerSecond: Math.round(tps * 10) / 10
             }
           };
+        } else if (!streamResponse.ok) {
+          const errText = await streamResponse.text();
+          throw new Error(`llama-server API error (${streamResponse.status}): ${errText}`);
         }
-      } catch {
+      } catch (err: any) {
+        if (err.message && err.message.includes('llama-server API error')) {
+          throw err;
+        }
         // Fall back to non-streaming if streaming fails
       }
     }
 
-    // 2. Non-streaming call
+    // 2. Non-streaming fallback call
     const response = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -246,9 +279,10 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
     const promptTokens = data.usage?.prompt_tokens || 0;
     const completionTokens = data.usage?.completion_tokens || 0;
     const totalTokens = data.usage?.total_tokens || promptTokens + completionTokens;
-    const tps = completionTokens > 0 && durationMs > 0
-      ? completionTokens / (durationMs / 1000)
-      : 0;
+    const serverReportedTps = data.timings?.predicted_per_second || 0;
+    const tps = serverReportedTps > 0
+      ? serverReportedTps
+      : (completionTokens > 0 && durationMs > 0 ? completionTokens / (durationMs / 1000) : 0);
 
     return {
       content,

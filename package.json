@@ -14,7 +14,6 @@
     "test": "tsx --test tests/**/*.test.ts",
     "benchmark": "tsx scripts/benchmark.ts"
   },
-
   "keywords": [
     "ai",
     "cli",
@@ -40,7 +39,8 @@
     "marked": "^15.0.12",
     "marked-terminal": "^7.3.0",
     "ollama": "^0.6.3",
-    "ora": "^9.4.1"
+    "ora": "^9.4.1",
+    "undici": "^8.11.2"
   },
   "devDependencies": {
     "@types/diff": "^7.0.2",

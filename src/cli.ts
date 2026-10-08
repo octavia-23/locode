@@ -15,7 +15,7 @@ try {
     })
   );
 } catch {}
-import { input } from '@inquirer/prompts';
+import { readInteractivePrompt } from './ui/prompt.js';
 import chalk from 'chalk';
 import { AgentContext } from './types.js';
 import { AgentLoop } from './agent/loop.js';
@@ -237,9 +237,8 @@ async function main() {
         ? chalk.hex('#e5c07b')('⚡auto')
         : chalk.hex('#5c6370')('safe');
 
-      const userInput = await input({
-        message: `${chalk.bold.hex('#61afef')('❯')} ${chalk.hex('#5c6370')(`[${modeTag}]`)} `,
-      });
+      const promptPrefix = `${chalk.bold.hex('#61afef')('❯')} ${chalk.hex('#5c6370')(`[${modeTag}]`)} `;
+      const userInput = await readInteractivePrompt(promptPrefix);
 
       const trimmed = userInput.trim();
       if (!trimmed) continue;

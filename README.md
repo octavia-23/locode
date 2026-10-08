@@ -7,7 +7,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-20%2B-green.svg)](https://nodejs.org/)
 [![License: Non--Commercial](https://img.shields.io/badge/License-Non--Commercial-orange.svg)](#-license)
-[![Tests: 50/50 Passing](https://img.shields.io/badge/Tests-50%2F50%20Passing-brightgreen.svg)](#-testing)
+[![Tests: 51/51 Passing](https://img.shields.io/badge/Tests-51%2F51%20Passing-brightgreen.svg)](#-testing)
 [![Context: Up to 262k](https://img.shields.io/badge/Context-Up%20to%20262k-purple.svg)](#-inference-profiles)
 
 ---

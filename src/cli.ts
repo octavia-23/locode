@@ -1,4 +1,5 @@
 import path from 'node:path';
+import fs from 'node:fs/promises';
 import { Agent, setGlobalDispatcher } from 'undici';
 import { Command } from 'commander';
 
@@ -49,6 +50,7 @@ program
   .option('--api-key <key>', 'API key for OpenAI-compatible provider', 'not-needed')
   .option('-y, --yes', 'Automatically approve all tool executions without prompting', false)
   .option('--auto', 'Run in Autonomous Mode (alias for -y, --yes)', false)
+  .option('-f, --file <path>', 'Load prompt from a text/markdown file')
   .option('-d, --dir <path>', 'Workspace directory', process.cwd())
   .option('--architect <model>', 'Secondary deep reasoning / architect model for complex bug escalation')
   .option('--mode <type>', 'Initial execution mode: worker | architect', 'worker')
@@ -57,7 +59,7 @@ program
 program.parse(process.argv);
 
 const options = program.opts();
-const promptArgs = program.args.join(' ').trim();
+let promptArgs = program.args.join(' ').trim();
 const targetCwd = path.resolve(options.dir);
 
 const renderer = new TerminalRenderer();
@@ -77,6 +79,16 @@ function parseContextOption(ctxOpt?: string): number | undefined {
 }
 
 async function main() {
+  if (options.file) {
+    try {
+      const filePath = path.resolve(process.cwd(), options.file);
+      promptArgs = (await fs.readFile(filePath, 'utf8')).trim();
+    } catch (err: any) {
+      renderer.printError(`Failed to load prompt file "${options.file}": ${err.message}`);
+      process.exit(1);
+    }
+  }
+
   // 1. Detect Host Hardware Architecture & Specs
   const hardwareProfile = await HardwareDetector.getProfile();
 

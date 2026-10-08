@@ -1,3 +1,5 @@
+import path from 'node:path';
+import fs from 'node:fs/promises';
 import chalk from 'chalk';
 import { execa } from 'execa';
 import { AgentLoop } from '../agent/loop.js';
@@ -35,9 +37,27 @@ export async function handleSlashCommand(
       console.log(`  ${chalk.yellow('/auto')}          - 🚀 Toggle Autonomous Mode (run all tools without asking for permission)`);
       console.log(`  ${chalk.yellow('/clear')}         - 🧹 Clear conversation memory and reset context`);
 
+      console.log(`  ${chalk.yellow('/file [path]')}   - 📄 Load and run prompt from a text/markdown file`);
       console.log(`  ${chalk.yellow('/tools')}         - 🛠️ List all registered agent tools`);
       console.log(`  ${chalk.yellow('/exit')}          - 🚪 Exit Locode CLI\n`);
       return true;
+
+    case '/f':
+    case '/file': {
+      if (!arg) {
+        console.log(chalk.yellow('Usage: /file <path-to-prompt.txt>'));
+        return true;
+      }
+      try {
+        const filePath = path.resolve(cwd, arg);
+        const content = (await fs.readFile(filePath, 'utf8')).trim();
+        console.log(chalk.bold.green(`Task loaded from ${arg} (${content.length} chars)\n`));
+        await agent.run(content);
+      } catch (err: any) {
+        console.log(chalk.red(`Failed to read prompt file: ${err.message}`));
+      }
+      return true;
+    }
 
 
 

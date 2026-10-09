@@ -73,26 +73,32 @@ export class TerminalRenderer {
     const modeStr = autoApprove ? 'autonomous' : 'interactive';
     const branch = getGitBranch(cwd);
 
-    const termWidth = process.stdout.columns || 80;
-    const cardWidth = Math.max(66, Math.min(termWidth - 4, 74));
-    const innerWidth = cardWidth - 4; // Minus 2 borders and 2 inner margin spaces
+    const termWidth = process.stdout.columns && process.stdout.columns > 30 ? process.stdout.columns : 80;
+    const cardWidth = Math.max(56, Math.min(termWidth - 4, 72));
+    const innerWidth = cardWidth - 4; // 1 space margin on each side + 2 vertical border characters
 
     const renderRow = (content: string) => {
-      const visibleLen = stripAnsi(content).length;
+      let visibleLen = stripAnsi(content).length;
+      let text = content;
+      if (visibleLen > innerWidth) {
+        const raw = stripAnsi(content);
+        text = theme.muted(raw.slice(0, innerWidth - 1) + '…');
+        visibleLen = innerWidth;
+      }
       const pad = Math.max(0, innerWidth - visibleLen);
-      console.log(`${theme.faint(theme.boxV)}  ${content}${' '.repeat(pad)}  ${theme.faint(theme.boxV)}`);
+      console.log(`${theme.faint(theme.boxV)} ${text}${' '.repeat(pad)} ${theme.faint(theme.boxV)}`);
     };
 
     const topBorder = `${theme.faint(theme.boxTl + theme.boxH.repeat(cardWidth - 2) + theme.boxTr)}`;
     const botBorder = `${theme.faint(theme.boxBl + theme.boxH.repeat(cardWidth - 2) + theme.boxBr)}`;
-    const emptyRow = `${theme.faint(theme.boxV)}${' '.repeat(cardWidth - 2)}${theme.faint(theme.boxV)}`;
+    const emptyRow = `${theme.faint(theme.boxV + ' '.repeat(cardWidth - 2) + theme.boxV)}`;
 
     console.log();
     console.log(topBorder);
 
     // Title line
     const titleLeft = `${theme.diamond} ${theme.strong('locode')} ${theme.muted('v0.4.0')}`;
-    const titleRight = `${theme.dim('local-first coding agent')}`;
+    const titleRight = `${theme.dim('local-first agent')}`;
     const titlePad = Math.max(1, innerWidth - stripAnsi(titleLeft).length - stripAnsi(titleRight).length);
     renderRow(`${titleLeft}${' '.repeat(titlePad)}${titleRight}`);
 
@@ -100,26 +106,35 @@ export class TerminalRenderer {
 
     // Metadata lines
     const labelPad = 11;
-    renderRow(`${theme.muted('model'.padEnd(labelPad))} ${theme.text(model)} ${theme.dim(`(${provDisplay})`)}`);
+    const modelStr = model.length > 20 ? model.slice(0, 18) + '…' : model;
+    renderRow(`${theme.muted('model'.padEnd(labelPad))} ${theme.text(modelStr)} ${theme.dim(`(${provDisplay})`)}`);
     renderRow(`${theme.muted('context'.padEnd(labelPad))} ${theme.accent(`${ctxVal.toLocaleString()} tokens`)} ${theme.faint('·')} ${theme.tag(modeStr)}`);
 
     if (hardwareProfile) {
       const vramStr = hardwareProfile.totalVramMb > 0
-        ? `${(hardwareProfile.totalVramMb / 1024).toFixed(1)} GB VRAM`
-        : `${(hardwareProfile.totalRamMb / 1024).toFixed(1)} GB RAM`;
+        ? `${(hardwareProfile.totalVramMb / 1024).toFixed(1)} GB`
+        : `${(hardwareProfile.totalRamMb / 1024).toFixed(1)} GB`;
       const offloadBadge = hardwareProfile.measuredGpuOffloadVerified
         ? '100% offload'
         : (hardwareProfile.estimatedFullOffload7B ? 'gpu offload' : 'hybrid moe');
+      const devShort = hardwareProfile.deviceName.length > 22
+        ? hardwareProfile.deviceName.slice(0, 20) + '…'
+        : hardwareProfile.deviceName;
 
-      renderRow(`${theme.muted('device'.padEnd(labelPad))} ${theme.secondary(hardwareProfile.deviceName)} ${theme.dim(`[${vramStr}]`)} ${theme.faint('·')} ${theme.dim(offloadBadge)}`);
+      renderRow(`${theme.muted('device'.padEnd(labelPad))} ${theme.secondary(devShort)} ${theme.dim(`[${vramStr}]`)} ${theme.faint('·')} ${theme.dim(offloadBadge)}`);
     }
 
-    const shortCwd = cwd.length > 42 ? '...' + cwd.slice(-39) : cwd;
     const branchDisplay = branch ? ` ${theme.dim(`(${branch})`)}` : '';
+    const maxPathLen = Math.max(16, innerWidth - labelPad - (branch ? branch.length + 3 : 0) - 2);
+    const shortCwd = cwd.length > maxPathLen ? '...' + cwd.slice(-(maxPathLen - 3)) : cwd;
     renderRow(`${theme.muted('workspace'.padEnd(labelPad))} ${theme.secondary(shortCwd)}${branchDisplay}`);
 
     console.log(emptyRow);
-    renderRow(`${theme.faint('enter prompt or /help · /undo · /verify · /diff · /stats · /clear')}`);
+
+    const hintText = innerWidth >= 62
+      ? 'enter prompt or /help · /undo · /verify · /diff · /stats'
+      : '/help for commands · /undo rollback · /verify test';
+    renderRow(`${theme.faint(hintText)}`);
 
     console.log(botBorder);
     console.log();

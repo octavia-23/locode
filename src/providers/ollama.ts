@@ -93,7 +93,8 @@ export class OllamaProvider implements ILLMProvider {
           stream: true,
           options: {
             num_ctx: this.numCtx,
-            temperature: 0.1
+            temperature: 0.1,
+            num_predict: 4096
           }
         });
 
@@ -152,7 +153,8 @@ export class OllamaProvider implements ILLMProvider {
       stream: false,
       options: {
         num_ctx: this.numCtx,
-        temperature: 0.1
+        temperature: 0.1,
+        num_predict: 4096
       }
     });
 

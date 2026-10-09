@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { RepoMapGenerator } from './repomap.js';
 
 async function loadProjectRules(cwd: string): Promise<string> {
   const ruleFiles = ['LOCODE.md', 'CLAUDE.md', 'AGENTS.md', '.locoderules'];
@@ -20,6 +21,8 @@ async function loadProjectRules(cwd: string): Promise<string> {
 export async function buildSystemPrompt(cwd: string): Promise<string> {
   const customRules = await loadProjectRules(cwd);
   const isWindows = process.platform === 'win32';
+  const repoMapGen = new RepoMapGenerator(cwd);
+  const repoMap = await repoMapGen.generateMap(45, 2000);
 
   return `You are Locode, an elite autonomous AI developer assistant (pair programmer and terminal agent) running locally on the user's machine.
 You have direct access to tools that can inspect the filesystem, read files, edit files surgically, write files, search code, execute shell commands, and ACCESS THE LIVE INTERNET via 'search_web' (live web search) and 'fetch_web' (webpage scraper and documentation reader).
@@ -29,6 +32,7 @@ Host Environment:
 - Workspace Root: ${cwd}
 ${isWindows ? `- Windows Shell Notice: Do NOT use Linux/Unix CLI utilities like 'wc', 'cat', 'grep', 'ls -la', 'touch', or 'rm -rf' in 'run_command'. Use your built-in tools instead: 'view_file' (shows file content and total lines), 'search_code' (text/regex search), and 'list_dir' (directory listing).` : ''}
 ${customRules}
+${repoMap ? `\n${repoMap}\n` : ''}
 Your core principles:
 1. LIVE INTERNET & WEB ACCESS:
    - You HAVE direct access to the live internet via \`search_web\` and \`fetch_web\`.

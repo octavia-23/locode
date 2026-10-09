@@ -114,6 +114,7 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
             tools: formattedTools.length > 0 ? formattedTools : undefined,
             tool_choice: options?.toolChoice,
             temperature: 0.1,
+            max_tokens: 4096,
             stream: true,
             stream_options: { include_usage: true }
           })
@@ -155,16 +156,21 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
                     firstTokenTime = Date.now();
                   }
                   fullContent += delta.content;
-                  onToken(delta.content);
+                  if (onToken) onToken(delta.content);
                 }
 
                 if (delta?.tool_calls) {
+                  if (!firstTokenTime) {
+                    firstTokenTime = Date.now();
+                  }
                   for (const tc of delta.tool_calls) {
                     const idx = tc.index ?? 0;
                     const existing = toolCallsAccumulator.get(idx) || { id: tc.id, name: '', arguments: '' };
                     if (tc.id) existing.id = tc.id;
                     if (tc.function?.name) existing.name += tc.function.name;
-                    if (tc.function?.arguments) existing.arguments += tc.function.arguments;
+                    if (tc.function?.arguments) {
+                      existing.arguments += tc.function.arguments;
+                    }
                     toolCallsAccumulator.set(idx, existing);
                   }
                 }
@@ -242,7 +248,8 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
         messages: formattedMessages,
         tools: formattedTools.length > 0 ? formattedTools : undefined,
         tool_choice: options?.toolChoice,
-        temperature: 0.1
+        temperature: 0.1,
+        max_tokens: 4096
       })
     });
 

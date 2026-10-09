@@ -84,7 +84,8 @@ export class OpenAICompatibleProvider implements ILLMProvider {
         messages: formattedMessages,
         tools: formattedTools.length > 0 ? formattedTools : undefined,
         tool_choice: options?.toolChoice,
-        temperature: 0.1
+        temperature: 0.1,
+        max_tokens: 4096
       })
     });
 

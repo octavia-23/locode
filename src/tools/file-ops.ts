@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ToolDefinition } from '../types.js';
 import { resolveSafePath } from './security.js';
+import { MultiStrategyEditEngine } from './edit-engine.js';
 
 export const viewFileTool: ToolDefinition = {
   name: 'view_file',
@@ -208,88 +209,28 @@ export const editFileTool: ToolDefinition = {
     try {
       const fullPath = resolveSafePath(args.path, context.cwd);
       const existing = await fs.readFile(fullPath, 'utf8');
-      
-      let target = args.target_content;
-      let replacement = args.replacement_content;
 
-      // Smart cleanup: If the model accidentally included view_file line numbers (e.g. "   1: " or "12 | "), strip them!
-      const stripLineNumbers = (text: string): string => {
-        const lines = text.split('\n');
-        const hasLineNumbers = lines.length > 0 && lines.every(l => !l.trim() || /^\s*\d+[:|]\s*/.test(l));
-        if (hasLineNumbers) {
-          return lines.map(l => l.replace(/^\s*\d+[:|]\s?/, '')).join('\n');
-        }
-        return text;
-      };
+      const editResult = MultiStrategyEditEngine.apply(
+        existing,
+        args.target_content,
+        args.replacement_content,
+        args.path
+      );
 
-      const cleanTarget = stripLineNumbers(target);
-      const cleanReplacement = stripLineNumbers(replacement);
-
-      // Helper function to find and replace in text with CRLF normalization
-      const attemptReplace = (fileText: string, searchTarget: string, searchReplacement: string): string | null => {
-        const normFile = fileText.replace(/\r\n/g, '\n');
-        const normTarget = searchTarget.replace(/\r\n/g, '\n');
-        const normReplacement = searchReplacement.replace(/\r\n/g, '\n');
-
-        if (normFile.includes(normTarget)) {
-          const firstIdx = normFile.indexOf(normTarget);
-          const secondIdx = normFile.indexOf(normTarget, firstIdx + normTarget.length);
-          if (secondIdx !== -1) {
-            throw new Error(`Target content appears multiple times in ${args.path}. Please provide a larger, unique block of context to replace.`);
-          }
-          return normFile.replace(normTarget, normReplacement);
-        }
-
-        // Fuzzy fallback: line-by-line whitespace-trimmed matching
-        const fileLines = normFile.split('\n');
-        const targetLines = normTarget.split('\n');
-
-        if (targetLines.length > 0) {
-          const trimmedTarget = targetLines.map(l => l.trim());
-          for (let i = 0; i <= fileLines.length - targetLines.length; i++) {
-            let matches = true;
-            for (let j = 0; j < targetLines.length; j++) {
-              if (fileLines[i + j].trim() !== trimmedTarget[j]) {
-                matches = false;
-                break;
-              }
-            }
-            if (matches) {
-              // Found matched block! Replace this exact range of lines
-              const before = fileLines.slice(0, i);
-              const after = fileLines.slice(i + targetLines.length);
-              return [...before, normReplacement, ...after].join('\n');
-            }
-          }
-        }
-
-        return null;
-      };
-
-      let newContent: string | null = null;
-      try {
-        // Try with original target first
-        newContent = attemptReplace(existing, target, replacement);
-        // If not found, try with line numbers stripped
-        if (!newContent && (cleanTarget !== target || cleanReplacement !== replacement)) {
-          newContent = attemptReplace(existing, cleanTarget, cleanReplacement);
-        }
-      } catch (err: any) {
-        return { result: err.message, isError: true };
+      if (!editResult.success) {
+        return { result: editResult.error || `Target content not found in ${args.path}.`, isError: true };
       }
 
-      if (!newContent) {
-        return {
-          result: `Target content not found in ${args.path}. Make sure the target text matches the file lines exactly (use view_file first to see current lines, without copying line numbers).`,
-          isError: true
-        };
-      }
-
-      await fs.writeFile(fullPath, newContent, 'utf8');
+      await fs.writeFile(fullPath, editResult.content, 'utf8');
       if (context.contextEngine?.invalidateFile) {
         context.contextEngine.invalidateFile(args.path);
       }
-      return { result: `Successfully updated ${args.path}` };
+
+      const fallbackNotice = editResult.strategyUsed && editResult.strategyUsed !== 'exact'
+        ? ` (applied via ${editResult.strategyUsed} fallback)`
+        : '';
+
+      return { result: `Successfully updated ${args.path}${fallbackNotice}` };
     } catch (err: any) {
       return { result: `Failed to edit file "${args.path}": ${err.message}`, isError: true };
     }

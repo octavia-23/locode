@@ -67,6 +67,61 @@ export class CodeVerifier {
   }
 
   /**
+   * Fast file-level or workspace-level linter check executed immediately after an edit.
+   * Catches syntax errors and broken types instantly before proceeding to subsequent turns.
+   */
+  static async runFastLint(cwd: string, targetFile?: string): Promise<VerificationResult> {
+    // 1. Python quick syntax check: python -m py_compile <targetFile>
+    if (targetFile && targetFile.endsWith('.py')) {
+      try {
+        const full = path.resolve(cwd, targetFile);
+        const res = await execa('python', ['-m', 'py_compile', full], {
+          cwd,
+          timeout: 5000,
+          reject: false
+        });
+        if (res.exitCode !== 0) {
+          const combined = `${res.stdout}\n${res.stderr}`.trim();
+          return {
+            passed: false,
+            command: `python -m py_compile ${targetFile}`,
+            errorOutput: this.sanitizeErrorOutput(combined)
+          };
+        }
+      } catch {}
+    }
+
+    // 2. Node/TypeScript: fast typecheck/check/lint
+    const pkgPath = path.join(cwd, 'package.json');
+    try {
+      const pkgContent = await fs.readFile(pkgPath, 'utf8');
+      const pkg = JSON.parse(pkgContent);
+      let cmd: string | null = null;
+      if (pkg.scripts?.typecheck) cmd = 'npm run typecheck';
+      else if (pkg.scripts?.check) cmd = 'npm run check';
+      else if (pkg.scripts?.lint) cmd = 'npm run lint';
+      else {
+        try {
+          await fs.access(path.join(cwd, 'tsconfig.json'));
+          cmd = 'npx --no-install tsc --noEmit';
+        } catch {}
+      }
+
+      if (cmd) {
+        return await this.run(cwd, cmd);
+      }
+    } catch {}
+
+    // 3. Rust: cargo check
+    try {
+      await fs.access(path.join(cwd, 'Cargo.toml'));
+      return await this.run(cwd, 'cargo check');
+    } catch {}
+
+    return { passed: true };
+  }
+
+  /**
    * Executes the verification command and returns whether the code passed or failed.
    */
   static async run(cwd: string, customCommand?: string): Promise<VerificationResult> {

@@ -7,7 +7,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-20%2B-green.svg)](https://nodejs.org/)
 [![License: Non--Commercial](https://img.shields.io/badge/License-Non--Commercial-orange.svg)](#-license)
-[![Tests: 53/53 Passing](https://img.shields.io/badge/Tests-53%2F53%20Passing-brightgreen.svg)](#-testing)
+[![Tests: 61/61 Passing](https://img.shields.io/badge/Tests-61%2F61%20Passing-brightgreen.svg)](#-testing)
 [![Context: Up to 262k](https://img.shields.io/badge/Context-Up%20to%20262k-purple.svg)](#-inference-profiles)
 
 ---
@@ -23,7 +23,9 @@ Running developer coding agents with local models on consumer laptops (such as a
 
 **Locode solves this with a purpose-built systems architecture:**
 * **Infinite-Timeout Streaming Engine:** Bypasses Node.js socket timeouts with custom `undici` dispatching and real-time SSE chunked streaming—enabling stable multi-minute prefill for contexts up to **262,144 tokens**.
-* **AST Codebase Repository Map:** Automatically indexes workspace exported functions, classes, interfaces, and types on Turn 1 in ~1,000–2,000 tokens, eliminating blind `view_file` exploratory cycles.
+* **PageRank Dependency Codebase Map:** Extracts multi-language symbol definitions and imports, builds cross-file dependency graphs, and runs PageRank power-iteration (damping factor 0.85) to surface central architectural files on Turn 1 in ~1,500–2,500 tokens.
+* **Multi-Strategy Edit Fallback Engine:** 5-tier resilient editing pipeline: exact match $\to$ view_file prefix cleanup $\to$ whitespace-normalized matching $\to$ top/bottom anchor context matching $\to$ unified diff hunks, with actionable closest-match diagnostics on failure.
+* **Immediate Automated Linter & Compiler Feedback Loop:** Runs instant background compilation checks (`py_compile`, `tsc`, `npm run typecheck`, `cargo check`) immediately upon file modification, feeding compiler errors right back to the model on the very next step.
 * **4,096 Output Token Generation Cap:** Prevents local models from running away in monolithic 20k-token monologues, enforcing tight feedback loops while preserving up to 262k input context.
 * **Autonomous Action Gate:** Detects passive exploration loops and temporarily withdraws read tools after 2 read turns to strictly enforce code modification (`edit_file`, `write_file`).
 * **Dynamic Step Leash:** Starts with a 150-step budget and dynamically adds **+80 steps** on every successful file edit, allowing complex refactors to run unattended overnight.
@@ -229,10 +231,10 @@ node dist/cli.js --provider openai --api-base http://localhost:1234/v1
 
 ## 🧪 Testing
 
-Locode is covered by a 53-test automated suite across unit, integration, and mock runtime flows:
+Locode is covered by a 61-test automated suite across unit, integration, and mock runtime flows:
 
 ```bash
-# Run complete test suite (53 tests passing)
+# Run complete test suite (61 tests passing)
 npm test
 
 # Run TypeScript typecheck

@@ -79,3 +79,54 @@ test('RepoMapGenerator - respects file count and token budget limits', async () 
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('RepoMapGenerator - computes PageRank ranking based on cross-file dependencies', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-repomap-pagerank-'));
+
+  try {
+    const srcDir = path.join(tmpDir, 'src');
+    await fs.mkdir(srcDir, { recursive: true });
+
+    // Core shared type definitions (should get highest PageRank because everyone imports it)
+    await fs.writeFile(path.join(srcDir, 'types.ts'), `
+export interface BaseEntity { id: string; }
+export interface User extends BaseEntity { name: string; }
+`, 'utf8');
+
+    // Service A depends on types
+    await fs.writeFile(path.join(srcDir, 'user-service.ts'), `
+import { User } from './types.js';
+export class UserService {
+  getUser(): User { return { id: '1', name: 'Alice' }; }
+}
+`, 'utf8');
+
+    // Service B depends on types
+    await fs.writeFile(path.join(srcDir, 'auth-service.ts'), `
+import { User } from './types.js';
+export class AuthService {
+  validate(user: User): boolean { return true; }
+}
+`, 'utf8');
+
+    // Leaf helper (nobody depends on it)
+    await fs.writeFile(path.join(srcDir, 'leaf-helper.ts'), `
+export function formatString(s: string) { return s.trim(); }
+`, 'utf8');
+
+    const generator = new RepoMapGenerator(tmpDir);
+    const map = await generator.generateMap(10, 2000);
+
+    // types.ts must appear in the map
+    assert.ok(map.includes('types.ts'));
+    assert.ok(map.includes('interface BaseEntity'));
+    assert.ok(map.includes('interface User'));
+    // types.ts should appear before leaf-helper.ts due to PageRank
+    const typesIdx = map.indexOf('types.ts');
+    const leafIdx = map.indexOf('leaf-helper.ts');
+    assert.ok(typesIdx !== -1 && leafIdx !== -1);
+    assert.ok(typesIdx < leafIdx, `Expected types.ts (idx ${typesIdx}) to rank before leaf-helper.ts (idx ${leafIdx})`);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});

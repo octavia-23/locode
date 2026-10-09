@@ -27,3 +27,11 @@ test('CodeVerifier - captures and sanitizes errors on failure', async () => {
   assert.equal(result.passed, false);
   assert.match(result.errorOutput || '', /TS2339/);
 });
+
+test('CodeVerifier - runFastLint executes fast linter/typecheck on modified file', async () => {
+  const cwd = process.cwd();
+  const result = await CodeVerifier.runFastLint(cwd, 'src/index.ts');
+
+  // In clean LOCODE codebase, fast lint (typecheck) should pass cleanly
+  assert.equal(result.passed, true);
+});

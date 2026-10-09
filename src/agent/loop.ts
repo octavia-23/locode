@@ -842,6 +842,17 @@ Example 'edit_file' invocation:
             if (safetyCeiling - stepCount < 80) {
               safetyCeiling = stepCount + 80;
             }
+
+            // Layer 3: Automated Linter / Compiler Self-Healing Loop
+            try {
+              const lintResult = await CodeVerifier.runFastLint(this.context.cwd, toolArgs.path);
+              if (!lintResult.passed && lintResult.errorOutput) {
+                this.renderer.printWarning(
+                  `⚠️ Automated Linter Alert: Syntax/type error detected after modifying ${toolArgs.path}`
+                );
+                executionResult.result += `\n\n[AUTOMATED LINTER / TYPECHECK FEEDBACK]:\nYour modification to "${toolArgs.path}" introduced compiler/type diagnostics (\`${lintResult.command}\`):\n\`\`\`\n${lintResult.errorOutput}\n\`\`\`\nPlease inspect the diagnostic above and invoke 'edit_file' to resolve it on your next step.`;
+              }
+            } catch {}
           }
         }
 

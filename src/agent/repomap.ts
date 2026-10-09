@@ -11,7 +11,10 @@ export interface FileSymbol {
 export interface FileMapEntry {
   relativePath: string;
   symbols: FileSymbol[];
+  references: Set<string>;
+  imports: Set<string>;
   lineCount: number;
+  pageRank?: number;
 }
 
 const IGNORED_DIRS = new Set([
@@ -43,10 +46,14 @@ const CODE_EXTENSIONS = new Set([
 ]);
 
 /**
- * Fast AST-style Symbol Extractor and Repository Map Generator.
+ * Advanced Dependency Graph & PageRank Codebase Repository Mapper.
  * 
- * Provides global codebase structure and exported symbol signatures
- * in ~1,000–2,000 tokens, eliminating the need for dozens of blind view_file turns.
+ * Inspired by Aider's repository mapping architecture:
+ * 1. Analyzes multi-language AST symbols (definitions, imports, and references).
+ * 2. Builds a directed cross-file dependency graph.
+ * 3. Runs PageRank (power iteration with damping factor 0.85) to surface the most
+ *    architecturally critical files and types.
+ * 4. Packs top-ranked symbols into an exact ~1,500–2,500 token budget.
  */
 export class RepoMapGenerator {
   private cwd: string;
@@ -58,16 +65,16 @@ export class RepoMapGenerator {
   }
 
   /**
-   * Generates a high-density, concise symbol map of the repository.
+   * Generates a high-density, PageRank-ranked repository map.
    */
-  async generateMap(maxFiles: number = 50, maxTokens: number = 2500): Promise<string> {
+  async generateMap(maxFiles: number = 50, maxTokens: number = 2500, focusFiles?: string[]): Promise<string> {
     const now = Date.now();
-    if (this.cachedMap && now - this.cachedAt < 60000) {
+    if (this.cachedMap && now - this.cachedAt < 60000 && !focusFiles) {
       return this.cachedMap;
     }
 
     try {
-      const sourceFiles = await this.discoverSourceFiles(this.cwd, maxFiles);
+      const sourceFiles = await this.discoverSourceFiles(this.cwd, maxFiles * 2);
       if (sourceFiles.length === 0) {
         this.cachedMap = '';
         this.cachedAt = now;
@@ -75,27 +82,39 @@ export class RepoMapGenerator {
       }
 
       const entries: FileMapEntry[] = [];
+      const symbolToFile = new Map<string, string>(); // symbol name -> relativePath
+
       for (const filePath of sourceFiles) {
         const entry = await this.extractFileSymbols(filePath);
         if (entry && (entry.symbols.length > 0 || entry.lineCount > 0)) {
           entries.push(entry);
+          for (const sym of entry.symbols) {
+            symbolToFile.set(sym.name, entry.relativePath);
+          }
         }
       }
 
-      // Prioritize entrypoints and high-symbol files
+      if (entries.length === 0) {
+        return '';
+      }
+
+      // Compute PageRank over file dependency graph
+      this.computePageRank(entries, symbolToFile, focusFiles);
+
+      // Sort by PageRank score (with architectural entrypoint boost)
       entries.sort((a, b) => {
-        const isEntryA = /index|main|app|cli|server|root/i.test(a.relativePath);
-        const isEntryB = /index|main|app|cli|server|root/i.test(b.relativePath);
-        if (isEntryA && !isEntryB) return -1;
-        if (!isEntryA && isEntryB) return 1;
-        return b.symbols.length - a.symbols.length;
+        const scoreA = this.calculateEntryScore(a);
+        const scoreB = this.calculateEntryScore(b);
+        return scoreB - scoreA;
       });
+
+      const selectedEntries = entries.slice(0, maxFiles);
 
       const outputParts: string[] = ['## Repository Codebase Map (Exported Symbols & Architecture):'];
       let estimatedChars = 0;
       const charBudget = maxTokens * 3.5;
 
-      for (const entry of entries) {
+      for (const entry of selectedEntries) {
         let fileLine = `• ${entry.relativePath} (${entry.lineCount} lines)`;
         if (entry.symbols.length > 0) {
           const syms = entry.symbols
@@ -118,12 +137,117 @@ export class RepoMapGenerator {
       }
 
       const finalMap = outputParts.join('\n');
-      this.cachedMap = finalMap;
-      this.cachedAt = now;
+      if (!focusFiles) {
+        this.cachedMap = finalMap;
+        this.cachedAt = now;
+      }
       return finalMap;
     } catch {
       return '';
     }
+  }
+
+  /**
+   * Computes PageRank across files based on directed references and imports.
+   */
+  computePageRank(entries: FileMapEntry[], symbolToFile: Map<string, string>, focusFiles?: string[]): void {
+    const n = entries.length;
+    if (n === 0) return;
+
+    const fileIndices = new Map<string, number>();
+    entries.forEach((e, idx) => fileIndices.set(e.relativePath, idx));
+
+    // Adjacency list: outgoing edges outEdges[u] = list of files that u depends on
+    const outEdges: number[][] = Array.from({ length: n }, () => []);
+    const inEdges: number[][] = Array.from({ length: n }, () => []);
+
+    for (let u = 0; u < n; u++) {
+      const entry = entries[u];
+      const targetIndices = new Set<number>();
+
+      // 1. Edges from explicit relative imports
+      for (const imp of entry.imports) {
+        // Resolve relative import path against entry.relativePath
+        const dir = path.dirname(entry.relativePath);
+        const resolvedBase = path.normalize(path.join(dir, imp)).replace(/\\/g, '/');
+        // Match exact or with common extensions
+        for (const ext of ['', '.ts', '.tsx', '.js', '.jsx', '.mjs', '/index.ts', '/index.js']) {
+          const candidate = resolvedBase + ext;
+          if (fileIndices.has(candidate) && fileIndices.get(candidate) !== u) {
+            targetIndices.add(fileIndices.get(candidate)!);
+            break;
+          }
+        }
+      }
+
+      // 2. Edges from referenced symbols
+      for (const ref of entry.references) {
+        const definingFile = symbolToFile.get(ref);
+        if (definingFile && definingFile !== entry.relativePath) {
+          const v = fileIndices.get(definingFile);
+          if (v !== undefined) {
+            targetIndices.add(v);
+          }
+        }
+      }
+
+      for (const v of targetIndices) {
+        outEdges[u].push(v);
+        inEdges[v].push(u);
+      }
+    }
+
+    // Power-iteration PageRank with damping factor d = 0.85
+    const d = 0.85;
+    let ranks = new Array<number>(n).fill(1 / n);
+
+    // Personalization vector for teleportation
+    const teleport = new Array<number>(n).fill(1 / n);
+    if (focusFiles && focusFiles.length > 0) {
+      const focusSet = new Set(focusFiles.map(f => f.replace(/\\/g, '/')));
+      const matched = entries.map((e, idx) => focusSet.has(e.relativePath) ? idx : -1).filter(idx => idx !== -1);
+      if (matched.length > 0) {
+        teleport.fill(0);
+        const weight = 1 / matched.length;
+        matched.forEach(idx => { teleport[idx] = weight; });
+      }
+    }
+
+    // 20 iterations guarantee convergence on DAGs and small graphs
+    for (let iter = 0; iter < 20; iter++) {
+      const nextRanks = new Array<number>(n).fill(0);
+      let sinkSum = 0;
+
+      for (let u = 0; u < n; u++) {
+        if (outEdges[u].length === 0) {
+          sinkSum += ranks[u];
+        }
+      }
+
+      for (let v = 0; v < n; v++) {
+        let incomingSum = 0;
+        for (const u of inEdges[v]) {
+          incomingSum += ranks[u] / outEdges[u].length;
+        }
+        nextRanks[v] = (1 - d) * teleport[v] + d * (incomingSum + sinkSum * teleport[v]);
+      }
+
+      ranks = nextRanks;
+    }
+
+    // Assign normalized PageRank to each entry
+    entries.forEach((e, idx) => {
+      e.pageRank = ranks[idx];
+    });
+  }
+
+  private calculateEntryScore(entry: FileMapEntry): number {
+    const isEntrypoint = /index|main|app|cli|server|root/i.test(entry.relativePath);
+    const pr = entry.pageRank || 0.01;
+    const symbolWeight = 1 + Math.log10(1 + entry.symbols.length);
+    const entryBoost = isEntrypoint ? 1.5 : 1.0;
+
+    return pr * symbolWeight * entryBoost;
   }
 
   private async discoverSourceFiles(dir: string, limit: number): Promise<string[]> {
@@ -162,6 +286,8 @@ export class RepoMapGenerator {
       const relativePath = path.relative(this.cwd, fullPath).replace(/\\/g, '/');
       const ext = path.extname(fullPath).toLowerCase();
       const symbols: FileSymbol[] = [];
+      const references = new Set<string>();
+      const imports = new Set<string>();
 
       lines.forEach((line, idx) => {
         const trimmed = line.trim();
@@ -169,6 +295,12 @@ export class RepoMapGenerator {
 
         // TS/JS patterns
         if (ext === '.ts' || ext === '.tsx' || ext === '.js' || ext === '.jsx' || ext === '.mjs') {
+          // Detect imports: import ... from './foo.js'
+          const importMatch = /from\s+['"]([^'"]+)['"]/.exec(trimmed);
+          if (importMatch && importMatch[1].startsWith('.')) {
+            imports.add(importMatch[1]);
+          }
+
           // Export functions
           const fnMatch = /^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([a-zA-Z0-9_$]+)\s*\(([^)]*)\)/.exec(trimmed);
           if (fnMatch) {
@@ -228,6 +360,12 @@ export class RepoMapGenerator {
 
         // Python patterns
         if (ext === '.py') {
+          // Detect imports
+          const pyImp = /^(?:from\s+(\S+)\s+import|import\s+(\S+))/.exec(trimmed);
+          if (pyImp) {
+            imports.add(pyImp[1] || pyImp[2]);
+          }
+
           const pyClass = /^class\s+([a-zA-Z0-9_]+)/.exec(trimmed);
           if (pyClass) {
             symbols.push({ kind: 'class', name: pyClass[1], line: lineNum });
@@ -262,11 +400,21 @@ export class RepoMapGenerator {
             return;
           }
         }
+
+        // Collect identifier tokens as reference candidates
+        const tokens = trimmed.match(/[a-zA-Z_$][a-zA-Z0-9_$]{2,}/g);
+        if (tokens) {
+          for (const token of tokens) {
+            references.add(token);
+          }
+        }
       });
 
       return {
         relativePath,
         symbols,
+        references,
+        imports,
         lineCount: lines.length
       };
     } catch {

@@ -3,7 +3,6 @@ import ora, { Ora } from 'ora';
 import { createTwoFilesPatch } from 'diff';
 import { marked } from 'marked';
 import MarkedTerminal from 'marked-terminal';
-import path from 'node:path';
 
 import { HardwareProfile } from '../hardware/detector.js';
 import { theme } from './theme.js';
@@ -40,11 +39,13 @@ export class TerminalRenderer {
     providerName?: string
   ) {
     const provDisplay = providerName === 'llamacpp' ? 'llama.cpp' : (providerName || 'ollama');
-    const ctxVal = (numCtx || hardwareProfile?.selectedCtx || hardwareProfile?.recommendedCtx || 32768).toLocaleString();
+    const ctxVal = (numCtx || hardwareProfile?.selectedCtx || hardwareProfile?.recommendedCtx || 32768);
     const modeStr = autoApprove ? 'auto-pilot' : 'safe-mode';
 
     console.log();
-    console.log(`  ${theme.strong('locode')}  ${theme.muted('0.1.0')} ${theme.faint('·')} ${theme.secondary(model)} ${theme.muted(`(${provDisplay})`)} ${theme.faint('·')} ${theme.accent(`${ctxVal} ctx`)}`);
+    console.log(`${theme.spineTop} ${theme.strong('locode')} ${theme.muted('0.1.0')} ${theme.faint('──────────────────────────────────────────────')}`);
+    console.log(`${theme.spineMid}${theme.muted('model')}     ${theme.secondary(model)} ${theme.muted(`(${provDisplay})`)}`);
+    console.log(`${theme.spineMid}${theme.muted('context')}   ${theme.accent(`${ctxVal.toLocaleString()} tokens`)} ${theme.faint('·')} ${theme.accent(modeStr)}`);
 
     if (hardwareProfile) {
       const vramStr = hardwareProfile.totalVramMb > 0
@@ -54,14 +55,12 @@ export class TerminalRenderer {
         ? 'gpu 100%'
         : (hardwareProfile.estimatedFullOffload7B ? 'gpu offload' : 'hybrid moe');
 
-      console.log(`  ${theme.muted('hw')}      ${theme.secondary(hardwareProfile.deviceName)} ${theme.muted(`[${vramStr}]`)} ${theme.faint('·')} ${theme.muted(offloadBadge)} ${theme.faint('·')} ${theme.accent(modeStr)}`);
-    } else {
-      console.log(`  ${theme.muted('mode')}    ${theme.accent(modeStr)}`);
+      console.log(`${theme.spineMid}${theme.muted('device')}    ${theme.secondary(hardwareProfile.deviceName)} ${theme.muted(`[${vramStr}]`)} ${theme.faint('·')} ${theme.muted(offloadBadge)}`);
     }
 
     const shortCwd = cwd.length > 55 ? '...' + cwd.slice(-52) : cwd;
-    console.log(`  ${theme.muted('dir')}     ${theme.secondary(shortCwd)}`);
-    console.log(`  ${theme.faint('type /help for commands · /auto for permissions')}`);
+    console.log(`${theme.spineMid}${theme.muted('root')}      ${theme.secondary(shortCwd)}`);
+    console.log(`${theme.spineBot} ${theme.faint('ready · /help for commands')}`);
     console.log();
   }
 
@@ -91,33 +90,33 @@ export class TerminalRenderer {
     if (name === 'view_file') {
       const p = args.path || '';
       const range = args.start_line ? ` (${args.start_line}–${args.end_line || ''})` : '';
-      console.log(`  ${theme.bullet} ${theme.muted(verb)} ${theme.path(p)}${theme.muted(range)}`);
+      console.log(`${theme.spineTop} ${theme.muted(verb)} ${theme.path(p)}${theme.muted(range)}`);
     } else if (name === 'write_file' || name === 'edit_file') {
       const p = args.path || args.target_file || '';
-      console.log(`  ${theme.bullet} ${theme.accent(verb)} ${theme.path(p)}`);
+      console.log(`${theme.spineTop} ${theme.accent(verb)} ${theme.path(p)}`);
     } else if (name === 'batch_read_files') {
       const count = Array.isArray(args.paths) ? args.paths.length : 0;
-      console.log(`  ${theme.bullet} ${theme.muted(verb)} ${theme.path(`${count} files`)}`);
+      console.log(`${theme.spineTop} ${theme.muted(verb)} ${theme.path(`${count} files`)}`);
     } else if (name === 'run_command') {
-      console.log(`  ${theme.bullet} ${theme.accent(verb)} ${theme.code(args.command)}`);
+      console.log(`${theme.spineTop} ${theme.accent(verb)} ${theme.code(args.command)}`);
     } else if (name === 'search_code') {
-      console.log(`  ${theme.bullet} ${theme.muted(verb)} "${theme.code(args.pattern || args.query)}"`);
+      console.log(`${theme.spineTop} ${theme.muted(verb)} "${theme.code(args.pattern || args.query)}"`);
     } else if (name === 'list_dir') {
-      console.log(`  ${theme.bullet} ${theme.muted(verb)} ${theme.path(args.path || '.')}`);
+      console.log(`${theme.spineTop} ${theme.muted(verb)} ${theme.path(args.path || '.')}`);
     } else {
-      console.log(`  ${theme.bullet} ${theme.muted(name)} ${theme.dim(JSON.stringify(args))}`);
+      console.log(`${theme.spineTop} ${theme.muted(name)} ${theme.dim(JSON.stringify(args))}`);
     }
   }
 
   private getToolVerb(name: string): string {
     switch (name) {
-      case 'edit_file': return 'edit  ';
-      case 'write_file': return 'write ';
-      case 'view_file': return 'read  ';
-      case 'batch_read_files': return 'read  ';
-      case 'run_command': return 'run   ';
-      case 'search_code': return 'find  ';
-      case 'list_dir': return 'ls    ';
+      case 'edit_file': return 'edit ';
+      case 'write_file': return 'write';
+      case 'view_file': return 'read ';
+      case 'batch_read_files': return 'read ';
+      case 'run_command': return 'run  ';
+      case 'search_code': return 'find ';
+      case 'list_dir': return 'ls   ';
       default: return name;
     }
   }
@@ -125,21 +124,20 @@ export class TerminalRenderer {
   printDiff(filePath: string, oldContent: string, newContent: string) {
     this.stopSpinner();
     const patch = createTwoFilesPatch(filePath, filePath, oldContent, newContent, 'old', 'new');
-    console.log(`\n  ${theme.muted('diff')} ${theme.path(filePath)}`);
+    console.log(`${theme.spineMid}${theme.muted('diff')} ${theme.path(filePath)}`);
 
     const lines = patch.split('\n').slice(4); // Skip headers
     for (const line of lines) {
       if (line.startsWith('+')) {
-        console.log(`  ${theme.diffAdd(line)}`);
+        console.log(`${theme.spineMid}${theme.diffAdd(line)}`);
       } else if (line.startsWith('-')) {
-        console.log(`  ${theme.diffDel(line)}`);
+        console.log(`${theme.spineMid}${theme.diffDel(line)}`);
       } else if (line.startsWith('@')) {
-        console.log(`  ${theme.diffHunk(line)}`);
+        console.log(`${theme.spineMid}${theme.diffHunk(line)}`);
       } else {
-        console.log(`  ${theme.diffContext(line)}`);
+        console.log(`${theme.spineMid}${theme.diffContext(line)}`);
       }
     }
-    console.log();
   }
 
   printToolResult(name: string, result: string, isError: boolean = false) {
@@ -148,18 +146,18 @@ export class TerminalRenderer {
     const firstLine = lines[0] || '';
 
     if (isError) {
-      console.log(`  ${theme.cross} ${theme.error(firstLine)}`);
       if (lines.length > 1) {
-        lines.slice(1, 5).forEach(l => console.log(`    ${theme.muted(l)}`));
+        lines.slice(1, 5).forEach(l => console.log(`${theme.spineMid}${theme.muted(l)}`));
       }
+      console.log(`${theme.spineBot} ${theme.cross} ${theme.error(firstLine)}`);
     } else {
-      console.log(`  ${theme.check} ${theme.secondary(firstLine)}`);
       if (lines.length > 1 && lines.length <= 8) {
-        lines.slice(1).forEach(l => console.log(`    ${theme.muted(l)}`));
+        lines.slice(1).forEach(l => console.log(`${theme.spineMid}${theme.muted(l)}`));
       } else if (lines.length > 8) {
-        lines.slice(1, 5).forEach(l => console.log(`    ${theme.muted(l)}`));
-        console.log(`    ${theme.faint(`... [${lines.length - 5} more lines in context]`)}`);
+        lines.slice(1, 4).forEach(l => console.log(`${theme.spineMid}${theme.muted(l)}`));
+        console.log(`${theme.spineMid}${theme.faint(`... [${lines.length - 4} more lines in context]`)}`);
       }
+      console.log(`${theme.spineBot} ${theme.check} ${theme.secondary(firstLine)}`);
     }
     console.log();
   }
@@ -201,21 +199,22 @@ export class TerminalRenderer {
 
     const parts: string[] = [];
     if (tps) parts.push(tps);
-    parts.push(`${usage.completionTokens || usage.totalTokens} tokens`);
+    parts.push(`${usage.completionTokens || usage.totalTokens} tok`);
     parts.push(`${sec}s`);
 
     if (contextInfo && contextInfo.maxTokens > 0) {
       const pct = Math.min(100, Math.round((contextInfo.usedTokens / contextInfo.maxTokens) * 100));
       const usedK = (contextInfo.usedTokens / 1024).toFixed(1);
       const maxK = (contextInfo.maxTokens / 1024).toFixed(1);
-      parts.push(`ctx: ${usedK}k/${maxK}k (${pct}%)`);
+      const gaugeBar = theme.gauge(pct, 7);
+      parts.push(`ctx ${gaugeBar} ${pct}% (${usedK}k/${maxK}k)`);
     }
 
     if (contextInfo?.cacheHitRate !== undefined && contextInfo.cacheHitRate > 0) {
-      parts.push(`cache: ${contextInfo.cacheHitRate}%`);
+      parts.push(`cache ${contextInfo.cacheHitRate}%`);
     }
 
     const line = parts.join(` ${theme.faint('·')} `);
-    console.log(`  ${theme.muted(line)}\n`);
+    console.log(`  ${theme.faint('──')} ${theme.muted(line)}\n`);
   }
 }

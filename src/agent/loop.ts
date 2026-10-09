@@ -17,6 +17,7 @@ import { MCPManager } from '../mcp/manager.js';
 import { CodeVerifier } from './verifier.js';
 import { ArchitectEngine } from './architect.js';
 import { SessionMemory } from './memory.js';
+import { extractToolCalls } from '../utils/tool-parser.js';
 
 export interface SessionStats {
   turns: number;
@@ -329,47 +330,38 @@ export class AgentLoop {
       });
     }
 
-    // Clean text by stripping embedded tool call tags/blocks
+    // Clean text and check for fallback tool call extraction
     let cleanedText = content.trim();
-    if (formattedToolCalls && formattedToolCalls.length > 0) {
+
+    if (!formattedToolCalls || formattedToolCalls.length === 0) {
+      // Qwen 35B A3B / MoE Tool Call Rescue:
+      // Rescue tool calls that were serialized as XML, Python calls, or JSON into message content
+      const extracted = extractToolCalls(content);
+      if (extracted.hasToolCalls) {
+        formattedToolCalls = extracted.toolCalls;
+        cleanedText = extracted.cleanedText;
+      }
+    } else {
+      // Native tool calls present: strip any leaked XML / JSON tags from cleanedText
       cleanedText = cleanedText
         .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
-        .replace(/```(?:json)?\s*\{\s*"name"\s*:\s*"[^"]+".*?\}\s*```/gis, '')
+        .replace(/<(?:function|call)[=:\s]+[\s\S]*?<\/(?:function|call)>/gi, '')
+        .replace(/```(?:tool_call|json)?\s*\{\s*"name"\s*:\s*"[^"]+".*?\}\s*```/gis, '')
         .trim();
-    }
-
-    const isJustJson = (cleanedText.startsWith('{') && cleanedText.endsWith('}')) ||
-                       (cleanedText.startsWith('<tool_call>') && cleanedText.endsWith('</tool_call>'));
-    if (isJustJson && (!formattedToolCalls || formattedToolCalls.length === 0)) {
-      // Check if text was a malformed tool call attempt
-      try {
-        const parsed = JSON.parse(cleanedText);
-        if (parsed.name) {
-          formattedToolCalls = [{
-            id: `call_${Date.now()}_0`,
-            type: 'function',
-            function: {
-              name: parsed.name,
-              arguments: parsed.arguments || {}
-            }
-          }];
-          cleanedText = '';
-        }
-      } catch {}
     }
 
     if (formattedToolCalls && formattedToolCalls.length > 0) {
       return {
         type: 'TOOL_CALLS',
         rawContent: content,
-        cleanedText: isJustJson ? '' : cleanedText,
+        cleanedText,
         toolCalls: formattedToolCalls,
         usage: response.usage
       };
     }
 
     // If completely empty or whitespace only
-    if (!content.trim()) {
+    if (!cleanedText && !content.trim()) {
       return {
         type: 'EMPTY_RESPONSE',
         rawContent: '',
@@ -381,7 +373,7 @@ export class AgentLoop {
     return {
       type: 'TEXT_FINAL',
       rawContent: content,
-      cleanedText: isJustJson ? '' : cleanedText,
+      cleanedText,
       usage: response.usage
     };
   }
@@ -695,7 +687,7 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
       // Add assistant's action to message history
       this.messages.push({
         role: 'assistant',
-        content: outcome.rawContent || '',
+        content: outcome.cleanedText || '',
         tool_calls: toolCalls
       });
 

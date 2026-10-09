@@ -12,6 +12,7 @@ export interface BinaryFlagSupport {
   supportsJinja: boolean;
   supportsCacheReuse: boolean;
   supportsFitOff: boolean;
+  supportsReasoningFormat: boolean;
 }
 
 export class RuntimeDetector {
@@ -86,7 +87,8 @@ export class RuntimeDetector {
         supportsMlock: /--mlock/i.test(text),
         supportsJinja: /--jinja/i.test(text),
         supportsCacheReuse: /--cache-reuse/i.test(text),
-        supportsFitOff: /--fit\b|-fit\b/i.test(text)
+        supportsFitOff: /--fit\b|-fit\b/i.test(text),
+        supportsReasoningFormat: /--reasoning-format/i.test(text)
       };
     } catch {
       // Conservative defaults if --help inspection fails
@@ -98,7 +100,8 @@ export class RuntimeDetector {
         supportsMlock: true,
         supportsJinja: true,
         supportsCacheReuse: true,
-        supportsFitOff: true
+        supportsFitOff: true,
+        supportsReasoningFormat: true
       };
     }
   }

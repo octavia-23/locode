@@ -22,6 +22,7 @@ export interface LlamaRuntimeConfig {
   threads: number;    // -t 12
   jinja: boolean;     // --jinja
   cacheReuse: number; // --cache-reuse N (min chunk size to reuse from KV cache)
+  reasoningFormat?: 'none' | 'deepseek' | 'qwen'; // --reasoning-format none (prevents internal parser mangling of tool tokens)
 }
 
 export const DEFAULT_QWEN_MODEL_PATH =
@@ -44,7 +45,8 @@ export const INFERENCE_PROFILES: Record<InferenceProfileName, Partial<LlamaRunti
     mlock: true,
     threads: 12,
     jinja: true,
-    cacheReuse: 256
+    cacheReuse: 256,
+    reasoningFormat: 'none'
   },
   performance: {
     profileName: 'performance',
@@ -60,7 +62,8 @@ export const INFERENCE_PROFILES: Record<InferenceProfileName, Partial<LlamaRunti
     mlock: true,
     threads: 12,
     jinja: true,
-    cacheReuse: 256
+    cacheReuse: 256,
+    reasoningFormat: 'none'
   },
   'large-context': {
     profileName: 'large-context',
@@ -76,7 +79,8 @@ export const INFERENCE_PROFILES: Record<InferenceProfileName, Partial<LlamaRunti
     mlock: true,
     threads: 12,
     jinja: true,
-    cacheReuse: 256
+    cacheReuse: 256,
+    reasoningFormat: 'none'
   },
   balanced: {
     profileName: 'balanced',
@@ -92,7 +96,8 @@ export const INFERENCE_PROFILES: Record<InferenceProfileName, Partial<LlamaRunti
     mlock: false,
     threads: 8,
     jinja: true,
-    cacheReuse: 256
+    cacheReuse: 256,
+    reasoningFormat: 'none'
   },
   custom: {
     profileName: 'custom'

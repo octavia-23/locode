@@ -424,4 +424,44 @@ test('Agent Loop Reliability - Circuit breaker halts execution after 5 consecuti
   }
 });
 
+test('Agent Loop Reliability - Rescues leaked Qwen <tool_call> XML from content and executes tool without looping', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-qwen-xml-rescue-'));
+  try {
+    const context: AgentContext = {
+      cwd: tmpDir,
+      autoApprove: true,
+      model: 'locode-qwen35b-a3b',
+      ollamaHost: 'http://127.0.0.1:11434'
+    };
+
+    // Model returns tool call leaked inside content XML without populating response.tool_calls
+    const mockProvider = new MockTestProvider([
+      () => ({
+        content: `I will create the target file:
+<tool_call>
+{"name": "write_file", "arguments": {"path": "rescued.txt", "content": "hello from qwen"}}
+</tool_call>`
+        // Note: tool_calls is intentionally undefined!
+      }),
+      () => ({
+        content: 'File was written successfully. Task complete.'
+      })
+    ]);
+
+    const renderer = new TerminalRenderer();
+    const agent = new AgentLoop(context, renderer, mockProvider);
+    await agent.init();
+
+    await agent.run('Create rescued.txt');
+
+    const createdContent = await fs.readFile(path.join(tmpDir, 'rescued.txt'), 'utf8');
+    assert.equal(createdContent, 'hello from qwen');
+
+    const stats = agent.getStats();
+    assert.equal(stats.successfulToolCalls, 1, 'Rescued tool call must be counted as successful');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
 

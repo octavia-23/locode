@@ -3,6 +3,7 @@ import { ChatMessage, ToolDefinition } from '../types.js';
 import { ILLMProvider, ChatProviderResponse } from './types.js';
 import { LlamaCppRuntime } from '../runtime/manager.js';
 import { LlamaRuntimeConfig } from '../runtime/profiles.js';
+import { extractToolCalls } from '../utils/tool-parser.js';
 
 // Ensure unlimited headers/body timeout globally for massive context windows
 try {
@@ -113,7 +114,12 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
             messages: formattedMessages,
             tools: formattedTools.length > 0 ? formattedTools : undefined,
             tool_choice: options?.toolChoice,
-            temperature: 0.1,
+            temperature: 0.2,
+            top_p: 0.85,
+            min_p: 0.05,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repeat_penalty: 1.0,
             max_tokens: 4096,
             stream: true,
             stream_options: { include_usage: true }
@@ -205,9 +211,21 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
           });
 
           // Fallback parsing if model returned tool calls inside markdown or tags
-          const finalToolCalls = parsedToolCalls.length > 0
-            ? parsedToolCalls
-            : this.parseFallbackToolCalls(fullContent);
+          let finalToolCalls = parsedToolCalls;
+          let cleanedContent = fullContent;
+          if (finalToolCalls.length === 0) {
+            const extracted = extractToolCalls(fullContent);
+            if (extracted.hasToolCalls) {
+              finalToolCalls = extracted.toolCalls;
+              cleanedContent = extracted.cleanedText;
+            }
+          } else if (/<(?:tool_call|function|call)/i.test(cleanedContent)) {
+            // Strip any leaked tool tags from content
+            cleanedContent = cleanedContent
+              .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+              .replace(/<(?:function|call)[=:\s]+[\s\S]*?<\/(?:function|call)>/gi, '')
+              .trim();
+          }
 
           const generationMs = firstTokenTime > 0 ? (Date.now() - firstTokenTime) : durationMs;
           const tps = serverReportedTps > 0
@@ -217,7 +235,7 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
                 : 0);
 
           return {
-            content: fullContent,
+            content: cleanedContent,
             tool_calls: finalToolCalls.length > 0 ? finalToolCalls : undefined,
             usage: {
               promptTokens: usageTokens.prompt,
@@ -248,7 +266,12 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
         messages: formattedMessages,
         tools: formattedTools.length > 0 ? formattedTools : undefined,
         tool_choice: options?.toolChoice,
-        temperature: 0.1,
+        temperature: 0.2,
+        top_p: 0.85,
+        min_p: 0.05,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        repeat_penalty: 1.0,
         max_tokens: 4096
       })
     });
@@ -265,8 +288,9 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
     const message = choice?.message || {};
     const content = message.content || '';
     let toolCalls = message.tool_calls;
+    let cleanedContent = content;
 
-    if (toolCalls && Array.isArray(toolCalls)) {
+    if (toolCalls && Array.isArray(toolCalls) && toolCalls.length > 0) {
       toolCalls = toolCalls.map((tc: any) => ({
         ...tc,
         function: {
@@ -276,10 +300,17 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
             : tc.function.arguments
         }
       }));
+      if (/<(?:tool_call|function|call)/i.test(cleanedContent)) {
+        cleanedContent = cleanedContent
+          .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
+          .replace(/<(?:function|call)[=:\s]+[\s\S]*?<\/(?:function|call)>/gi, '')
+          .trim();
+      }
     } else {
-      const fallback = this.parseFallbackToolCalls(content);
-      if (fallback.length > 0) {
-        toolCalls = fallback;
+      const extracted = extractToolCalls(content);
+      if (extracted.hasToolCalls) {
+        toolCalls = extracted.toolCalls;
+        cleanedContent = extracted.cleanedText;
       }
     }
 
@@ -292,7 +323,7 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
       : (completionTokens > 0 && durationMs > 0 ? completionTokens / (durationMs / 1000) : 0);
 
     return {
-      content,
+      content: cleanedContent,
       tool_calls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
       usage: {
         promptTokens,
@@ -302,86 +333,5 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
         tokensPerSecond: Math.round(tps * 10) / 10
       }
     };
-  }
-
-  private parseFallbackToolCalls(content: string): Array<{ id?: string; type?: string; function: { name: string; arguments: any } }> {
-    if (!content) return [];
-    const calls: Array<{ id?: string; type?: string; function: { name: string; arguments: any } }> = [];
-
-    // Pattern 1: <tool_call>\n{...}\n</tool_call>
-    const xmlRegex = /<tool_call>([\s\S]*?)<\/tool_call>/gi;
-    let match: RegExpExecArray | null;
-    while ((match = xmlRegex.exec(content)) !== null) {
-      try {
-        const parsed = JSON.parse(match[1].trim());
-        if (parsed.name) {
-          calls.push({
-            id: `call_${Date.now()}_${calls.length}`,
-            type: 'function',
-            function: {
-              name: parsed.name,
-              arguments: parsed.arguments || {}
-            }
-          });
-        }
-      } catch {}
-    }
-
-    if (calls.length > 0) return calls;
-
-    // Pattern 2: ```json {"name": "...", "arguments": ...} ```
-    const codeBlockRegex = /```(?:json)?\s*(\{\s*"name"\s*:\s*"[^"]+".*?\})\s*```/gis;
-    while ((match = codeBlockRegex.exec(content)) !== null) {
-      try {
-        const parsed = JSON.parse(match[1]);
-        if (parsed.name) {
-          calls.push({
-            id: `call_${Date.now()}_${calls.length}`,
-            type: 'function',
-            function: {
-              name: parsed.name,
-              arguments: parsed.arguments || {}
-            }
-          });
-        }
-      } catch {}
-    }
-
-    if (calls.length > 0) return calls;
-
-    // Pattern 3: Entire text is a JSON object with name & arguments
-    try {
-      const parsed = JSON.parse(content.trim());
-      if (parsed.name && typeof parsed.name === 'string') {
-        calls.push({
-          id: `call_${Date.now()}_0`,
-          type: 'function',
-          function: {
-            name: parsed.name,
-            arguments: parsed.arguments || {}
-          }
-        });
-        return calls;
-      }
-    } catch {}
-
-    // Pattern 4: Embedded JSON object with name & arguments
-    const jsonMatcher = /\{\s*"name"\s*:\s*"([a-zA-Z0-9_-]+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
-    while ((match = jsonMatcher.exec(content)) !== null) {
-      try {
-        const name = match[1];
-        const args = JSON.parse(match[2]);
-        calls.push({
-          id: `call_${Date.now()}_${calls.length}`,
-          type: 'function',
-          function: {
-            name,
-            arguments: args
-          }
-        });
-      } catch {}
-    }
-
-    return calls;
   }
 }

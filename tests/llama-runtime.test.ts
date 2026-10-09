@@ -55,7 +55,8 @@ test('LlamaCppRuntime - buildArgs generates exact optimized TurboQuant CLI argum
     supportsMlock: true,
     supportsJinja: true,
     supportsCacheReuse: true,
-    supportsFitOff: true
+    supportsFitOff: true,
+    supportsReasoningFormat: true
   };
 
   const args = runtime.buildArgs(flags);
@@ -84,6 +85,8 @@ test('LlamaCppRuntime - buildArgs generates exact optimized TurboQuant CLI argum
   assert.ok(args.includes('--no-mmap'));
   assert.ok(args.includes('--mlock'));
   assert.ok(args.includes('--jinja'));
+  assert.ok(args.includes('--reasoning-format'));
+  assert.ok(args.includes('none'));
 });
 
 test('LlamaCppRuntime - gracefully drops unsupported flags when binary lacks them', () => {
@@ -100,7 +103,8 @@ test('LlamaCppRuntime - gracefully drops unsupported flags when binary lacks the
     supportsMlock: false,
     supportsJinja: true,
     supportsCacheReuse: false,
-    supportsFitOff: false
+    supportsFitOff: false,
+    supportsReasoningFormat: false
   };
 
   const args = runtime.buildArgs(limitedFlags);
@@ -110,6 +114,7 @@ test('LlamaCppRuntime - gracefully drops unsupported flags when binary lacks the
   assert.ok(!args.includes('--no-mmap'));
   assert.ok(!args.includes('--mlock'));
   assert.ok(!args.includes('--fit'));
+  assert.ok(!args.includes('--reasoning-format'));
   assert.ok(args.includes('--jinja'));
 });
 

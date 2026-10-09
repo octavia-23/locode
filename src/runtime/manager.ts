@@ -59,6 +59,7 @@ export class LlamaCppRuntime {
       threads: 12,
       jinja: true,
       cacheReuse: 256,
+      reasoningFormat: 'none',
       ...profile,
       ...customConfig
     };
@@ -221,6 +222,10 @@ export class LlamaCppRuntime {
 
     if (flags.supportsFitOff) {
       args.push('--fit', 'off');
+    }
+
+    if (flags.supportsReasoningFormat && this.config.reasoningFormat) {
+      args.push('--reasoning-format', this.config.reasoningFormat);
     }
 
     // Explicitly restrict to 1 parallel slot to prevent multi-slot KV cache splitting & cold slot thrashing

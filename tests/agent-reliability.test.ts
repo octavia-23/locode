@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import { AgentLoop } from '../src/agent/loop.js';
+import { AgentLoop, detectToolExecutionCycle } from '../src/agent/loop.js';
 import { ContextEngine } from '../src/agent/context.js';
 import { TerminalRenderer } from '../src/ui/renderer.js';
 import { AgentContext, ChatMessage, ToolDefinition } from '../src/types.js';
@@ -354,4 +354,74 @@ test('Agent Loop - Autonomous Action Gate blocks passive read tools after 2 read
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 });
+
+test('Cycle Detector - Traps period 1, period 2 (ping-pong), and period 3 cycles', () => {
+  // Period 1: identical calls (needs 4)
+  const p1 = ['edit:a', 'edit:a', 'edit:a', 'edit:a'];
+  const res1 = detectToolExecutionCycle(p1);
+  assert.equal(res1.detected, true);
+  assert.equal(res1.period, 1);
+
+  // Period 2: alternating A-B-A-B-A-B (needs 3 reps = 6 calls)
+  const p2 = ['read:x', 'run:test', 'read:x', 'run:test', 'read:x', 'run:test'];
+  const res2 = detectToolExecutionCycle(p2);
+  assert.equal(res2.detected, true);
+  assert.equal(res2.period, 2);
+
+  // Period 3: A-B-C-A-B-C (needs 2 reps = 6 calls)
+  const p3 = ['read:x', 'edit:y', 'run:z', 'read:x', 'edit:y', 'run:z'];
+  const res3 = detectToolExecutionCycle(p3);
+  assert.equal(res3.detected, true);
+  assert.equal(res3.period, 3);
+
+  // Normal non-cyclic sequence
+  const normal = ['read:a', 'read:b', 'edit:a', 'run:test', 'read:c'];
+  const resNormal = detectToolExecutionCycle(normal);
+  assert.equal(resNormal.detected, false);
+});
+
+test('Agent Loop Reliability - Circuit breaker halts execution after 5 consecutive tool failures', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-circuit-breaker-'));
+  try {
+    const context: AgentContext = {
+      cwd: tmpDir,
+      autoApprove: true,
+      model: 'qwen2.5-coder:7b',
+      ollamaHost: 'http://127.0.0.1:11434'
+    };
+
+    // Model attempts 10 failing edit calls in a row on different files
+    const responses: Array<() => ChatProviderResponse> = [];
+    for (let i = 0; i < 10; i++) {
+      const idx = i;
+      responses.push(() => ({
+        content: `Attempt ${idx}`,
+        tool_calls: [{
+          function: {
+            name: 'edit_file',
+            arguments: {
+              path: `non_existent_${idx}.js`,
+              target_content: 'foo',
+              replacement_content: 'bar'
+            }
+          }
+        }]
+      }));
+    }
+
+    const mockProvider = new MockTestProvider(responses);
+    const renderer = new TerminalRenderer();
+    const agent = new AgentLoop(context, renderer, mockProvider);
+    await agent.init();
+
+    await agent.run('Fix non existent file');
+
+    const stats = agent.getStats();
+    // Must halt at exactly 5 consecutive failures, not continuing all 10!
+    assert.equal(stats.failedToolCalls, 5, 'Circuit breaker must trip at exactly 5 consecutive tool failures');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
 

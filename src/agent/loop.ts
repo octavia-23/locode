@@ -72,11 +72,58 @@ export interface ProgressTracker {
   recentFailureSignatures: string[];
   filesModified: Set<string>;
   fileReadTurns: Map<string, number>;
+  fileEditCounts: Map<string, number>;
+  fileContentHashes: Map<string, string[]>;
+  fastLintFailuresPerFile: Map<string, number>;
+  consecutiveCycleDetections: number;
+  consecutiveToolFailures: number;
   successfulToolCount: number;
   failedToolCount: number;
   consecutiveNoProgressCount: number;
   consecutiveEmptyResponses: number;
   actionNudgeGiven?: boolean;
+}
+
+export interface CycleInfo {
+  detected: boolean;
+  period: number;
+  repetitions: number;
+  summary: string;
+}
+
+/**
+ * Detects if recent tool execution signatures form a repeating periodic cycle.
+ * Traps period 1 (identical call), period 2 (A-B-A-B ping-pong), period 3, and period 4.
+ */
+export function detectToolExecutionCycle(signatures: string[]): CycleInfo {
+  const len = signatures.length;
+  if (len < 4) return { detected: false, period: 0, repetitions: 0, summary: '' };
+
+  for (let p = 1; p <= 4; p++) {
+    const minReps = p === 1 ? 4 : (p === 2 ? 3 : 2);
+    const requiredLen = p * minReps;
+    if (len < requiredLen) continue;
+
+    const pattern = signatures.slice(len - p);
+    let allMatch = true;
+
+    for (let rep = 1; rep < minReps; rep++) {
+      for (let i = 0; i < p; i++) {
+        if (signatures[len - (rep + 1) * p + i] !== pattern[i]) {
+          allMatch = false;
+          break;
+        }
+      }
+      if (!allMatch) break;
+    }
+
+    if (allMatch) {
+      const summary = pattern.map(s => s.split(':')[0]).join(' → ');
+      return { detected: true, period: p, repetitions: minReps, summary };
+    }
+  }
+
+  return { detected: false, period: 0, repetitions: 0, summary: '' };
 }
 
 export class AgentLoop {
@@ -362,8 +409,9 @@ export class AgentLoop {
 
     // Adaptive execution budget:
     // Decouple read/inspection actions from active mutations so the model never exhausts its budget
-    // while researching code. When active modifications occur, the leash dynamically extends.
-    let safetyCeiling = 150;
+    // while researching code. Strictly bounded by ABSOLUTE_MAX_STEPS (60) to prevent infinite loops.
+    let safetyCeiling = 45;
+    const ABSOLUTE_MAX_STEPS = 60;
     let stepCount = 0;
     let readStepCount = 0;
     let mutationStepCount = 0;
@@ -376,6 +424,11 @@ export class AgentLoop {
       recentFailureSignatures: [],
       filesModified: new Set<string>(),
       fileReadTurns: new Map<string, number>(),
+      fileEditCounts: new Map<string, number>(),
+      fileContentHashes: new Map<string, string[]>(),
+      fastLintFailuresPerFile: new Map<string, number>(),
+      consecutiveCycleDetections: 0,
+      consecutiveToolFailures: 0,
       successfulToolCount: 0,
       failedToolCount: 0,
       consecutiveNoProgressCount: 0,
@@ -646,32 +699,58 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         tool_calls: toolCalls
       });
 
-      // Progress Guard 1: Detect repetitive identical tool calls
+      // Progress Guard 1: Detect repetitive identical tool calls and periodic cycles
       const currentCallSignature = toolCalls
         .map(tc => `${tc.function.name}:${JSON.stringify(tc.function.arguments)}`)
         .join(';');
 
       progress.recentToolSignatures.push(currentCallSignature);
-      if (progress.recentToolSignatures.length > 8) {
+      if (progress.recentToolSignatures.length > 16) {
         progress.recentToolSignatures.shift();
       }
 
       const duplicateCallCount = progress.recentToolSignatures.filter(sig => sig === currentCallSignature).length;
-      if (duplicateCallCount >= 4) {
-        this.stats.progressLoopsDetected++;
-        this.renderer.printWarning('Detected repetitive identical tool execution loop. Intervening with recovery directive...');
-        
-        progress.recentToolSignatures = [];
+      const cycle = detectToolExecutionCycle(progress.recentToolSignatures);
 
-        for (const call of toolCalls) {
-          this.messages.push({
-            role: 'tool',
-            name: call.function.name,
-            tool_call_id: call.id,
-            content: `[PROGRESS GUARD WARNING] This exact tool action has been called ${duplicateCallCount} times without making new progress. Do not repeat this identical call. Please inspect an alternate file, run verification via run_command, or provide your final response.`
-          });
+      if (duplicateCallCount >= 4 || cycle.detected) {
+        this.stats.progressLoopsDetected++;
+        progress.consecutiveCycleDetections++;
+        const cycleSummary = cycle.detected ? cycle.summary : currentCallSignature.split(':')[0];
+
+        if (progress.consecutiveCycleDetections >= 3) {
+          this.renderer.printWarning(
+            `Model entered persistent repetition loop (${cycleSummary}). Halting execution to prevent token burn.`
+          );
+          break;
+        } else if (progress.consecutiveCycleDetections === 2) {
+          this.renderer.printWarning(
+            `Repeated execution cycle detected (${cycleSummary}). Blocking repeated tool actions.`
+          );
+          for (const call of toolCalls) {
+            this.messages.push({
+              role: 'tool',
+              name: call.function.name,
+              tool_call_id: call.id,
+              content: `[EXECUTION BLOCKED - CYCLE DETECTED] You have repeated the pattern [${cycleSummary}] multiple times without making progress. This tool call was BLOCKED. You must stop repeating this sequence. Either take a completely different approach or conclude and provide your final response.`
+            });
+          }
+          continue;
+        } else {
+          this.renderer.printWarning(
+            `Detected repetitive tool execution loop (${cycleSummary}). Intervening with recovery directive...`
+          );
+          for (const call of toolCalls) {
+            this.messages.push({
+              role: 'tool',
+              name: call.function.name,
+              tool_call_id: call.id,
+              content: `[PROGRESS GUARD WARNING] This exact tool action has been called ${duplicateCallCount >= 4 ? duplicateCallCount : cycle.repetitions} times without making new progress. Do not repeat this identical call. Please inspect an alternate file, run verification via run_command, or provide your final response.`
+            });
+          }
+          continue;
         }
-        continue;
+      } else {
+        progress.consecutiveCycleDetections = 0;
       }
 
       // Progress Guard 2: Trap obsessive single-file read loops & accelerate to action gate
@@ -703,6 +782,7 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         name === 'find_by_name';
 
       // Execute each tool call sequentially
+      let shouldTerminateTurn = false;
       for (const call of toolCalls) {
         this.stats.toolCalls++;
         const toolName = call.function.name;
@@ -829,24 +909,76 @@ Example 'edit_file' invocation:
         if (executionResult.isError) {
           this.stats.failedToolCalls++;
           progress.failedToolCount++;
+          progress.consecutiveToolFailures++;
+
+          if (progress.consecutiveToolFailures >= 5) {
+            this.renderer.printError(
+              `Execution halted: ${progress.consecutiveToolFailures} consecutive tool execution errors encountered. Aborting turn to prevent token waste.`
+            );
+            shouldTerminateTurn = true;
+            break;
+          } else if (progress.consecutiveToolFailures >= 3) {
+            executionResult.result += `\n\n[CIRCUIT BREAKER WARNING] ${progress.consecutiveToolFailures} consecutive tool actions have failed. Stop guessing tool arguments. Re-read the target file with 'view_file' or check directory paths before proceeding.`;
+          }
         } else {
           this.stats.successfulToolCalls++;
           progress.successfulToolCount++;
+          progress.consecutiveToolFailures = 0;
+
           if ((toolName === 'edit_file' || toolName === 'write_file') && toolArgs.path) {
             hasModifiedCode = true;
             progress.filesModified.add(toolArgs.path);
-            // DYNAMIC LEASH EXTENSION: When the model makes a successful file edit,
-            // ensure it always has at least 80 steps remaining from now so it never gets throttled mid-refactor!
-            if (safetyCeiling - stepCount < 80) {
-              safetyCeiling = stepCount + 80;
+
+            const editCount = (progress.fileEditCounts.get(toolArgs.path) || 0) + 1;
+            progress.fileEditCounts.set(toolArgs.path, editCount);
+
+            // Check for file content oscillation (reverting to a previous state in this turn)
+            let isOscillation = false;
+            try {
+              const targetFullPath = path.resolve(this.context.cwd, toolArgs.path);
+              const currentContent = await fs.readFile(targetFullPath, 'utf8');
+              const contentHash = crypto.createHash('md5').update(currentContent).digest('hex');
+              const pastHashes = progress.fileContentHashes.get(toolArgs.path) || [];
+              if (pastHashes.includes(contentHash)) {
+                isOscillation = true;
+              }
+              pastHashes.push(contentHash);
+              if (pastHashes.length > 5) pastHashes.shift();
+              progress.fileContentHashes.set(toolArgs.path, pastHashes);
+            } catch {}
+
+            if (isOscillation) {
+              this.renderer.printWarning(`Detected edit oscillation on "${toolArgs.path}" (file reverted to earlier state).`);
+              executionResult.result += `\n\n[OSCILLATION WARNING] Your modification reverted "${toolArgs.path}" to an earlier state from this turn. You are thrashing between alternate versions. Run tests or inspect compiler output before editing this file again.`;
             }
 
-            // Layer 3: Automated Linter / Compiler Self-Healing Loop
+            if (editCount > 6) {
+              this.renderer.printWarning(`High edit churn on "${toolArgs.path}" (${editCount} edits in single turn).`);
+              executionResult.result += `\n\n[CHURN LIMIT REACHED] "${toolArgs.path}" has been modified ${editCount} times in this turn. Further blind edits are restricted. Please verify the code or finish the task.`;
+            }
+
+            // Bounded dynamic leash extension:
+            // Extend only for productive, non-thrashing edits, capped strictly at ABSOLUTE_MAX_STEPS (60)
+            if (editCount <= 4 && safetyCeiling < ABSOLUTE_MAX_STEPS) {
+              safetyCeiling = Math.min(stepCount + 15, ABSOLUTE_MAX_STEPS);
+            }
+
+            // Layer 3: Automated Linter / Compiler Self-Healing Loop with failure cap
             try {
               const lintResult = await CodeVerifier.runFastLint(this.context.cwd, toolArgs.path);
               if (!lintResult.passed && lintResult.errorOutput) {
-                console.log(`${theme.branch}${theme.alert} ${theme.warning(`Auto-lint diagnostic: syntax/type issue in ${toolArgs.path} (\`${lintResult.command}\`)`)}`);
-                executionResult.result += `\n\n[AUTOMATED LINTER / TYPECHECK FEEDBACK]:\nYour modification to "${toolArgs.path}" introduced compiler/type diagnostics (\`${lintResult.command}\`):\n\`\`\`\n${lintResult.errorOutput}\n\`\`\`\nPlease inspect the diagnostic above and invoke 'edit_file' to resolve it on your next step.`;
+                const fastLintFails = (progress.fastLintFailuresPerFile.get(toolArgs.path) || 0) + 1;
+                progress.fastLintFailuresPerFile.set(toolArgs.path, fastLintFails);
+
+                if (fastLintFails <= 2) {
+                  console.log(`${theme.branch}${theme.alert} ${theme.warning(`Auto-lint diagnostic: syntax/type issue in ${toolArgs.path} (\`${lintResult.command}\`)`)}`);
+                  executionResult.result += `\n\n[AUTOMATED LINTER / TYPECHECK FEEDBACK]:\nYour modification to "${toolArgs.path}" introduced compiler/type diagnostics (\`${lintResult.command}\`):\n\`\`\`\n${lintResult.errorOutput}\n\`\`\`\nPlease inspect the diagnostic above and invoke 'edit_file' to resolve it on your next step.`;
+                } else {
+                  console.log(`${theme.branch}${theme.alert} ${theme.warning(`Auto-lint diagnostic limit reached for ${toolArgs.path} (${fastLintFails} failures)`)}`);
+                  executionResult.result += `\n\n[AUTOMATED LINTER CEILING REACHED]:\nRepeated attempts (${fastLintFails}) to auto-heal compiler diagnostics in "${toolArgs.path}" have failed:\n\`\`\`\n${lintResult.errorOutput}\n\`\`\`\nDo not attempt further blind edits to this file. Explain the error or formulate an alternative approach.`;
+                }
+              } else {
+                progress.fastLintFailuresPerFile.set(toolArgs.path, 0);
               }
             } catch {}
           }
@@ -866,6 +998,10 @@ Example 'edit_file' invocation:
           tool_call_id: call.id,
           content: toolOutput
         });
+      }
+
+      if (shouldTerminateTurn) {
+        break;
       }
     }
 

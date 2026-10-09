@@ -17,6 +17,7 @@ try {
 } catch {}
 import { readInteractivePrompt } from './ui/prompt.js';
 import chalk from 'chalk';
+import { theme } from './ui/theme.js';
 import { AgentContext } from './types.js';
 import { AgentLoop } from './agent/loop.js';
 import { TerminalRenderer } from './ui/renderer.js';
@@ -175,16 +176,14 @@ async function main() {
 
   // If using llamacpp provider and auto-start is enabled, ensure server readiness first
   if (context.provider === 'llamacpp' && llamaConfig.autoStart) {
-    console.log(chalk.cyan.bold('\n🚀 Initializing Local TurboQuant LLM Server...'));
-    console.log(chalk.gray(`  GPU Detected:        ${chalk.white(hardwareProfile.deviceName)} (${(hardwareProfile.totalVramMb / 1024).toFixed(1)} GB VRAM)`));
-    console.log(chalk.gray(`  System RAM:          ${chalk.white((hardwareProfile.totalRamMb / 1024).toFixed(1) + ' GB')}`));
-    console.log(chalk.gray(`  CPU Threads:         ${chalk.white(hardwareProfile.cpuThreads || 12)} threads`));
-    console.log(chalk.gray(`  Inference Profile:   ${chalk.green.bold(profileName)} [Context: ${chalk.cyan(numCtx.toLocaleString() + ' tokens')}]`));
-    console.log(chalk.gray(`  Model:               ${chalk.yellow('Qwen3.6-35B-A3B (IQ2_M TurboQuant)')}`));
+    console.log(`\n  ${theme.strong('starting local model runtime')}`);
+    console.log(`  ${theme.muted('gpu')}      ${theme.secondary(hardwareProfile.deviceName)} ${theme.muted(`[${(hardwareProfile.totalVramMb / 1024).toFixed(1)} GB VRAM]`)}`);
+    console.log(`  ${theme.muted('profile')}  ${theme.accent(profileName)} ${theme.faint('·')} ${theme.muted(`${numCtx.toLocaleString()} tokens`)}`);
+    console.log(`  ${theme.muted('model')}    ${theme.secondary(modelName)}`);
 
     const runtime = getSharedLlamaRuntime(context);
     try {
-      renderer.startSpinner('Starting llama-server and loading model weights into VRAM/RAM...');
+      renderer.startSpinner('loading model weights into memory...');
       const readyResult = await runtime.ensureReady((msg) => {
         renderer.startSpinner(msg);
       });
@@ -196,10 +195,10 @@ async function main() {
         context.numCtx = activeCtx;
         llamaConfig.contextSize = activeCtx;
       }
-      renderer.printSuccess(`Model loaded & ready at ${readyResult.apiBase} (context: ${(context.numCtx || 262144).toLocaleString()} tokens)`);
+      renderer.printSuccess(`model ready at ${readyResult.apiBase} (${(context.numCtx || 262144).toLocaleString()} ctx)`);
     } catch (err: any) {
       renderer.stopSpinner();
-      renderer.printError(`Failed to initialize local model runtime:\n${err.message}`);
+      renderer.printError(`failed to initialize local runtime: ${err.message}`);
       process.exit(1);
     }
   }
@@ -212,17 +211,17 @@ async function main() {
   // Check Provider health
   const isHealthy = await provider.isHealthy();
   if (!isHealthy) {
-    const provName = context.provider === 'llamacpp' ? 'TurboQuant llama-server' : (context.provider || 'Ollama');
+    const provName = context.provider === 'llamacpp' ? 'llama-server' : (context.provider || 'ollama');
     renderer.printError(
-      `Unable to connect to ${provName} at ${context.apiBase || context.ollamaHost}.\n` +
-      `  Please ensure your local LLM server is running.`
+      `unable to connect to ${provName} at ${context.apiBase || context.ollamaHost}.\n` +
+      `  ensure local LLM backend is running.`
     );
   }
 
   // If one-shot prompt was passed via CLI: e.g. locode "check git status and test"
   if (promptArgs) {
     renderer.printHeader(context.model, context.cwd, context.autoApprove, context.hardwareProfile, context.numCtx, context.provider);
-    console.log(chalk.bold.green(`Task: `) + chalk.white(promptArgs) + '\n');
+    console.log(`  ${theme.arrow} ${theme.strong(promptArgs)}\n`);
     await agent.run(promptArgs);
     renderer.stopSpinner();
     return;
@@ -234,10 +233,10 @@ async function main() {
   while (true) {
     try {
       const modeTag = context.autoApprove
-        ? chalk.hex('#e5c07b')('⚡auto')
-        : chalk.hex('#5c6370')('safe');
+        ? theme.accent('auto')
+        : theme.muted('safe');
 
-      const promptPrefix = `${chalk.bold.hex('#61afef')('❯')} ${chalk.hex('#5c6370')(`[${modeTag}]`)} `;
+      const promptPrefix = `${theme.muted('locode')} ${theme.faint('·')} ${modeTag} ${theme.secondary('›')} `;
       const userInput = await readInteractivePrompt(promptPrefix);
 
       const trimmed = userInput.trim();

@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { confirm } from '@inquirer/prompts';
 import chalk from 'chalk';
+import { theme } from '../ui/theme.js';
 import { AgentContext, ChatMessage } from '../types.js';
 import { allTools, toolRegistry } from '../tools/index.js';
 import { ILLMProvider } from '../providers/types.js';
@@ -434,7 +435,7 @@ export class AgentLoop {
         ? allTools.filter(t => t.name === 'edit_file' || t.name === 'write_file' || t.name === 'run_command')
         : allTools;
 
-      this.renderer.startSpinner(`Thinking with ${chalk.cyan(this.context.model)}...`);
+      this.renderer.startSpinner(`thinking (${this.context.model})...`);
 
       let rawResponse: any;
       let rawError: any;
@@ -443,9 +444,9 @@ export class AgentLoop {
         rawResponse = await this.provider.chat(compacted, activeTools, (token) => {
           streamedTokens++;
           if (streamedTokens === 1) {
-            this.renderer.startSpinner(`Generating response (${chalk.cyan(this.context.model)})...`);
+            this.renderer.startSpinner(`generating (${this.context.model})...`);
           } else if (streamedTokens % 15 === 0) {
-            this.renderer.startSpinner(`Generating response (${chalk.cyan(this.context.model)} · ${streamedTokens} tokens)...`);
+            this.renderer.startSpinner(`generating (${this.context.model} · ${streamedTokens} tokens)...`);
           }
         });
       } catch (err: any) {
@@ -558,10 +559,8 @@ Please proceed with the next tool call (e.g., view_file, edit_file, run_command)
             // If verification failed twice or mode is architect, escalate to Architect for root-cause diagnosis
             if (repairAttempts >= 2 || this.context.mode === 'architect') {
               const archModel = this.context.architectModel || this.context.model;
-              this.renderer.printWarning(
-                `⚡ Escalating to Architect Engine (${chalk.cyan(archModel)}) for deep root-cause diagnosis...`
-              );
-              this.renderer.startSpinner('Architect analyzing cross-file contracts and root cause...');
+              this.renderer.printWarning(`escalating to architect mode (${archModel}) for diagnosis...`);
+              this.renderer.startSpinner('analyzing cross-file contracts...');
               architectPlan = await ArchitectEngine.diagnose(
                 vResult.errorOutput || '',
                 vResult.command || '',
@@ -570,11 +569,10 @@ Please proceed with the next tool call (e.g., view_file, edit_file, run_command)
                 this.provider
               );
               this.renderer.stopSpinner();
-              console.log(chalk.bold.magenta('\n🏛️ Senior Architect Directive:'));
-              console.log(chalk.gray(architectPlan) + '\n');
+              console.log(`\n  ${theme.strong('architect directive:')}\n  ${theme.muted(architectPlan)}\n`);
             } else {
               this.renderer.printWarning(
-                `Autonomous Self-Repair [Attempt ${repairAttempts}/${maxRepairAttempts}]: \`${vResult.command}\` failed. Feeding error trace back to model...`
+                `self-repair [attempt ${repairAttempts}/${maxRepairAttempts}]: \`${vResult.command}\` failed. feeding error trace to model...`
               );
             }
 
@@ -769,7 +767,7 @@ Example 'edit_file' invocation:
               currentContent = await fs.readFile(targetPath, 'utf8');
               this.renderer.printDiff(toolArgs.path, currentContent, toolArgs.content);
             } catch {
-              console.log(chalk.green(`  (New file: ${toolArgs.path})`));
+              console.log(`  ${theme.bullet} new file: ${theme.path(toolArgs.path)}`);
             }
           } catch {}
         }
@@ -783,7 +781,7 @@ Example 'edit_file' invocation:
         if (needsApproval && !this.context.autoApprove) {
           try {
             isApproved = await confirm({
-              message: `Approve execution of ${chalk.bold.yellow(toolName)}?`,
+              message: `approve ${theme.accent(toolName)}?`,
               default: true
             });
           } catch {

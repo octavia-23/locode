@@ -21,26 +21,34 @@ export async function handleSlashCommand(
   const arg = parts.slice(1).join(' ');
 
   switch (command) {
-    case '/help':
-      console.log(`\n  ${theme.strong('commands')}`);
-      console.log(`  ${theme.accent('/undo')}          ${theme.muted('rollback workspace to state before last turn')}`);
-      console.log(`  ${theme.accent('/verify [cmd]')}   ${theme.muted('run typecheck & test suite')}`);
-      console.log(`  ${theme.accent('/commit [msg]')}  ${theme.muted('generate or apply git commit')}`);
-      console.log(`  ${theme.accent('/hardware')}      ${theme.muted('inspect gpu, vram, and offload stats')}`);
-      console.log(`  ${theme.accent('/mcp')}           ${theme.muted('list connected mcp servers & tools')}`);
-      console.log(`  ${theme.accent('/diff')}          ${theme.muted('show pending workspace modifications')}`);
-      console.log(`  ${theme.accent('/stats')}         ${theme.muted('display session token metrics and speed')}`);
-      console.log(`  ${theme.accent('/model [name]')}  ${theme.muted('switch model on the fly')}`);
-      console.log(`  ${theme.accent('/context [size]')} ${theme.muted('switch context window (e.g. 32k, 64k, 262k)')}`);
-      console.log(`  ${theme.accent('/profile [name]')} ${theme.muted('switch inference profile')}`);
-      console.log(`  ${theme.accent('/mode [type]')}   ${theme.muted('toggle worker vs architect lane')}`);
-      console.log(`  ${theme.accent('/auto')}          ${theme.muted('toggle permissionless execution')}`);
-      console.log(`  ${theme.accent('/file [path]')}   ${theme.muted('run prompt from a text/markdown file')}`);
-      console.log(`  ${theme.accent('/memory')}        ${theme.muted('view saved session memory')}`);
-      console.log(`  ${theme.accent('/clear')}         ${theme.muted('clear conversation memory')}`);
-      console.log(`  ${theme.accent('/tools')}         ${theme.muted('list registered tools')}`);
-      console.log(`  ${theme.accent('/exit')}          ${theme.muted('exit locode')}\n`);
+    case '/help': {
+      console.log(`\n  ${theme.diamond} ${theme.strong('Commands')}\n`);
+      const cmdColWidth = 18;
+      const cmds: [string, string][] = [
+        ['/undo', 'Rollback workspace to checkpoint before last turn'],
+        ['/verify [cmd]', 'Run linter & automated test suite'],
+        ['/commit [msg]', 'Stage and commit workspace changes with git'],
+        ['/diff', 'Show pending workspace git modifications'],
+        ['/stats', 'Display session token count and generation speed'],
+        ['/hardware', 'Inspect GPU, VRAM, and offload telemetry'],
+        ['/mcp', 'List connected MCP servers and external tools'],
+        ['/model [name]', 'Switch active LLM on the fly'],
+        ['/context [sz]', 'Switch context window (16k, 32k, 64k, 262k)'],
+        ['/profile [p]', 'Switch inference profile (ultra-context, performance)'],
+        ['/mode [type]', 'Toggle worker vs architect lane'],
+        ['/auto', 'Toggle autonomous zero-confirmation mode'],
+        ['/file [path]', 'Execute prompt from a text/markdown file'],
+        ['/memory', 'View persisted project session memory'],
+        ['/clear', 'Reset conversation memory'],
+        ['/tools', 'List registered agent tools'],
+        ['/exit', 'Exit locode']
+      ];
+      for (const [cmd, desc] of cmds) {
+        console.log(`    ${theme.accent(cmd.padEnd(cmdColWidth))} ${theme.muted(desc)}`);
+      }
+      console.log();
       return true;
+    }
 
     case '/f':
     case '/file': {
@@ -84,26 +92,26 @@ export async function handleSlashCommand(
       const ctx = agent.getContext();
       const activeCtx = ctx.numCtx || hw.recommendedCtx;
 
-      console.log(`\n  ${theme.strong('hardware & telemetry')}`);
-      console.log(`  ${theme.muted('device')}       ${theme.secondary(hw.deviceName)} ${theme.muted(`[${hw.type}]`)}`);
+      console.log(`\n  ${theme.diamond} ${theme.strong('Hardware & Telemetry')}\n`);
+      console.log(`    ${theme.muted('device'.padEnd(12))} ${theme.secondary(hw.deviceName)} ${theme.dim(`[${hw.type}]`)}`);
       if (hw.totalVramMb > 0) {
         const usedVram = Math.max(0, hw.totalVramMb - hw.freeVramMb);
-        console.log(`  ${theme.muted('vram')}         ${theme.secondary(`${(hw.totalVramMb / 1024).toFixed(1)} GB`)} ${theme.muted(`(free: ${(hw.freeVramMb / 1024).toFixed(1)} GB, used: ${(usedVram / 1024).toFixed(1)} GB)`)}`);
+        console.log(`    ${theme.muted('vram'.padEnd(12))} ${theme.secondary(`${(hw.totalVramMb / 1024).toFixed(1)} GB`)} ${theme.dim(`(free: ${(hw.freeVramMb / 1024).toFixed(1)} GB, used: ${(usedVram / 1024).toFixed(1)} GB)`)}`);
       }
-      console.log(`  ${theme.muted('ram')}          ${theme.secondary(`${(hw.totalRamMb / 1024).toFixed(1)} GB`)} ${theme.muted(`(free: ${(hw.freeRamMb / 1024).toFixed(1)} GB)`)}`);
-      console.log(`  ${theme.muted('backend')}      ${theme.secondary(hw.backend)}`);
-      console.log(`  ${theme.muted('model')}        ${theme.secondary(ctx.model)}`);
-      console.log(`  ${theme.muted('context')}      ${theme.accent(`${activeCtx.toLocaleString()} tokens`)} ${theme.muted(`(recommended: ${hw.recommendedCtx.toLocaleString()})`)}`);
+      console.log(`    ${theme.muted('ram'.padEnd(12))} ${theme.secondary(`${(hw.totalRamMb / 1024).toFixed(1)} GB`)} ${theme.dim(`(free: ${(hw.freeRamMb / 1024).toFixed(1)} GB)`)}`);
+      console.log(`    ${theme.muted('backend'.padEnd(12))} ${theme.secondary(hw.backend)}`);
+      console.log(`    ${theme.muted('model'.padEnd(12))} ${theme.secondary(ctx.model)}`);
+      console.log(`    ${theme.muted('context'.padEnd(12))} ${theme.accent(`${activeCtx.toLocaleString()} tokens`)} ${theme.dim(`(recommended: ${hw.recommendedCtx.toLocaleString()})`)}`);
 
       const offloadStr = hw.measuredGpuOffloadVerified
         ? '100% gpu offload (verified)'
         : (hw.estimatedFullOffload7B ? 'gpu offload' : 'hybrid moe');
-      console.log(`  ${theme.muted('offload')}      ${theme.secondary(offloadStr)}`);
+      console.log(`    ${theme.muted('offload'.padEnd(12))} ${theme.secondary(offloadStr)}`);
 
       if (hw.notes.length > 0) {
-        console.log(`\n  ${theme.muted('notes:')}`);
+        console.log(`\n    ${theme.muted('notes:')}`);
         for (const note of hw.notes) {
-          console.log(`    ${theme.bullet} ${theme.muted(note)}`);
+          console.log(`      ${theme.bullet} ${theme.muted(note)}`);
         }
       }
       console.log();
@@ -132,13 +140,19 @@ export async function handleSlashCommand(
         return true;
       }
 
-      console.log(`\n  ${theme.strong('verification report')}`);
-      console.log(`  ${theme.muted('command')}  ${theme.code(vResult.command)}`);
+      console.log(`\n  ${theme.diamond} ${theme.strong('Verification Report')}\n`);
+      console.log(`    ${theme.muted('command'.padEnd(12))} ${theme.code(vResult.command)}`);
       if (vResult.passed) {
-        console.log(`  ${theme.muted('status')}   ${theme.success('passed (0 errors)')}\n`);
+        console.log(`    ${theme.muted('status'.padEnd(12))} ${theme.check} ${theme.success('passed (0 errors)')}\n`);
       } else {
-        console.log(`  ${theme.muted('status')}   ${theme.error('failed')}`);
-        console.log(`\n${theme.muted(vResult.errorOutput || '')}\n`);
+        console.log(`    ${theme.muted('status'.padEnd(12))} ${theme.cross} ${theme.error('failed')}`);
+        if (vResult.errorOutput) {
+          console.log();
+          for (const line of vResult.errorOutput.split('\n')) {
+            console.log(`    ${theme.muted(line)}`);
+          }
+          console.log();
+        }
       }
       return true;
     }
@@ -179,12 +193,12 @@ export async function handleSlashCommand(
         : '0.0';
       const sec = (stats.totalDurationMs / 1000).toFixed(1);
 
-      console.log(`\n  ${theme.strong('session stats')}`);
-      console.log(`  ${theme.muted('turns')}        ${theme.secondary(stats.turns)}`);
-      console.log(`  ${theme.muted('model calls')}  ${theme.secondary(stats.modelCalls)}`);
-      console.log(`  ${theme.muted('tool calls')}   ${theme.secondary(stats.toolCalls)} ${theme.muted(`(${stats.successfulToolCalls} ok, ${stats.failedToolCalls} fail)`)}`);
-      console.log(`  ${theme.muted('total tokens')} ${theme.secondary(stats.totalTokens.toLocaleString())}`);
-      console.log(`  ${theme.muted('prompt tok')}   ${theme.muted(stats.promptTokens.toLocaleString())}`);
+      console.log(`\n  ${theme.diamond} ${theme.strong('Session Telemetry')}\n`);
+      console.log(`    ${theme.muted('turns'.padEnd(14))} ${theme.text(String(stats.turns))}`);
+      console.log(`    ${theme.muted('model calls'.padEnd(14))} ${theme.text(String(stats.modelCalls))}`);
+      console.log(`    ${theme.muted('tool calls'.padEnd(14))} ${theme.text(String(stats.toolCalls))} ${theme.dim(`(${stats.successfulToolCalls} ok, ${stats.failedToolCalls} fail)`)}`);
+      console.log(`    ${theme.muted('total tokens'.padEnd(14))} ${theme.text(stats.totalTokens.toLocaleString())}`);
+      console.log(`    ${theme.muted('prompt tok'.padEnd(14))} ${theme.dim(stats.promptTokens.toLocaleString())}`);
       console.log(`  ${theme.muted('output tok')}   ${theme.secondary(stats.completionTokens.toLocaleString())}`);
       console.log(`  ${theme.muted('duration')}     ${theme.secondary(`${sec}s`)}`);
       console.log(`  ${theme.muted('avg speed')}    ${theme.accent(`${avgTps} tok/s`)}\n`);

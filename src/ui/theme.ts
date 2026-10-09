@@ -1,18 +1,18 @@
 import chalk from 'chalk';
 
 /**
- * Reika-inspired Minimalist Design System & Visual Grammar for Locode.
+ * Claude Code & Reika-inspired Design System & Visual Grammar for Locode.
  * 
  * Aesthetic Principles:
- * - Natural, muted zinc and slate neutrals (no harsh neon colors).
- * - Zero saturated cyan/blue slop.
- * - Understated warm amber/sand accent (`#d4a373`).
- * - Soft sage green (`#34d399`) and coral rose (`#f43f5e`) for diffs and status.
- * - Elegant, open-spine structural framing (`╭─`, `│ `, `╰─`) connecting tool calls and outcomes.
- * - Clean micro-gauges (`▰▰▰▱▱▱▱▱`) for context and VRAM.
+ * - Natural, muted zinc and slate neutrals (zero neon blue or cyan slop).
+ * - Warm terracotta / sand / desert amber accent (`#d4a373`).
+ * - Soft sage green (`#34d399`) and coral rose (`#f43f5e`) for diffs, checks, and diagnostics.
+ * - Claude Code action tree hierarchy: `⏺ Action` with nested `  ⎿  Outcome`.
+ * - Clean gutter-aligned inline diffs (`line │ - / +`).
+ * - Reika-inspired geometric frames and micro-gauges (`[▰▰▰▱▱▱▱▱]`).
  */
 export const theme = {
-  // Neutral spectrum
+  // Neutral spectrum (Zinc / Slate)
   text: chalk.hex('#f4f4f5'),          // Crisp off-white
   secondary: chalk.hex('#a1a1aa'),     // Muted zinc
   muted: chalk.hex('#71717a'),         // Darker zinc / metadata
@@ -20,7 +20,7 @@ export const theme = {
   subtle: chalk.hex('#27272a'),        // Darkest structural elements
 
   // Semantic accents (low-saturation, natural)
-  accent: chalk.hex('#d4a373'),        // Warm sand / desert amber
+  accent: chalk.hex('#d4a373'),        // Warm terracotta / desert sand
   success: chalk.hex('#34d399'),       // Soft sage green
   error: chalk.hex('#f43f5e'),         // Soft rose coral
   warning: chalk.hex('#fbbf24'),       // Muted warm amber
@@ -31,15 +31,29 @@ export const theme = {
   diffHunk: chalk.hex('#52525b'),
   diffContext: chalk.hex('#71717a'),
 
-  // Structural spine glyphs (open-frame terminal connectors)
+  // Claude Code Action Tree Glyphs
+  actionDot: chalk.hex('#d4a373')('⏺'),
+  branch: chalk.hex('#71717a')('  ⎿  '),
+  branchSub: chalk.hex('#3f3f46')('     │ '),
+  promptGlyph: chalk.hex('#d4a373').bold('❯'),
+  diamond: chalk.hex('#d4a373')('◆'),
+
+  // Structural spine & box characters
   spineTop: chalk.hex('#52525b')('╭─'),
   spineMid: chalk.hex('#3f3f46')('│ '),
   spineBot: chalk.hex('#52525b')('╰─'),
   spineLine: chalk.hex('#3f3f46')('──'),
 
+  boxTl: '╭',
+  boxTr: '╮',
+  boxBl: '╰',
+  boxBr: '╯',
+  boxH: '─',
+  boxV: '│',
+
   // Semantic glyphs
   bullet: chalk.hex('#52525b')('•'),
-  arrow: chalk.hex('#52525b')('›'),
+  arrow: chalk.hex('#d4a373')('›'),
   check: chalk.hex('#34d399')('✓'),
   cross: chalk.hex('#f43f5e')('×'),
   alert: chalk.hex('#fbbf24')('!'),
@@ -49,6 +63,15 @@ export const theme = {
   path: (text: string) => chalk.hex('#f4f4f5').bold(text),
   dim: (text: string | number) => chalk.hex('#71717a')(String(text)),
   strong: (text: string | number) => chalk.hex('#f4f4f5').bold(String(text)),
+  tag: (text: string) => chalk.hex('#3f3f46')('[') + chalk.hex('#a1a1aa')(text) + chalk.hex('#3f3f46')(']'),
+
+  /**
+   * Formats line number and vertical gutter rule for diffs
+   */
+  gutter(lineNo: number | string, width: number = 4): string {
+    const padded = String(lineNo).padStart(width);
+    return `${chalk.hex('#52525b')(padded)} ${chalk.hex('#3f3f46')('│')} `;
+  },
 
   /**
    * Generates a sleek, non-gimmicky Unicode micro-gauge: e.g. [▰▰▰▱▱▱▱▱] 38%

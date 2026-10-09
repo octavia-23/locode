@@ -767,7 +767,7 @@ Example 'edit_file' invocation:
               currentContent = await fs.readFile(targetPath, 'utf8');
               this.renderer.printDiff(toolArgs.path, currentContent, toolArgs.content);
             } catch {
-              console.log(`  ${theme.bullet} new file: ${theme.path(toolArgs.path)}`);
+              console.log(`${theme.branch}New file: ${theme.path(toolArgs.path)}`);
             }
           } catch {}
         }
@@ -845,9 +845,7 @@ Example 'edit_file' invocation:
             try {
               const lintResult = await CodeVerifier.runFastLint(this.context.cwd, toolArgs.path);
               if (!lintResult.passed && lintResult.errorOutput) {
-                this.renderer.printWarning(
-                  `⚠️ Automated Linter Alert: Syntax/type error detected after modifying ${toolArgs.path}`
-                );
+                console.log(`${theme.branch}${theme.alert} ${theme.warning(`Auto-lint diagnostic: syntax/type issue in ${toolArgs.path} (\`${lintResult.command}\`)`)}`);
                 executionResult.result += `\n\n[AUTOMATED LINTER / TYPECHECK FEEDBACK]:\nYour modification to "${toolArgs.path}" introduced compiler/type diagnostics (\`${lintResult.command}\`):\n\`\`\`\n${lintResult.errorOutput}\n\`\`\`\nPlease inspect the diagnostic above and invoke 'edit_file' to resolve it on your next step.`;
               }
             } catch {}

@@ -176,10 +176,10 @@ async function main() {
 
   // If using llamacpp provider and auto-start is enabled, ensure server readiness first
   if (context.provider === 'llamacpp' && llamaConfig.autoStart) {
-    console.log(`\n  ${theme.strong('starting local model runtime')}`);
-    console.log(`  ${theme.muted('gpu')}      ${theme.secondary(hardwareProfile.deviceName)} ${theme.muted(`[${(hardwareProfile.totalVramMb / 1024).toFixed(1)} GB VRAM]`)}`);
-    console.log(`  ${theme.muted('profile')}  ${theme.accent(profileName)} ${theme.faint('·')} ${theme.muted(`${numCtx.toLocaleString()} tokens`)}`);
-    console.log(`  ${theme.muted('model')}    ${theme.secondary(modelName)}`);
+    console.log(`\n  ${theme.diamond} ${theme.strong('Initializing Local Runtime')}\n`);
+    console.log(`    ${theme.muted('gpu'.padEnd(10))} ${theme.secondary(hardwareProfile.deviceName)} ${theme.dim(`[${(hardwareProfile.totalVramMb / 1024).toFixed(1)} GB VRAM]`)}`);
+    console.log(`    ${theme.muted('profile'.padEnd(10))} ${theme.accent(profileName)} ${theme.faint('·')} ${theme.dim(`${numCtx.toLocaleString()} tokens`)}`);
+    console.log(`    ${theme.muted('model'.padEnd(10))} ${theme.secondary(modelName)}\n`);
 
     const runtime = getSharedLlamaRuntime(context);
     try {
@@ -221,7 +221,7 @@ async function main() {
   // If one-shot prompt was passed via CLI: e.g. locode "check git status and test"
   if (promptArgs) {
     renderer.printHeader(context.model, context.cwd, context.autoApprove, context.hardwareProfile, context.numCtx, context.provider);
-    console.log(`  ${theme.arrow} ${theme.strong(promptArgs)}\n`);
+    console.log(`  ${theme.promptGlyph} ${theme.strong(promptArgs)}\n`);
     await agent.run(promptArgs);
     renderer.stopSpinner();
     return;
@@ -236,7 +236,7 @@ async function main() {
         ? theme.accent('auto')
         : theme.muted('safe');
 
-      const promptPrefix = `${theme.muted('locode')} ${theme.faint('·')} ${modeTag} ${theme.secondary('›')} `;
+      const promptPrefix = `${theme.muted('locode')} ${theme.faint('·')} ${modeTag} ${theme.promptGlyph} `;
       const userInput = await readInteractivePrompt(promptPrefix);
 
       const trimmed = userInput.trim();
@@ -251,7 +251,7 @@ async function main() {
       console.log(); // Blank line for spacing
     } catch (err: any) {
       if (err.name === 'ExitPromptError' || err.message?.includes('force closed')) {
-        console.log(chalk.cyan('\nExiting Locode.'));
+        console.log(theme.muted('\nExiting Locode.'));
         process.exit(0);
       }
       renderer.printError(`Unexpected error: ${err.message}`);

@@ -42,6 +42,10 @@ export class OpenAICompatibleProvider implements ILLMProvider {
     return { maxOutputTokens: 8192 };
   }
 
+  private isLocal(): boolean {
+    return this.apiBase.includes('localhost') || this.apiBase.includes('127.0.0.1') || this.apiBase.includes('0.0.0.0');
+  }
+
   async isHealthy(): Promise<boolean> {
     try {
       const headers: Record<string, string> = { ...this.extraHeaders };
@@ -122,7 +126,7 @@ export class OpenAICompatibleProvider implements ILLMProvider {
       tools: formattedTools.length > 0 ? formattedTools : undefined,
       tool_choice: options?.toolChoice,
       temperature: options?.temperature ?? 0.2,
-      max_tokens: options?.maxTokens || 4096
+      max_tokens: options?.maxTokens || (this.isLocal() ? 4096 : 8192)
     };
 
     // 1. Streaming execution

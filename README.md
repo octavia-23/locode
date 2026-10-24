@@ -1,171 +1,121 @@
-# Locode 🤖
+# Locode
 
-> **Autonomous AI Software Engineer (Hybrid Cloud & Local-First)**  
-> Powered by **Node.js**, **TypeScript**, Frontier Cloud LLMs (**Google Gemini**, **Anthropic Claude**, **Groq**, **OpenAI**, **OpenRouter**) and Local Hardware Runtimes (**llama.cpp / TurboQuant**, **Ollama**, **LM Studio**, **vLLM**).  
-> *An autonomous developer delivering continuous agentic execution, PageRank codebase mapping, surgical multi-strategy edits, and compiler-verified self-repair.*
+Locode is an extensible terminal coding agent supporting both frontier cloud APIs and local quantized LLM runtimes. It provides an automated development loop with repository indexing, multi-strategy file editing, integrated compiler/test verification, and file rollback capabilities.
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-20%2B-green.svg)](https://nodejs.org/)
-[![License: Non--Commercial](https://img.shields.io/badge/License-Non--Commercial-orange.svg)](#-license)
-[![Tests: 111/111 Passing](https://img.shields.io/badge/Tests-111%2F111%20Passing-brightgreen.svg)](#-testing)
-[![Context: Up to 262k](https://img.shields.io/badge/Context-Up%20to%20262k-purple.svg)](#-inference-profiles)
+[![Tests: 122 Passing](https://img.shields.io/badge/Tests-122%20Passing-brightgreen.svg)](#testing)
+[![License: Non--Commercial](https://img.shields.io/badge/License-Non--Commercial-orange.svg)](#license)
 
 ---
 
-## 💡 The Problem Locode Solves
+## Overview
 
-Running developer coding agents with local models on consumer laptops (such as an **NVIDIA RTX 4050 6GB / 16GB RAM**) traditionally faces four fatal roadblocks:
+Coding agents frequently encounter failure modes that reduce reliability:
 
-1. **The VRAM Spilling & Ingestion Timeout:** Ingesting massive codebases (30k+ tokens) on consumer hardware with hybrid CPU/GPU offloading takes minutes. Standard HTTP clients time out at 300s, killing the session mid-turn.
-2. **The Passive Loop Trap:** Local models often fall into repetitive "research procrastination" loops—reading files repeatedly without ever modifying code.
-3. **The 7B/14B/35B Verification Gap:** Local models frequently report tasks as "complete" while leaving syntax errors, broken imports, or failing tests behind.
-4. **The Unsafe Workspace Risk:** Typical agent scripts risk destructive shell executions (`rm -rf`, disk wipes), directory traversal leaks, and unrecoverable workspace edits.
+- **Prompt prefill timeouts:** Heavy multi-file contexts can cause standard HTTP client sockets to time out during prefill on local inference engines.
+- **Repetitive read loops:** Smaller or local models can become trapped in passive file inspection without applying code changes.
+- **Unchecked errors:** Agentic loops that do not run project linters or test suites often report success while leaving syntax errors, broken imports, or failing tests.
+- **Workspace risks:** Shell commands run without path restrictions can modify files outside the intended project tree or introduce destructive changes.
 
-**Locode solves this with a purpose-built systems architecture:**
-* **Infinite-Timeout Streaming Engine:** Bypasses Node.js socket timeouts with custom `undici` dispatching and real-time SSE chunked streaming—enabling stable multi-minute prefill for contexts up to **262,144 tokens**.
-* **PageRank Dependency Codebase Map:** Extracts multi-language symbol definitions and imports, builds cross-file dependency graphs, and runs PageRank power-iteration (damping factor 0.85) to surface central architectural files on Turn 1 in ~1,500–2,500 tokens.
-* **Multi-Strategy Edit Fallback Engine:** 5-tier resilient editing pipeline: exact match $\to$ view_file prefix cleanup $\to$ whitespace-normalized matching $\to$ top/bottom anchor context matching $\to$ unified diff hunks, with actionable closest-match diagnostics on failure.
-* **Immediate Automated Linter & Compiler Feedback Loop:** Runs instant background compilation checks (`py_compile`, `tsc`, `npm run typecheck`, `cargo check`) immediately upon file modification, feeding compiler errors right back to the model on the very next step.
-* **4,096 Output Token Generation Cap:** Prevents local models from running away in monolithic 20k-token monologues, enforcing tight feedback loops while preserving up to 262k input context.
-* **Autonomous Action Gate:** Detects passive exploration loops and temporarily withdraws read tools after 2 read turns to strictly enforce code modification (`edit_file`, `write_file`).
-* **Dynamic Step Leash:** Starts with a 150-step budget and dynamically adds **+80 steps** on every successful file edit, allowing complex refactors to run unattended overnight.
-* **Autonomous Verification Gate:** Runs background linters/typecheckers (`tsc`, `npm test`, `pytest`, `cargo check`) and traps compiler diagnostics for automated multi-attempt self-repair.
-* **Hardened Security & Instant Git `/undo`:** Strict workspace boundary enforcement (`resolveSafePath`), SSRF protection, and file-level pre-edit snapshot tracking for instant rollback without losing uncommitted user work.
+Locode addresses these issues through:
+
+1. **Adaptive Loop Profiles:** Differentiates between cloud and local models. Cloud providers (Claude, Gemini, Groq, OpenAI) receive expanded step budgets and deep context inspection, while local runtimes (llama.cpp, Ollama) enforce strict action gates and cycle detection to prevent resource thrashing.
+2. **Multi-Strategy File Editing:** A multi-tier patching engine that falls back from exact matching to whitespace-tolerant matching, contextual line anchors, and unified diff application. Preserves CRLF line endings on Windows.
+3. **Automated Verification Feedback:** Integrates directly with project build systems (`tsc`, `npm test`, `pytest`, `py_compile`, `cargo check`). Captures compiler error outputs, filters out unrelated project errors, and injects actionable diagnostics into the next turn for autonomous correction.
+4. **Sandboxed Workspace Operations:** Enforces path containment to prevent directory traversal outside the repository root, blocks destructive commands, and creates atomic file snapshots before each modification.
+5. **Prompt Caching & Streaming:** Utilizes Server-Sent Events (SSE) and vendor prompt caching (e.g. Anthropic prompt caching, Gemini context reuse) to minimize latency and token expenditure.
 
 ---
 
-## 🏛️ System Architecture
+## Architecture
 
 ```text
-                             USER TASK / OBJECTIVE
-                                       │
-                                       ▼
-                     ┌───────────────────────────────────┐
-                     │ Hardware Telemetry & Profile Init │
-                     │   (Ultra-Context 262k / Balanced) │
-                     └─────────────────┬─────────────────┘
-                                       │
-                                       ▼
-                     ┌───────────────────────────────────┐
-                     │   Prefix-Stable Context Engine    │
-                     │  (7-Layer Structured Memory)      │
-                     └─────────────────┬─────────────────┘
-                                       │
-                                       ▼
-                     ┌───────────────────────────────────┐
-                     │   Active Streaming Engine         │ ◄─── (Zero-Timeout Fetch Dispatcher)
-                     │   (llama.cpp TurboQuant / Ollama) │
-                     └─────────────────┬─────────────────┘
-                                       │
+                           USER OBJECTIVE / TASK
+                                     │
+                                     ▼
+                    ┌──────────────────────────────────┐
+                    │  Provider & Environment Config   │
+                    │  (Cloud API or Local Runtime)    │
+                    └────────────────┬─────────────────┘
+                                     │
+                                     ▼
+                    ┌──────────────────────────────────┐
+                    │      Context Engine & Memory     │
+                    │   (Repository Map, Task State)   │
+                    └────────────────┬─────────────────┘
+                                     │
+                                     ▼
+                    ┌──────────────────────────────────┐
+                    │       Active LLM Streaming       │
+                    │  (Groq / Gemini / Claude / etc)  │
+                    └────────────────┬─────────────────┘
+                                     │
                         Tool Calls Requested?
-                                       │
-                        ┌──────────────┴──────────────┐
-                        │                             │
-                   [Tool Actions]                [Final Text]
-                        │                             │
-                        ▼                             ▼
-       ┌─────────────────────────────────┐   ┌─────────────────┐
-       │   Autonomous Action Gate        │   │ Clean Session   │
-       │   (Blocks passive read traps)   │   │ Memory Save     │
-       └────────────────┬────────────────┘   └─────────────────┘
-                        │
-                        ▼
-       ┌─────────────────────────────────┐
-       │   Sandboxed Tool Execution      │
-       │   (Path Guard, SSRF Filter,     │
-       │    Pre-Edit Snapshot Recorded)  │
-       └────────────────┬────────────────┘
-                        │
-                        ▼
-       ┌─────────────────────────────────┐
-       │  Autonomous Verification Gate   │
-       │  (tsc / npm test / pytest)      │
-       └────────────────┬────────────────┘
-                        │
-                 Passes Verification?
-                 ┌──────┴──────┐
-                 │             │
-              [YES]          [NO]
-                 │             │
-                 ▼             ▼
-       ┌────────────────┐  ┌───────────────────────────────┐
-       │ Dynamic Leash  │  │ Architect Root-Cause Diagnosis│
-       │ +80 Steps      │  │ ➔ Direct Surgical Repair      │
-       └────────────────┘  └───────────────────────────────┘
+                                     │
+                      ┌──────────────┴──────────────┐
+                      │                             │
+                 [Tool Calls]                  [Text Response]
+                      │                             │
+                      ▼                             ▼
+     ┌──────────────────────────────────┐   ┌───────────────────┐
+     │  Stagnation & Cycle Guard        │   │ Session Memory    │
+     │  (Detects repetitive patterns)   │   │ Persisted         │
+     └────────────────┬─────────────────┘   └───────────────────┘
+                      │
+                      ▼
+     ┌──────────────────────────────────┐
+     │  Sandboxed Execution Pipeline    │
+     │  - Path containment check        │
+     │  - Pre-edit snapshot recorded    │
+     │  - Dangerous command filter      │
+     └────────────────┬─────────────────┘
+                      │
+                      ▼
+     ┌──────────────────────────────────┐
+     │  Verification & Fast-Lint Gate   │
+     │  (tsc, npm test, pytest, cargo)  │
+     └────────────────┬─────────────────┘
+                      │
+                Checks Pass?
+                ┌─────┴─────┐
+                │           │
+              [Yes]        [No]
+                │           │
+                ▼           ▼
+     ┌────────────────┐   ┌─────────────────────────────┐
+     │ Turn Finalized │   │ Feed Compiler Error Trace   │
+     │ or Next Action │   │ Directly Into Next Turn     │
+     └────────────────┘   └─────────────────────────────┘
 ```
 
 ---
 
-## ✨ Core Features & Innovations
+## Supported Providers
 
-### 1. ⚡ Ultra-Context Engine & Hardware Profiles (`/profile`)
-Locode includes dedicated inference profiles tailored for varying VRAM and context demands:
+Locode supports both managed cloud endpoints and locally hosted engines:
 
-| Profile | Context Window | Target Use Case | KV Cache Strategy |
-| :--- | :---: | :--- | :---: |
-| **`ultra-context`** *(Default)* | **262,144 tokens** | Full multi-file repository understanding | TurboQuant 4-bit / 3-bit |
-| **`large-context`** | **65,536 tokens** | Large multi-file tasks with moderate VRAM | TurboQuant 4-bit |
-| **`performance`** | **32,768 tokens** | High-speed single-turn edits | TurboQuant 4-bit |
-| **`balanced`** | **16,384 tokens** | Compact memory footprint | Standard / Balanced |
-
-### 2. 🌊 Zero-Timeout Streaming Pipeline
-* Bypasses the default 300-second Node.js `headersTimeout` (`fetch failed`) during lengthy CPU/GPU prompt prefill on 30k+ token prompts.
-* Employs live Server-Sent Events (SSE) streaming so tokens and tool invocations stream in real time with continuous tokens/second telemetry.
-
-### 3. 🛡️ Autonomous Action Gate & Dynamic Leash
-* **Anti-Procrastination Enforcement:** If a model spends 2 consecutive turns executing read-only tools (`view_file`, `search_code`) without modifying code, Locode temporarily withdraws passive inspection tools, making it impossible for the model to get stuck in read loops.
-* **Overnight Execution Leash:** Starts with a 150-step budget and dynamically grants **+80 additional steps** whenever code is modified, preventing runaway execution while allowing long-running tasks to complete unattended.
-
-### 4. 🧪 Autonomous Verification & Self-Repair Gate (`/verify`)
-* Automatically detects project test and typecheck suites:
-  * **TypeScript/Node.js:** `npm run typecheck`, `tsc --noEmit`, `npm test`
-  * **Python:** `pytest`, `pytest.ini`, `python -m unittest`
-  * **Rust / Go:** `cargo check`, `go test ./...`
-* When errors occur, Locode extracts the relevant compiler diagnostic lines, strips build noise, and injects actionable repair directives back into the model context.
-
-### 5. ⏪ Safe Multi-Turn Git Checkpointing & Instant `/undo`
-* Preserves user uncommitted changes before turns begin.
-* Automatically records file snapshots before `edit_file` or `write_file` execute.
-* `/undo` surgically rolls back only the agent's edits without discarding pre-existing user drafts.
-
-### 6. 🔒 Enterprise Security Sandboxing
-* **Filesystem:** Strict workspace traversal prevention (`resolveSafePath`). Prevents accessing files outside the workspace root.
-* **Terminal:** Dangerous command filter (`isDangerousCommand`) blocking destructive system actions (`rm -rf`, disk wipes, format commands).
-* **Web Tools:** SSRF protection (`isSsrfSafeUrl`) blocking loopback addresses, private subnet ranges, and cloud metadata endpoints (`169.254.169.254`).
+| Provider | Type | Default Model | Context Support | Key Features |
+| :--- | :--- | :--- | :--- | :--- |
+| **Groq** | Cloud | `qwen/qwen3.8-27b` | Up to 131k tokens | Fast token generation speed |
+| **Google Gemini** | Cloud | `gemini-3.8-flash` | Up to 1M+ tokens | Thought signature preservation, native tools |
+| **Anthropic** | Cloud | `claude-3-7-sonnet-20250219` | Up to 200k tokens | Structured prompt caching, tool use |
+| **OpenAI** | Cloud | `gpt-4o` | Up to 128k tokens | Streaming function calling |
+| **OpenRouter** | Cloud | Configurable | Varies by model | Unified gateway for open & closed models |
+| **llama.cpp** | Local | Configurable (`.gguf`) | Up to 262k tokens | Custom KV-cache profiles, zero timeout |
+| **Ollama** | Local | `qwen2.5-coder:7b` | Varies | Local inference via Ollama server |
 
 ---
 
-## 📊 Empirical Self-Repair Benchmark
+## Getting Started
 
-Locode includes an end-to-end benchmark suite (`npm run benchmark`) testing genuine bug interception and autonomous repair across 5 categories:
+### Prerequisites
 
-| Seeded Bug Category | Benchmark Case Description | Initial Verifier Catch | Repair Resolution | Result |
-| :--- | :--- | :---: | :---: | :---: |
-| **TypeScript Type Error** | Interface property mismatch (`TS2339`) | Real node test failure | Surgical property alignment | **PASS** |
-| **Function/API Contract** | Unhandled async Promise resolution | Real contract failure | Promise resolution handling | **PASS** |
-| **Failing Unit Test** | Calculator logic error | Real assertion error | Logic parameter repair | **PASS** |
-| **Missing Import** | Unresolved dependency (`ReferenceError`) | Real symbol failure | Targeted import inclusion | **PASS** |
-| **Incorrect Return Value** | Authentication logic reversal | Real assertion error | Architect escalation + fix | **PASS** |
+- [Node.js](https://nodejs.org/) v20 or higher
+- An API key for cloud providers, or a running local runtime (such as Ollama or llama.cpp)
 
-### Benchmark Scorecard (RTX 4050 Laptop GPU / Local Test Sandbox)
-* **Total Cases:** 5
-* **Successful Repairs:** 5 (100% success rate)
-* **Average Repair Attempts:** 1.2
-* **Average Verification Runs:** 3.0
-* **Average Repair Time:** ~1,550 ms
+### Installation
 
----
-
-## 🚀 Quick Start
-
-### 1. Prerequisites
-* [Node.js](https://nodejs.org/) v20 or higher
-* A local model runtime:
-  * **llama.cpp** (`llama-server.exe`) for native TurboQuant & ultra-context (recommended)
-  * **Ollama** (`ollama pull qwen2.5-coder:7b`)
-  * **LM Studio** / **vLLM** (OpenAI-compatible endpoint)
-
-### 2. Installation
 ```bash
 git clone https://github.com/octavia-23/locode.git
 cd locode
@@ -173,81 +123,142 @@ npm install
 npm run build
 ```
 
+### Configuration
+
+Create a `.env` file in the project directory or in your home directory (`~/.locode/.env`):
+
+```bash
+cp .env.example .env
+```
+
+Add your API keys to the `.env` file:
+
+```env
+# Google Gemini
+GEMINI_API_KEY="your-gemini-key"
+
+# Anthropic Claude
+ANTHROPIC_API_KEY="your-anthropic-key"
+
+# Groq
+GROQ_API_KEY="your-groq-key"
+
+# OpenAI
+OPENAI_API_KEY="your-openai-key"
+
+# OpenRouter
+OPENROUTER_API_KEY="your-openrouter-key"
+
+# Optional defaults
+LOCODE_PROVIDER="groq"
+LOCODE_MODEL="qwen/qwen3.8-27b"
+```
+
+Locode loads environment variables in the following order:
+1. Workspace `.env`
+2. Global configuration in `~/.locode/.env`
+3. System environment variables
+
 ---
 
-## 💻 Usage
+## Usage
 
-### Interactive REPL Mode
+### Interactive Mode
+
+Start the interactive terminal interface:
+
 ```bash
 npm start
-# or after build:
+# or after running npm run build:
 node dist/cli.js
 ```
 
 ### Autonomous / Non-Interactive Mode
-Run a one-shot coding task to completion without confirmation prompts:
+
+Execute a specific task directly from the command line without interactive approval prompts:
+
 ```bash
-node dist/cli.js --auto "Implement user authentication middleware and run npm test"
+node dist/cli.js --auto "Fix failing tests in tests/auth.test.ts"
 ```
 
-### Useful CLI Flags
-```bash
-# Autonomous mode (auto-approves all tool actions)
-node dist/cli.js --auto
+### Command Line Options
 
-# Select an inference profile
-node dist/cli.js --profile ultra-context   # 262,144 tokens
-node dist/cli.js --profile performance     # 32,768 tokens
-node dist/cli.js --profile balanced        # 16,384 tokens
+```text
+Usage: locode [options] [prompt...]
 
-# Explicit context override
-node dist/cli.js --ctx 64k
+Arguments:
+  prompt                     Initial instruction to execute
 
-# Target a specific model file or provider
-node dist/cli.js --model-path "C:\models\qwen-35b.gguf"
-node dist/cli.js --provider llamacpp
-node dist/cli.js --provider ollama --model qwen2.5-coder:7b
-node dist/cli.js --provider openai --api-base http://localhost:1234/v1
+Options:
+  -p, --provider <type>      Provider: gemini | anthropic | openai | openrouter | groq | llamacpp | ollama
+  -m, --model <name>         Model identifier
+  -c, --ctx <size>           Context window override (e.g. 16k, 32k, 64k, 128k, 262k)
+  -y, --yes, --auto          Auto-approve tool executions without manual confirmation
+  -f, --file <path>          Read instructions from a text or markdown file
+  -d, --dir <path>           Set target workspace directory (default: current working directory)
+  --profile <name>           Inference profile: ultra-context | performance | large-context | balanced
+  --api-base <url>           Base URL for OpenAI-compatible endpoints
+  --api-key <key>            API key override
+  --host <url>               Ollama host URL (default: http://127.0.0.1:11434)
+  --model-path <path>        Path to local .gguf model file for llama.cpp
+  -h, --help                 Display CLI help
+  -V, --version              Output version number
 ```
 
-### Slash Commands in REPL
-| Command | Action |
+### REPL Commands
+
+Within interactive mode, use slash commands to inspect state or modify settings on the fly:
+
+| Command | Description |
 | :--- | :--- |
-| `/auto` | ⚡ Toggle Autonomous Mode (permissionless execution) |
-| `/hardware` | 🖥️ Inspect hardware telemetry, VRAM, and runtime stats |
-| `/verify [cmd]` | 🧪 Run workspace verification (typechecker or test runner) |
-| `/mode [worker\|architect]` | 🔀 Toggle fast worker lane vs deep architect lane |
-| `/undo` | ⏪ Rollback workspace to state prior to the last agent turn |
-| `/diff` | 📝 Inspect pending workspace modifications and git diffs |
-| `/stats` | 📊 Display session token metrics, duration, and TPS |
-| `/commit [msg]` | 🤖 Auto-generate or apply a conventional git commit |
-| `/mcp` | 🔌 Inspect connected Model Context Protocol (MCP) servers |
-| `/model [name]` | 🔄 Switch active model on the fly |
-| `/clear` | 🧹 Reset conversation history and working memory |
-| `/help` | ❓ Display all interactive commands and options |
-| `/exit` | 🚪 Exit Locode CLI |
+| `/provider [name]` | Switch provider (`gemini`, `anthropic`, `groq`, `openai`, `llamacpp`, `ollama`) |
+| `/model [name]` | Change active model identifier |
+| `/auto` | Toggle permissionless auto-approval mode |
+| `/verify [cmd]` | Run project linters or test commands |
+| `/undo` | Roll back workspace changes to the state before the last agent turn |
+| `/diff` | Display uncommitted git changes generated by the agent |
+| `/commit [msg]` | Stage changes and create a git commit (auto-generates conventional message if omitted) |
+| `/stats` | View token usage, duration, and generation speed metrics |
+| `/context [size]` | Set context window limit (e.g. `16k`, `64k`, `128k`) |
+| `/profile [name]` | Switch local inference profile (`ultra-context`, `performance`, `balanced`) |
+| `/hardware` | Display host CPU, GPU, and VRAM telemetry |
+| `/mcp` | List connected Model Context Protocol (MCP) servers and tools |
+| `/tools` | List registered internal agent tools |
+| `/memory` | Inspect persisted session memory for the workspace |
+| `/clear` | Clear active conversation history |
+| `/help` | List available commands |
+| `/exit` | Exit the application |
 
 ---
 
-## 🧪 Testing
+## Security Model
 
-Locode is covered by a 61-test automated suite across unit, integration, and mock runtime flows:
+Locode runs commands and modifies files with the permissions of the current shell user. To mitigate unintended changes, the agent applies several containment mechanisms:
+
+- **Path Containment:** File tools check paths using `resolveSafePath`, preventing read or write access outside the active workspace directory.
+- **Pre-Execution Snapshots:** The checkpoint manager records file states prior to any write or edit, allowing clean rollback via `/undo`.
+- **Command Filtering:** Detects and blocks known destructive system commands (e.g., recursive root deletions, format utilities).
+- **Network Validation:** Web-fetching tools validate target URLs against private network ranges, loopback addresses, and cloud instance metadata addresses (`169.254.169.254`) to prevent Server-Side Request Forgery (SSRF).
+
+---
+
+## Testing
+
+Locode contains an automated test suite verifying providers, parsing, file operations, error isolation, and circuit breakers:
 
 ```bash
-# Run complete test suite (61 tests passing)
+# Run unit and integration tests (122 tests)
 npm test
 
 # Run TypeScript typecheck
 npm run typecheck
 
-# Run deterministic autonomous self-repair benchmark
-npm run benchmark
-
-# Production build
+# Build distribution bundle
 npm run build
 ```
 
 ---
 
-## 📜 License
+## License
+
 Source-Available Non-Commercial License. Copyright (c) 2026 Akshat Yadav. All rights reserved. Free for personal, educational, research, and non-commercial development. Commercial use, redistribution, or deployment requires explicit permission (see [LICENSE](LICENSE)).

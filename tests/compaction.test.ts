@@ -110,7 +110,7 @@ test('Context Compaction - evicts older file inspections from prompt history whi
   const compacted = cm.compactMessages(messages);
   // Older file inspection at index 2 should have its raw code lines evicted into a compact pointer
   assert.ok(compacted[2].content.includes('[File inspection: src/heavy.ts'), 'Old file inspection must be evicted to reference');
-  assert.ok(compacted[2].content.includes('raw code lines folded for token budget'), 'Fold explanation must be included');
+  assert.ok(compacted[2].content.includes('Call view_file again'), 'Placeholder must tell the model how to recover the contents');
   assert.ok(!compacted[2].content.includes('const x = 1;\n1: const x = 1;'), 'Raw 200 lines of code must not be kept');
   // Recent file at index 5 should remain intact
   assert.ok(compacted[5].content.includes('src/second.ts'), 'Recent file must be preserved');
@@ -140,4 +140,51 @@ test('Context Compaction - emergency ceiling cap guarantees total tokens fit wit
   const budget = cm.getAvailableContextBudget(0);
 
   assert.ok(estimatedTokens <= budget, `Estimated tokens (${estimatedTokens}) must not exceed budget (${budget})`);
+});
+
+test('Context Compaction - duplicate outputs below budget do not evict earlier file source', () => {
+  const cm = new ContextManager(8192);
+  const fileOutput = 'File: src/example.ts (lines 1-3 of 3)\n1: export const a = 1;\n2: export const b = 2;\n3: export const c = 3;';
+  const messages = [
+    { role: 'system' as const, content: 'System prompt' },
+    { role: 'user' as const, content: 'Fix the implementation.' },
+    { role: 'tool' as const, content: fileOutput },
+    { role: 'assistant' as const, content: 'I inspected the file.' },
+    { role: 'tool' as const, content: 'Directory contents: src, tests' },
+    { role: 'tool' as const, content: 'Directory contents: src, tests' },
+    { role: 'assistant' as const, content: 'I will use the inspected code.' }
+  ];
+
+  const result = cm.compactMessages(messages);
+  assert.notEqual(result, messages, 'Exact duplicate results may be deduplicated');
+  assert.ok(result[2].content.includes('export const a = 1;'), 'Original source output must remain available');
+  assert.ok(!result[2].content.includes('raw code lines folded for token budget'), 'Below-budget duplicate output must not trigger full history compaction');
+  assert.equal(cm.getStats().compactionRuns, 0, 'A duplicate below budget must not count as a compaction run');
+});
+
+test('Context Engine - any file invalidation clears stale verification', () => {
+  const engine = new ContextManager(8192);
+  engine.recordVerificationResult(true, 'npm test');
+  assert.equal(engine.getTaskState().lastVerification?.passed, true);
+
+  engine.invalidateFile('src/changed.ts');
+  assert.equal(engine.getTaskState().lastVerification, undefined, 'Verification must be invalidated as soon as a file is edited');
+});
+
+test('Context Compaction - re-reading a folded file always returns its contents (regression: re-read loop)', () => {
+  const cm = new ContextManager(8192);
+  const viewOut = 'File: src/app.ts (lines 1-120 of 120)\n' +
+    Array.from({ length: 120 }, (_, i) => `${i + 1}: const value${i} = compute(${i}); // code`).join('\n');
+  const messages: any[] = [
+    { role: 'system', content: 'sys' },
+    { role: 'user', content: 'fix the bug in src/app.ts' },
+    { role: 'assistant', content: '', tool_calls: [{ id: 'a', function: { name: 'view_file', arguments: { path: 'src/app.ts' } } }] },
+    { role: 'tool', content: viewOut },
+    { role: 'assistant', content: '', tool_calls: [{ id: 'b', function: { name: 'search_code', arguments: {} } }] },
+    { role: 'tool', content: 'src/app.ts:10: something\n'.repeat(40) },
+    { role: 'assistant', content: '', tool_calls: [{ id: 'c', function: { name: 'view_file', arguments: { path: 'src/app.ts' } } }] },
+    { role: 'tool', content: viewOut }
+  ];
+  const compacted = cm.compactMessages(messages);
+  assert.ok(compacted[compacted.length - 1].content.includes('compute(50)'), 'newest view_file result must stay intact');
 });

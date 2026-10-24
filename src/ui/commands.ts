@@ -7,6 +7,9 @@ import { allTools } from '../tools/index.js';
 import { TerminalRenderer } from './renderer.js';
 import { HardwareDetector } from '../hardware/detector.js';
 import { CodeVerifier } from '../agent/verifier.js';
+import { createLLMProvider, isCloudProvider, resolveProvider } from '../providers/factory.js';
+import { getApiKeyForProvider } from '../utils/config.js';
+import { ProviderType } from '../types.js';
 import { theme } from './theme.js';
 
 export async function handleSlashCommand(
@@ -30,6 +33,7 @@ export async function handleSlashCommand(
         ['/commit [msg]', 'Stage and commit workspace changes with git'],
         ['/diff', 'Show pending workspace git modifications'],
         ['/stats', 'Display session token count and generation speed'],
+        ['/provider [name]', 'Switch active provider (gemini, anthropic, openai, llamacpp, ollama)'],
         ['/hardware', 'Inspect GPU, VRAM, and offload telemetry'],
         ['/mcp', 'List connected MCP servers and external tools'],
         ['/model [name]', 'Switch active LLM on the fly'],
@@ -188,20 +192,93 @@ export async function handleSlashCommand(
 
     case '/stats': {
       const stats = agent.getStats();
+      const ctx = agent.getContext();
+      const isCloud = isCloudProvider(ctx.provider);
       const avgTps = stats.totalDurationMs > 0
         ? (stats.completionTokens / (stats.totalDurationMs / 1000)).toFixed(1)
         : '0.0';
       const sec = (stats.totalDurationMs / 1000).toFixed(1);
 
       console.log(`\n  ${theme.diamond} ${theme.strong('Session Telemetry')}\n`);
+      console.log(`    ${theme.muted('provider'.padEnd(14))} ${theme.accent(ctx.provider || 'auto')} ${theme.dim(`[${isCloud ? '☁ Cloud Frontier' : '💻 Local Quantized'}]`)}`);
+      console.log(`    ${theme.muted('model'.padEnd(14))} ${theme.secondary(ctx.model)}`);
       console.log(`    ${theme.muted('turns'.padEnd(14))} ${theme.text(String(stats.turns))}`);
       console.log(`    ${theme.muted('model calls'.padEnd(14))} ${theme.text(String(stats.modelCalls))}`);
       console.log(`    ${theme.muted('tool calls'.padEnd(14))} ${theme.text(String(stats.toolCalls))} ${theme.dim(`(${stats.successfulToolCalls} ok, ${stats.failedToolCalls} fail)`)}`);
       console.log(`    ${theme.muted('total tokens'.padEnd(14))} ${theme.text(stats.totalTokens.toLocaleString())}`);
       console.log(`    ${theme.muted('prompt tok'.padEnd(14))} ${theme.dim(stats.promptTokens.toLocaleString())}`);
-      console.log(`  ${theme.muted('output tok')}   ${theme.secondary(stats.completionTokens.toLocaleString())}`);
-      console.log(`  ${theme.muted('duration')}     ${theme.secondary(`${sec}s`)}`);
-      console.log(`  ${theme.muted('avg speed')}    ${theme.accent(`${avgTps} tok/s`)}\n`);
+      console.log(`    ${theme.muted('output tok'.padEnd(14))} ${theme.secondary(stats.completionTokens.toLocaleString())}`);
+      console.log(`    ${theme.muted('duration'.padEnd(14))} ${theme.secondary(`${sec}s`)}`);
+      console.log(`    ${theme.muted('avg speed'.padEnd(14))} ${theme.accent(`${avgTps} tok/s`)}\n`);
+      return true;
+    }
+
+    case '/provider': {
+      const ctx = agent.getContext();
+      const activeProvider = ctx.provider || 'ollama';
+      const supportedProviders: Array<{ name: ProviderType; defaultModel: string; type: 'cloud' | 'local' }> = [
+        { name: 'gemini', defaultModel: 'gemini-3.6-flash', type: 'cloud' },
+        { name: 'anthropic', defaultModel: 'claude-3-5-sonnet-20241022', type: 'cloud' },
+        { name: 'openai', defaultModel: 'gpt-4o', type: 'cloud' },
+        { name: 'openrouter', defaultModel: 'anthropic/claude-3.5-sonnet', type: 'cloud' },
+        { name: 'groq', defaultModel: 'qwen/qwen3.8-27b', type: 'cloud' },
+        { name: 'llamacpp', defaultModel: 'qwen2.5-coder:7b', type: 'local' },
+        { name: 'ollama', defaultModel: 'qwen2.5-coder:7b', type: 'local' }
+      ];
+
+      if (!arg) {
+        console.log(`\n  ${theme.diamond} ${theme.strong('LLM Providers')}\n`);
+        console.log(`    ${theme.muted('active:')} ${theme.accent(activeProvider)} ${theme.dim(`[${isCloudProvider(activeProvider) ? '☁ Cloud' : '💻 Local'}]`)}\n`);
+        console.log(`    ${theme.muted('available providers:')}`);
+        for (const p of supportedProviders) {
+          const isAct = p.name === activeProvider;
+          const marker = isAct ? theme.check : ' ';
+          const tag = p.type === 'cloud' ? theme.dim('(cloud)') : theme.dim('(local)');
+          const label = isAct ? theme.strong(p.name) : theme.secondary(p.name);
+          console.log(`    ${marker} ${label.padEnd(14)} ${tag.padEnd(10)} ${theme.muted(`default: ${p.defaultModel}`)}`);
+        }
+        console.log(`\n  ${theme.faint('switch with: /provider <name> (e.g. /provider gemini)\n')}`);
+        return true;
+      }
+
+      const requested = arg.trim().toLowerCase() as ProviderType;
+      const target = supportedProviders.find(p => p.name === requested);
+      if (!target) {
+        renderer.printError(`unknown provider "${arg}". Choose: ${supportedProviders.map(p => p.name).join(', ')}`);
+        return true;
+      }
+
+      try {
+        const targetApiKey = isCloudProvider(requested) ? getApiKeyForProvider(requested) : undefined;
+        let newNumCtx = 8192;
+        if (requested === 'gemini') newNumCtx = 1048576;
+        else if (requested === 'anthropic') newNumCtx = 200000;
+        else if (requested === 'groq') newNumCtx = 131072;
+        else if (requested === 'openai' || requested === 'openrouter') newNumCtx = 128000;
+        else if (requested === 'llamacpp') newNumCtx = 262144;
+
+        const newContext = {
+          ...ctx,
+          provider: requested,
+          model: target.defaultModel,
+          apiKey: targetApiKey || ctx.apiKey,
+          numCtx: newNumCtx
+        };
+
+        const newProvider = createLLMProvider(newContext);
+        agent.setProvider(newProvider, requested);
+        agent.setContext({
+          provider: requested,
+          model: target.defaultModel,
+          apiKey: targetApiKey || ctx.apiKey,
+          numCtx: newNumCtx
+        });
+
+        const cloudBadge = isCloudProvider(requested) ? '☁ Cloud Frontier' : '💻 Local Quantized';
+        renderer.printSuccess(`provider switched to ${requested} [${cloudBadge}] (model: ${target.defaultModel}, ctx: ${newNumCtx.toLocaleString()})`);
+      } catch (err: any) {
+        renderer.printError(`failed to switch provider: ${err.message}`);
+      }
       return true;
     }
 

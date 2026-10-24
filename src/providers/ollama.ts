@@ -94,7 +94,7 @@ export class OllamaProvider implements ILLMProvider {
           options: {
             num_ctx: this.numCtx,
             temperature: 0.1,
-            num_predict: 4096
+            num_predict: options?.maxTokens || 4096
           }
         });
 
@@ -129,6 +129,7 @@ export class OllamaProvider implements ILLMProvider {
         return {
           content: fullContent,
           tool_calls: parsedCalls.length > 0 ? parsedCalls : undefined,
+          stopReason: 'stop',
           usage: {
             promptTokens,
             completionTokens,
@@ -138,14 +139,19 @@ export class OllamaProvider implements ILLMProvider {
           }
         };
       } catch (err: any) {
-        return this.chatNonStreaming(ollamaMessages, formattedTools, startTime);
+        return this.chatNonStreaming(ollamaMessages, formattedTools, startTime, options);
       }
     }
 
-    return this.chatNonStreaming(ollamaMessages, formattedTools, startTime);
+    return this.chatNonStreaming(ollamaMessages, formattedTools, startTime, options);
   }
 
-  private async chatNonStreaming(messages: OllamaMessage[], tools: any[], startTime: number): Promise<ChatProviderResponse> {
+  private async chatNonStreaming(
+    messages: OllamaMessage[],
+    tools: any[],
+    startTime: number,
+    options?: import('./types.js').ChatOptions
+  ): Promise<ChatProviderResponse> {
     const response = await ollama.chat({
       model: this.model,
       messages: messages,
@@ -154,7 +160,7 @@ export class OllamaProvider implements ILLMProvider {
       options: {
         num_ctx: this.numCtx,
         temperature: 0.1,
-        num_predict: 4096
+        num_predict: options?.maxTokens || 4096
       }
     });
 
@@ -174,6 +180,7 @@ export class OllamaProvider implements ILLMProvider {
     return {
       content,
       tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+      stopReason: (response as any).done_reason || 'stop',
       usage: {
         promptTokens,
         completionTokens,

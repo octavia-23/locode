@@ -114,13 +114,13 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
             messages: formattedMessages,
             tools: formattedTools.length > 0 ? formattedTools : undefined,
             tool_choice: options?.toolChoice,
-            temperature: 0.2,
+            temperature: options?.temperature ?? 0.2,
             top_p: 0.85,
             min_p: 0.05,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            repeat_penalty: 1.0,
-            max_tokens: 4096,
+            presence_penalty: options?.presencePenalty ?? 0.0,
+            frequency_penalty: options?.frequencyPenalty ?? 0.1,
+            repeat_penalty: options?.repeatPenalty ?? 1.1,
+            max_tokens: options?.maxTokens || 4096,
             stream: true,
             stream_options: { include_usage: true }
           })
@@ -132,6 +132,7 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
           let fullContent = '';
           const toolCallsAccumulator: Map<number, { id?: string; name: string; arguments: string }> = new Map();
           let usageTokens = { prompt: 0, completion: 0, total: 0 };
+          let stopReason: string | undefined;
 
           let firstTokenTime: number = 0;
           let serverReportedTps: number = 0;
@@ -156,7 +157,11 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
                   serverReportedTps = json.timings.predicted_per_second;
                 }
 
-                const delta = json.choices?.[0]?.delta;
+                const choice = json.choices?.[0];
+                if (choice?.finish_reason) {
+                  stopReason = choice.finish_reason;
+                }
+                const delta = choice?.delta;
                 if (delta?.content) {
                   if (!firstTokenTime) {
                     firstTokenTime = Date.now();
@@ -237,6 +242,7 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
           return {
             content: cleanedContent,
             tool_calls: finalToolCalls.length > 0 ? finalToolCalls : undefined,
+            stopReason,
             usage: {
               promptTokens: usageTokens.prompt,
               completionTokens: usageTokens.completion,
@@ -266,13 +272,13 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
         messages: formattedMessages,
         tools: formattedTools.length > 0 ? formattedTools : undefined,
         tool_choice: options?.toolChoice,
-        temperature: 0.2,
+        temperature: options?.temperature ?? 0.2,
         top_p: 0.85,
         min_p: 0.05,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-        repeat_penalty: 1.0,
-        max_tokens: 4096
+        presence_penalty: options?.presencePenalty ?? 0.0,
+        frequency_penalty: options?.frequencyPenalty ?? 0.1,
+        repeat_penalty: options?.repeatPenalty ?? 1.1,
+        max_tokens: options?.maxTokens || 4096
       })
     });
 
@@ -287,6 +293,7 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
     const choice = data.choices?.[0];
     const message = choice?.message || {};
     const content = message.content || '';
+    const stopReason = choice?.finish_reason;
     let toolCalls = message.tool_calls;
     let cleanedContent = content;
 
@@ -325,6 +332,7 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
     return {
       content: cleanedContent,
       tool_calls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
+      stopReason,
       usage: {
         promptTokens,
         completionTokens,

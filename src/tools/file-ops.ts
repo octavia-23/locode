@@ -3,6 +3,7 @@ import path from 'node:path';
 import { ToolDefinition } from '../types.js';
 import { resolveSafePath } from './security.js';
 import { MultiStrategyEditEngine } from './edit-engine.js';
+import { isCloudProvider } from '../providers/factory.js';
 
 export const viewFileTool: ToolDefinition = {
   name: 'view_file',
@@ -54,10 +55,12 @@ export const viewFileTool: ToolDefinition = {
         };
       }
       
+      const isCloud = isCloudProvider(context?.provider);
       const start = args.start_line ? Math.max(1, Math.min(args.start_line, lines.length)) : 1;
-      const defaultEnd = Math.min(lines.length, start + 600);
+      const defaultWindow = isCloud ? 2500 : 600;
+      const maxWindow = isCloud ? 3000 : 700;
+      const defaultEnd = Math.min(lines.length, start + defaultWindow);
       let end = args.end_line ? Math.min(lines.length, Math.max(start, args.end_line)) : defaultEnd;
-      const maxWindow = 700;
       let wasWindowCapped = false;
       if (end - start + 1 > maxWindow) {
         end = start + maxWindow - 1;
@@ -70,12 +73,19 @@ export const viewFileTool: ToolDefinition = {
         .join('\n');
 
       let header = `File: ${args.path} (lines ${start}-${end} of ${lines.length})\n`;
-      if (lines.length > 800) {
-        header += `[NOTICE: Large file (${lines.length} lines). Do NOT paginate the entire file with view_file! Use 'search_code' to find the relevant function/variable, or 'view_file' with outline=true to see declarations, then proceed directly to 'edit_file']\n`;
-      } else if (wasWindowCapped) {
-        header += `[Window capped at ${maxWindow} lines. Do NOT page through the file. Use 'search_code' to locate specific functions or proceed directly to 'edit_file']\n`;
-      } else if (end < lines.length && !args.end_line) {
-        header += `[Context limit: output truncated at line ${end} of ${lines.length}. Use 'search_code' to locate specific functions or proceed directly to 'edit_file']\n`;
+      if (isCloud) {
+        if (wasWindowCapped || end < lines.length) {
+          header += `[Lines ${start}-${end} of ${lines.length} shown. Use start_line/end_line to view other sections if needed]\n`;
+        }
+      } else {
+        if (lines.length > 800) {
+          header += `[NOTICE: Large file (${lines.length} lines). Do NOT paginate the entire file with view_file! Use 'search_code' to find the relevant function/variable, or 'view_file' with outline=true to see declarations, then proceed directly to 'edit_file']\n`;
+        }
+        if (wasWindowCapped) {
+          header += `[Window capped at ${maxWindow} lines. Do NOT page through the file. Use 'search_code' to locate specific functions or proceed directly to 'edit_file']\n`;
+        } else if (end < lines.length && !args.end_line) {
+          header += `[Context limit: output truncated at line ${end} of ${lines.length}. Use 'search_code' to locate specific functions or proceed directly to 'edit_file']\n`;
+        }
       }
 
       if (context.contextEngine?.recordFileRead) {
@@ -115,7 +125,9 @@ export const batchReadFilesTool: ToolDefinition = {
         return { result: 'No file paths provided.', isError: true };
       }
 
-      const maxLines = args.max_lines_per_file || 200;
+      const isCloud = isCloudProvider(context?.provider);
+      const defaultBatchMax = isCloud ? 500 : 200;
+      const maxLines = args.max_lines_per_file || defaultBatchMax;
       const results: string[] = [];
 
       for (const p of paths.slice(0, 10)) { // limit to 10 files per batch
@@ -221,7 +233,9 @@ export const editFileTool: ToolDefinition = {
         return { result: editResult.error || `Target content not found in ${args.path}.`, isError: true };
       }
 
-      await fs.writeFile(fullPath, editResult.content, 'utf8');
+      const hasCrlf = existing.includes('\r\n');
+      const finalContent = hasCrlf ? editResult.content.replace(/\r?\n/g, '\r\n') : editResult.content;
+      await fs.writeFile(fullPath, finalContent, 'utf8');
       if (context.contextEngine?.invalidateFile) {
         context.contextEngine.invalidateFile(args.path);
       }

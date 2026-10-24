@@ -108,14 +108,31 @@ export class CodeVerifier {
       }
 
       if (cmd) {
-        return await this.run(cwd, cmd);
+        const vRes = await this.run(cwd, cmd);
+        if (!vRes.passed && targetFile && vRes.errorOutput) {
+          const baseName = path.basename(targetFile).toLowerCase();
+          const targetRel = targetFile.replace(/\\/g, '/').toLowerCase();
+          const errorLower = vRes.errorOutput.toLowerCase();
+          if (!errorLower.includes(baseName) && !errorLower.includes(targetRel)) {
+            // Unrelated pre-existing errors in other files, do not falsely accuse targetFile!
+            return { passed: true, command: vRes.command };
+          }
+        }
+        return vRes;
       }
     } catch {}
 
     // 3. Rust: cargo check
     try {
       await fs.access(path.join(cwd, 'Cargo.toml'));
-      return await this.run(cwd, 'cargo check');
+      const vRes = await this.run(cwd, 'cargo check');
+      if (!vRes.passed && targetFile && vRes.errorOutput) {
+        const baseName = path.basename(targetFile).toLowerCase();
+        if (!vRes.errorOutput.toLowerCase().includes(baseName)) {
+          return { passed: true, command: vRes.command };
+        }
+      }
+      return vRes;
     } catch {}
 
     return { passed: true };

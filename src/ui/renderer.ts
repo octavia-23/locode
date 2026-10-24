@@ -6,6 +6,7 @@ import { marked } from 'marked';
 import MarkedTerminal from 'marked-terminal';
 
 import { HardwareProfile } from '../hardware/detector.js';
+import { isCloudProvider } from '../providers/factory.js';
 import { theme } from './theme.js';
 
 // Setup marked for terminal with clean, muted typography
@@ -98,7 +99,7 @@ export class TerminalRenderer {
 
     // Title line
     const titleLeft = `${theme.diamond} ${theme.strong('locode')} ${theme.muted('v0.4.0')}`;
-    const titleRight = `${theme.dim('local-first agent')}`;
+    const titleRight = isCloudProvider(providerName) ? `${theme.dim('hybrid cloud agent')}` : `${theme.dim('local-first agent')}`;
     const titlePad = Math.max(1, innerWidth - stripAnsi(titleLeft).length - stripAnsi(titleRight).length);
     renderRow(`${titleLeft}${' '.repeat(titlePad)}${titleRight}`);
 
@@ -110,7 +111,9 @@ export class TerminalRenderer {
     renderRow(`${theme.muted('model'.padEnd(labelPad))} ${theme.text(modelStr)} ${theme.dim(`(${provDisplay})`)}`);
     renderRow(`${theme.muted('context'.padEnd(labelPad))} ${theme.accent(`${ctxVal.toLocaleString()} tokens`)} ${theme.faint('·')} ${theme.tag(modeStr)}`);
 
-    if (hardwareProfile) {
+    if (isCloudProvider(providerName)) {
+      renderRow(`${theme.muted('engine'.padEnd(labelPad))} ${theme.secondary('Cloud Frontier API')} ${theme.faint('·')} ${theme.dim('zero local vram')}`);
+    } else if (hardwareProfile) {
       const vramStr = hardwareProfile.totalVramMb > 0
         ? `${(hardwareProfile.totalVramMb / 1024).toFixed(1)} GB`
         : `${(hardwareProfile.totalRamMb / 1024).toFixed(1)} GB`;

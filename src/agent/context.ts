@@ -163,6 +163,9 @@ export class ContextEngine {
   invalidateFile(filePath: string) {
     const norm = this.normalizePath(filePath);
     this.fileCache.delete(norm);
+    // A verification result only applies to the exact workspace state that was tested.
+    // Any file write/edit invalidates it until verification is run again.
+    this.taskState.lastVerification = undefined;
     if (!this.taskState.relevantFiles.includes(norm)) {
       this.taskState.relevantFiles.push(norm);
     }
@@ -389,6 +392,32 @@ export class ContextEngine {
    * 5. Layer F: Recent execution window (turns N-1, N-2)
    * 6. Lower: Historical turns compacted or pruned
    */
+  /**
+   * Replaces older duplicate tool outputs with a short note, ALWAYS keeping the newest copy intact.
+   * (Previously the newest copy was replaced with a pointer to the older one; once the older one was
+   * folded away the model had no copy of the content anywhere and kept re-reading it in a loop.)
+   */
+  private dedupeToolOutputs(msgs: ChatMessage[], startIdx: number = 0): boolean {
+    const seen = new Set<string>();
+    let changed = false;
+    for (let i = msgs.length - 1; i >= startIdx; i--) {
+      const msg = msgs[i];
+      if (msg.role !== 'tool' || !msg.content || !msg.content.trim()) continue;
+      const isVerifOrStatus = /^(PASSED|FAILED|Command .* exited cleanly|\[Command .* exited cleanly|\(no output\))/i.test(msg.content.trim());
+      if (isVerifOrStatus) continue;
+      const hash = crypto.createHash('sha256').update(msg.content).digest('hex');
+      if (seen.has(hash)) {
+        const tokensSaved = this.estimateTokens(msg.content) - 15;
+        if (tokensSaved > 0) this.stats.tokensAvoidedByDeduplication += tokensSaved;
+        msg.content = '[Identical output appears again later in this conversation; omitted here to save context]';
+        changed = true;
+      } else {
+        seen.add(hash);
+      }
+    }
+    return changed;
+  }
+
   compactMessages(messages: ChatMessage[], synthesizedFindings?: string): ChatMessage[] {
     const budget = this.getAvailableContextBudget();
     this.stats.budgetTokens = budget;
@@ -396,27 +425,35 @@ export class ContextEngine {
     const totalTokens = this.estimateMessagesTokens(messages);
     this.stats.totalTokensEstimated = totalTokens;
 
-    // Check if there are duplicate identical tool outputs that should be deduplicated
+    // Check if there are duplicate verbose tool outputs that should be deduplicated
     let hasDuplicateTools = false;
     const testSeen = new Set<string>();
     for (const m of messages) {
-      if (m.role === 'tool' && m.content) {
-        const hash = crypto.createHash('md5').update(m.content.slice(0, 500)).digest('hex');
-        if (testSeen.has(hash)) {
-          hasDuplicateTools = true;
-          break;
+      // Exempt empty outputs, short exit statuses, and verification messages from deduplication
+      if (m.role === 'tool' && m.content && m.content.trim().length > 0) {
+        const isVerifOrStatus = /^(PASSED|FAILED|Command .* exited cleanly|\[Command .* exited cleanly|\(no output\))/i.test(m.content.trim());
+        if (!isVerifOrStatus) {
+          const hash = crypto.createHash('sha256').update(m.content).digest('hex');
+          if (testSeen.has(hash)) {
+            hasDuplicateTools = true;
+            break;
+          }
+          testSeen.add(hash);
         }
-        testSeen.add(hash);
       }
     }
 
     // PREFIX-STABILITY CHECK:
-    // If message history is within budget and has no duplicate tool spam,
-    // do NOT alter or rewrite middle message bytes!
-    // Returning identical messages allows llama.cpp and local LLM engines
-    // to achieve 100% KV cache hit rate for prompt prefill.
-    if (totalTokens <= budget && !hasDuplicateTools) {
-      return messages;
+    // If history fits, never run the full compaction pass. In particular, a repeated
+    // tool result must not cause older file inspections to be replaced with pointers
+    // while there is still ample context space; that can make the model reread files.
+    if (totalTokens <= budget) {
+      if (!hasDuplicateTools) return messages;
+
+      // Deduplicate exact repeated tool outputs only (keeping the newest copy).
+      const deduplicated = messages.map(m => ({ ...m }));
+      this.dedupeToolOutputs(deduplicated);
+      return deduplicated;
     }
 
     this.stats.compactionRuns++;
@@ -428,22 +465,8 @@ export class ContextEngine {
       this.taskState.objective = initialUserMsg.content.slice(0, 500);
     }
 
-    // Step 1: Deduplicate identical tool outputs across the session
-    const seenToolOutputs = new Map<string, number>();
-    for (let i = 1; i < compacted.length; i++) {
-      const msg = compacted[i];
-      if (msg.role === 'tool' && msg.content) {
-        const hash = crypto.createHash('md5').update(msg.content.slice(0, 500)).digest('hex');
-        if (seenToolOutputs.has(hash)) {
-          const priorIdx = seenToolOutputs.get(hash)!;
-          const tokensSaved = this.estimateTokens(msg.content) - 15;
-          if (tokensSaved > 0) this.stats.tokensAvoidedByDeduplication += tokensSaved;
-          msg.content = `[Output identical to tool result at step ${priorIdx}; omitted for token budget]`;
-        } else {
-          seenToolOutputs.set(hash, i);
-        }
-      }
-    }
+    // Step 1: Deduplicate identical tool outputs, keeping the NEWEST copy so a re-read always returns content.
+    this.dedupeToolOutputs(compacted, 1);
 
     // Step 2: Compress older tool outputs & evict older file viewings
     // Keep the final turn (last 2 messages: assistant/user) intact; compact earlier turns
@@ -457,7 +480,7 @@ export class ContextEngine {
         const fileMatch = /^File:\s+([^\s\n]+)\s+\(lines\s+(\d+)-(\d+)\s+of\s+(\d+)\)/.exec(msg.content);
         if (fileMatch) {
           const [, filePath, startL, endL, totalL] = fileMatch;
-          msg.content = `[File inspection: ${filePath} (lines ${startL}-${endL} of ${totalL}) previously read and stored in task state; raw code lines folded for token budget. Re-read with view_file if needed]`;
+          msg.content = `[File inspection: ${filePath} (lines ${startL}-${endL} of ${totalL}) raw lines were dropped from context to save space. Call view_file again if you need the contents]`;
         } else if (msg.content.length > 500) {
           msg.content = this.compactToolOutput(msg.content, 500);
         }
@@ -477,7 +500,10 @@ export class ContextEngine {
       }
       const systemMsg = compacted[0];
       const initialUser = compacted.find(m => m.role === 'user') || { role: 'user', content: this.taskState.objective };
-      const recentWindow = compacted.slice(-4);
+      // Never start the window on a `tool` message: its assistant tool_call would be dropped (orphaned result).
+      let windowStart = Math.max(1, compacted.length - 4);
+      while (windowStart > 1 && compacted[windowStart].role === 'tool') windowStart--;
+      const recentWindow = compacted.slice(windowStart);
 
       const prunedMessages: ChatMessage[] = [
         systemMsg,

@@ -38,13 +38,25 @@ export interface ChatMessage {
 
 import { HardwareProfile } from './hardware/detector.js';
 import { LlamaRuntimeConfig } from './runtime/profiles.js';
+import type { StagnationThresholds } from './agent/stagnation.js';
+
+export type ProviderType =
+  | 'ollama'
+  | 'openai'
+  | 'lmstudio'
+  | 'vllm'
+  | 'llamacpp'
+  | 'gemini'
+  | 'anthropic'
+  | 'openrouter'
+  | 'groq';
 
 export interface AgentContext {
   cwd: string;
   autoApprove: boolean;
   model: string;
   ollamaHost: string;
-  provider?: 'ollama' | 'openai' | 'lmstudio' | 'vllm' | 'llamacpp';
+  provider?: ProviderType;
   apiBase?: string;
   apiKey?: string;
   numCtx?: number;
@@ -53,4 +65,10 @@ export interface AgentContext {
   mode?: 'worker' | 'architect';
   llamaConfig?: Partial<LlamaRuntimeConfig>;
   contextEngine?: any;
+  stagnationThresholds?: Partial<StagnationThresholds>;
+  maxOutputTokens?: number;
+  reasoningBudget?: number;
+  commandTimeoutMs?: number;
+  signal?: AbortSignal;
+  onCommandProgress?: (progress: { elapsedMs: number; lastOutput?: string }) => void;
 }

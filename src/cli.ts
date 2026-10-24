@@ -30,7 +30,8 @@ import {
   InferenceProfileName
 } from './runtime/profiles.js';
 import { RuntimeDetector } from './runtime/detector.js';
-import { getSharedLlamaRuntime } from './providers/factory.js';
+import { getSharedLlamaRuntime, isCloudProvider, resolveProvider } from './providers/factory.js';
+import { loadEnvironmentVariables, getApiKeyForProvider, promptAndSaveApiKey } from './utils/config.js';
 
 const program = new Command();
 
@@ -40,7 +41,7 @@ program
   .version('0.4.0')
   .argument('[prompt...]', 'Initial coding instruction to execute')
   .option('-m, --model <name>', 'Model to use (or alias for local TurboQuant model)')
-  .option('-p, --provider <type>', 'Provider: llamacpp | ollama | openai | lmstudio | vllm')
+  .option('-p, --provider <type>', 'Provider: gemini | anthropic | openai | openrouter | groq | llamacpp | ollama | lmstudio | vllm')
   .option('-c, --ctx <number_or_size>', 'Context window size (e.g. 32k, 64k, 128k, 262k)')
   .option('--profile <name>', 'Inference profile: ultra-context | performance | large-context | balanced', 'ultra-context')
   .option('--model-path <path>', 'Absolute path to local .gguf model file')
@@ -48,7 +49,7 @@ program
   .option('--port <number>', 'Port for local model server (default: 8081 or auto-selected)')
   .option('--no-auto-start', 'Disable automatic start of llama-server')
   .option('--api-base <url>', 'Base URL for OpenAI-compatible provider (e.g. http://localhost:1234/v1)')
-  .option('--api-key <key>', 'API key for OpenAI-compatible provider', 'not-needed')
+  .option('--api-key <key>', 'API key for cloud or OpenAI-compatible provider')
   .option('-y, --yes', 'Automatically approve all tool executions without prompting', false)
   .option('--auto', 'Run in Autonomous Mode (alias for -y, --yes)', false)
   .option('-f, --file <path>', 'Load prompt from a text/markdown file')
@@ -80,6 +81,7 @@ function parseContextOption(ctxOpt?: string): number | undefined {
 }
 
 async function main() {
+  loadEnvironmentVariables(targetCwd);
   if (options.file) {
     try {
       const filePath = path.resolve(process.cwd(), options.file);
@@ -102,12 +104,16 @@ async function main() {
   // If provider explicitly specified on CLI or env: use it.
   // Otherwise, if local TurboQuant Qwen model is available: default to 'llamacpp'.
   // Otherwise fallback to 'ollama'.
-  let chosenProvider = options.provider || process.env.LOCODE_PROVIDER;
-  if (!chosenProvider) {
-    if (isLocalModelPresent) {
-      chosenProvider = 'llamacpp';
-    } else {
-      chosenProvider = 'ollama';
+  let chosenProvider = options.provider || process.env.LOCODE_PROVIDER || resolveProvider({ model: options.model, apiKey: options.apiKey });
+  if (chosenProvider === 'ollama' && isLocalModelPresent) {
+    chosenProvider = 'llamacpp';
+  }
+
+  let activeApiKey = options.apiKey;
+  if (isCloudProvider(chosenProvider)) {
+    activeApiKey = getApiKeyForProvider(chosenProvider, options.apiKey);
+    if (!activeApiKey) {
+      activeApiKey = await promptAndSaveApiKey(chosenProvider);
     }
   }
 
@@ -122,6 +128,14 @@ async function main() {
   let numCtx: number;
   if (cliCtx) {
     numCtx = cliCtx;
+  } else if (chosenProvider === 'gemini') {
+    numCtx = 1048576;
+  } else if (chosenProvider === 'anthropic') {
+    numCtx = 200000;
+  } else if (chosenProvider === 'groq') {
+    numCtx = 131072;
+  } else if (chosenProvider === 'openai' || chosenProvider === 'openrouter') {
+    numCtx = 128000;
   } else if (chosenProvider === 'llamacpp') {
     if (profileName === 'ultra-context') {
       numCtx = 262144;
@@ -139,7 +153,17 @@ async function main() {
   // Determine active model name / alias
   let modelName = options.model;
   if (!modelName) {
-    if (chosenProvider === 'llamacpp') {
+    if (chosenProvider === 'gemini') {
+      modelName = 'gemini-3.6-flash';
+    } else if (chosenProvider === 'anthropic') {
+      modelName = 'claude-3-5-sonnet-20241022';
+    } else if (chosenProvider === 'openrouter') {
+      modelName = 'anthropic/claude-3.5-sonnet';
+    } else if (chosenProvider === 'groq') {
+      modelName = 'qwen/qwen3.8-27b';
+    } else if (chosenProvider === 'openai') {
+      modelName = 'gpt-4o';
+    } else if (chosenProvider === 'llamacpp') {
       modelName = DEFAULT_QWEN_MODEL_ALIAS;
     } else {
       modelName = 'qwen2.5-coder:7b';
@@ -166,7 +190,7 @@ async function main() {
     ollamaHost: options.host,
     provider: chosenProvider as any,
     apiBase: options.apiBase,
-    apiKey: options.apiKey,
+    apiKey: activeApiKey || options.apiKey,
     numCtx,
     hardwareProfile,
     architectModel: options.architect,
@@ -211,11 +235,18 @@ async function main() {
   // Check Provider health
   const isHealthy = await provider.isHealthy();
   if (!isHealthy) {
-    const provName = context.provider === 'llamacpp' ? 'llama-server' : (context.provider || 'ollama');
-    renderer.printError(
-      `unable to connect to ${provName} at ${context.apiBase || context.ollamaHost}.\n` +
-      `  ensure local LLM backend is running.`
-    );
+    if (isCloudProvider(context.provider)) {
+      renderer.printError(
+        `unable to authenticate or connect to ${context.provider}.\n` +
+        `  ensure your API key is configured in ~/.locode/.env and check your network connection.`
+      );
+    } else {
+      const provName = context.provider === 'llamacpp' ? 'llama-server' : (context.provider || 'ollama');
+      renderer.printError(
+        `unable to connect to ${provName} at ${context.apiBase || context.ollamaHost}.\n` +
+        `  ensure local LLM backend is running.`
+      );
+    }
   }
 
   // If one-shot prompt was passed via CLI: e.g. locode "check git status and test"
@@ -243,7 +274,7 @@ async function main() {
       if (!trimmed) continue;
 
       if (trimmed.startsWith('/')) {
-        const handled = await handleSlashCommand(trimmed, agent, provider, renderer, context.cwd);
+        const handled = await handleSlashCommand(trimmed, agent, agent.getProvider(), renderer, context.cwd);
         if (handled) continue;
       }
 

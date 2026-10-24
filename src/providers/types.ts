@@ -10,6 +10,7 @@ export interface ChatProviderResponse {
       arguments: Record<string, any>;
     };
   }>;
+  stopReason?: string;
   usage?: {
     promptTokens: number;
     completionTokens: number;
@@ -21,6 +22,11 @@ export interface ChatProviderResponse {
 
 export interface ChatOptions {
   toolChoice?: 'auto' | 'none' | 'required';
+  maxTokens?: number;
+  repeatPenalty?: number;
+  presencePenalty?: number;
+  frequencyPenalty?: number;
+  temperature?: number;
 }
 
 export interface ILLMProvider {
@@ -36,6 +42,7 @@ export interface ILLMProvider {
   ): Promise<ChatProviderResponse>;
   getNumCtx?(): number;
   setNumCtx?(numCtx: number): void;
+  getModelLimits?(): { maxOutputTokens?: number };
 }
 
 

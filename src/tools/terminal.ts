@@ -2,6 +2,28 @@ import fs from 'node:fs/promises';
 import { execa } from 'execa';
 import { ToolDefinition } from '../types.js';
 import { resolveSafePath, isDangerousCommand } from './security.js';
+import { isCloudProvider } from '../providers/factory.js';
+
+/**
+ * Safely and recursively terminates a process and all its child processes.
+ * Uses taskkill on Windows to clean the whole process tree, and process group SIGKILL on POSIX.
+ */
+export async function killProcessTree(pid: number | undefined): Promise<void> {
+  if (!pid) return;
+  try {
+    if (process.platform === 'win32') {
+      await execa('taskkill', ['/F', '/T', '/PID', String(pid)], { reject: false, timeout: 5000 });
+    } else {
+      try {
+        process.kill(-pid, 'SIGKILL');
+      } catch {
+        process.kill(pid, 'SIGKILL');
+      }
+    }
+  } catch {
+    // Process may have already exited
+  }
+}
 
 export const runCommandTool: ToolDefinition = {
   name: 'run_command',
@@ -16,6 +38,10 @@ export const runCommandTool: ToolDefinition = {
       cwd: {
         type: 'string',
         description: 'Optional subpath to run command in (defaults to project root)'
+      },
+      timeout: {
+        type: 'number',
+        description: 'Optional timeout in milliseconds (defaults to 45000ms or context.commandTimeoutMs)'
       }
     },
     required: ['command']
@@ -62,10 +88,9 @@ export const runCommandTool: ToolDefinition = {
         }
       }
 
-      // Run via shell (Git Bash on Windows if available for full POSIX compatibility, powershell/cmd fallback)
+      // Run via shell (Git Bash on Windows if available for full POSIX compatibility, cmd fallback)
       let shellExecutable: string | boolean = true;
       if (isWindows) {
-        // Automatically prefer Git Bash on Windows (has git, wc, ls, grep, cat, curl, npm built-in)
         const gitBashPath = 'C:\\Program Files\\Git\\bin\\bash.exe';
         try {
           await fs.access(gitBashPath);
@@ -75,24 +100,99 @@ export const runCommandTool: ToolDefinition = {
         }
       }
 
+      const timeoutMs = typeof args.timeout === 'number' && args.timeout > 0
+        ? args.timeout
+        : (typeof context.commandTimeoutMs === 'number' && context.commandTimeoutMs > 0 ? context.commandTimeoutMs : 45000);
+
+      // Check pre-aborted signal
+      if (context.signal?.aborted) {
+        return { result: 'Command was cancelled before execution began.', isError: true };
+      }
+
+      let timedOut = false;
+      let cancelled = false;
+      let timer: NodeJS.Timeout | undefined;
+
+      const allChunks: string[] = [];
+      let lastOutputLine = '';
+      const startTime = Date.now();
+
+      // Spawn child process with stdin: 'ignore' to prevent interactive stalls
       const child = execa(args.command, {
         cwd: effectiveCwd,
         shell: shellExecutable,
-        timeout: 90000,
+        stdin: 'ignore',
         reject: false,
         all: true,
         env: {
           ...process.env,
-          CI: 'true'
+          CI: 'true',
+          PYTHONUNBUFFERED: '1',
+          NODE_ENV: 'test',
+          FORCE_COLOR: '0'
         }
       });
 
-      const result = await child;
-      const rawOutput = (result.all || `${result.stdout}\n${result.stderr}`).trim();
-      const exitCode = result.exitCode;
+      // Stream stdout/stderr in real-time and expose progress
+      if (child.all) {
+        child.all.on('data', (chunk: Buffer | string) => {
+          const text = chunk.toString();
+          allChunks.push(text);
+          const lines = text.trim().split('\n');
+          if (lines.length > 0) {
+            lastOutputLine = lines[lines.length - 1].trim();
+          }
+          if (context.onCommandProgress) {
+            context.onCommandProgress({
+              elapsedMs: Date.now() - startTime,
+              lastOutput: lastOutputLine
+            });
+          }
+        });
+      }
+
+      // Cancellation listener
+      let abortListener: (() => void) | undefined;
+      if (context.signal) {
+        abortListener = async () => {
+          cancelled = true;
+          if (child.pid) {
+            await killProcessTree(child.pid);
+          }
+          try {
+            child.kill('SIGKILL');
+          } catch {}
+        };
+        context.signal.addEventListener('abort', abortListener, { once: true });
+      }
+
+      // Timeout watchdog
+      timer = setTimeout(async () => {
+        timedOut = true;
+        if (child.pid) {
+          await killProcessTree(child.pid);
+        }
+        try {
+          child.kill('SIGKILL');
+        } catch {}
+      }, timeoutMs);
+
+      let result: any;
+      try {
+        result = await child;
+      } finally {
+        if (timer) clearTimeout(timer);
+        if (context.signal && abortListener) {
+          context.signal.removeEventListener('abort', abortListener);
+        }
+      }
+
+      const rawOutput = (allChunks.join('') || result?.all || `${result?.stdout || ''}\n${result?.stderr || ''}`).trim();
+      const exitCode = result?.exitCode ?? (timedOut || cancelled ? 1 : 0);
 
       let trimmedOutput = rawOutput;
-      const MAX_CMD_CHARS = 4000;
+      const isCloud = isCloudProvider(context?.provider);
+      const MAX_CMD_CHARS = isCloud || (context?.numCtx && context.numCtx >= 65536) ? 35000 : 4000;
       if (trimmedOutput.length > MAX_CMD_CHARS) {
         if (context.contextEngine?.compactToolOutput) {
           trimmedOutput = context.contextEngine.compactToolOutput(trimmedOutput, MAX_CMD_CHARS);
@@ -110,6 +210,20 @@ export const runCommandTool: ToolDefinition = {
         }
       }
 
+      if (timedOut) {
+        return {
+          result: `Command timed out after ${timeoutMs / 1000} seconds:\n${trimmedOutput || '(no output produced before timeout)'}`,
+          isError: true
+        };
+      }
+
+      if (cancelled) {
+        return {
+          result: `Command was cancelled:\n${trimmedOutput || '(no output produced before cancellation)'}`,
+          isError: true
+        };
+      }
+
       if (exitCode !== 0) {
         return {
           result: `Command exited with status code ${exitCode}:\n${trimmedOutput || '(no output)'}`,
@@ -121,9 +235,6 @@ export const runCommandTool: ToolDefinition = {
         result: trimmedOutput || 'Command executed successfully with no output.'
       };
     } catch (err: any) {
-      if (err.timedOut) {
-        return { result: `Command timed out after 90 seconds.`, isError: true };
-      }
       return { result: `Failed to execute command: ${err.message}`, isError: true };
     }
   }

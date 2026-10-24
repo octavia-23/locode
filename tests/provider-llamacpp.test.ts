@@ -6,6 +6,7 @@ import { LlamaCppRuntime } from '../src/runtime/manager.js';
 import { ToolDefinition } from '../src/types.js';
 
 test('LlamaCppTurboQuantProvider - e2e simulated server handles chat, streaming, and tool calls', async () => {
+  const capturedBodies: any[] = [];
   // Spin up a lightweight local mock server simulating llama-server OpenAI API
   const server = http.createServer((req, res) => {
     if (req.url === '/v1/models') {
@@ -19,6 +20,7 @@ test('LlamaCppTurboQuantProvider - e2e simulated server handles chat, streaming,
       req.on('data', chunk => body += chunk);
       req.on('end', () => {
         const parsed = JSON.parse(body);
+        capturedBodies.push(parsed);
 
         if (parsed.stream) {
           // Stream chunks in SSE format
@@ -110,8 +112,10 @@ test('LlamaCppTurboQuantProvider - e2e simulated server handles chat, streaming,
     const streamResult = await provider.chat(
       [{ role: 'user', content: 'What is in index.ts?' }],
       [dummyTool],
-      (tok) => { streamedTokens += tok; }
+      (tok) => { streamedTokens += tok; },
+      { presencePenalty: 0.15 }
     );
+    assert.equal(capturedBodies[0].presence_penalty, 0.15, 'Streaming request must forward the configured presence penalty');
 
     assert.equal(streamedTokens, 'I am reading ');
     assert.equal(streamResult.content, 'I am reading ');
@@ -124,8 +128,11 @@ test('LlamaCppTurboQuantProvider - e2e simulated server handles chat, streaming,
     // 4. Non-Streaming Chat with Tool Call
     const nonStreamResult = await provider.chat(
       [{ role: 'user', content: 'Inspect index.ts' }],
-      [dummyTool]
+      [dummyTool],
+      undefined,
+      { presencePenalty: 0.25 }
     );
+    assert.equal(capturedBodies[1].presence_penalty, 0.25, 'Non-streaming request must forward the configured presence penalty');
 
     assert.equal(nonStreamResult.content, 'Inspecting codebase');
     assert.ok(nonStreamResult.tool_calls && nonStreamResult.tool_calls.length === 1);

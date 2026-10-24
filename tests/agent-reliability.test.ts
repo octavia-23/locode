@@ -222,9 +222,10 @@ test('Context Engine - Deduplicates identical tool outputs across turns', () => 
   ];
 
   const compacted = engine.compactMessages(messages);
-  // Second tool result should be deduplicated
-  const secondTool = compacted.find((m, idx) => idx > 3 && m.role === 'tool');
-  assert.ok(secondTool?.content.includes('identical to tool result'));
+  // The OLDER duplicate is replaced; the newest copy must stay intact so the model always has the content.
+  const toolMsgs = compacted.filter(m => m.role === 'tool');
+  assert.ok(toolMsgs[0].content.includes('appears again later'));
+  assert.equal(toolMsgs[toolMsgs.length - 1].content, toolResult);
   const stats = engine.getStats();
   assert.ok(stats.tokensAvoidedByDeduplication > 0);
 });
@@ -465,3 +466,67 @@ test('Agent Loop Reliability - Rescues leaked Qwen <tool_call> XML from content 
 });
 
 
+
+test('Agent Loop Reliability - shell commands and no-op writes cannot bypass the inspection action gate', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-action-gate-'));
+  try {
+    const context: AgentContext = {
+      cwd: tmpDir,
+      autoApprove: true,
+      model: 'mock-llm',
+      ollamaHost: 'http://127.0.0.1:11434'
+    };
+    await fs.writeFile(path.join(tmpDir, 'result.txt'), 'before', 'utf8');
+    for (let i = 0; i < 8; i++) {
+      await fs.mkdir(path.join(tmpDir, `folder-${i}`));
+      await fs.writeFile(path.join(tmpDir, `folder-${i}`, 'marker.txt'), `folder ${i}`, 'utf8');
+    }
+
+    let actionGateBlockedShell = false;
+    const responses: Array<(messages: ChatMessage[]) => ChatProviderResponse> = [];
+    for (let i = 0; i < 8; i++) {
+      const folder = `folder-${i}`;
+      responses.push(() => ({
+        content: `Inspecting ${folder}`,
+        tool_calls: [{
+          function: { name: 'list_dir', arguments: { path: folder } }
+        }]
+      }));
+    }
+    // A successful write of identical bytes must not reset the inspection streak.
+    responses.push(() => ({
+      content: 'Rewrite the same content',
+      tool_calls: [{
+        function: { name: 'write_file', arguments: { path: 'result.txt', content: 'before' } }
+      }]
+    }));
+    // This command would create a marker if the runtime action gate accidentally permits it.
+    responses.push(() => ({
+      content: 'Try shell anyway',
+      tool_calls: [{
+        function: { name: 'run_command', arguments: { command: 'echo MARKER > shell-ran.txt' } }
+      }]
+    }));
+    responses.push((messages) => {
+      actionGateBlockedShell = messages.some(m => m.role === 'tool' && m.content.includes('Inspection has repeated without a real file change'));
+      return {
+        content: 'Make the actual change',
+        tool_calls: [{
+          function: { name: 'write_file', arguments: { path: 'result.txt', content: 'after' } }
+        }]
+      };
+    });
+    responses.push(() => ({ content: 'Finished after a real file change.' }));
+
+    const mockProvider = new MockTestProvider(responses);
+    const agent = new AgentLoop(context, new TerminalRenderer(), mockProvider);
+    await agent.init();
+    await agent.run('Fix result.txt after inspecting the project');
+
+    assert.equal(actionGateBlockedShell, true, 'The shell command should be blocked after 8 inspections and a no-op write');
+    assert.equal(await fs.readFile(path.join(tmpDir, 'result.txt'), 'utf8'), 'after', 'A real file change should be allowed to reset the gate');
+    await assert.rejects(fs.access(path.join(tmpDir, 'shell-ran.txt')), 'Blocked shell command must not execute');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+});

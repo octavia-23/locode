@@ -1,13 +1,13 @@
 # Locode 🤖
 
-> **Local-First Autonomous AI Software Engineer Engineered for Consumer Hardware**  
-> Powered by **Node.js**, **TypeScript**, and local inference backends (**llama.cpp / TurboQuant**, **Ollama**, **LM Studio**, **vLLM**).  
-> *A private, local-first autonomous developer designed to deliver continuous agentic execution and up to 262k context on consumer GPUs.*
+> **Autonomous AI Software Engineer (Hybrid Cloud & Local-First)**  
+> Powered by **Node.js**, **TypeScript**, Frontier Cloud LLMs (**Google Gemini**, **Anthropic Claude**, **Groq**, **OpenAI**, **OpenRouter**) and Local Hardware Runtimes (**llama.cpp / TurboQuant**, **Ollama**, **LM Studio**, **vLLM**).  
+> *An autonomous developer delivering continuous agentic execution, PageRank codebase mapping, surgical multi-strategy edits, and compiler-verified self-repair.*
 
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-20%2B-green.svg)](https://nodejs.org/)
 [![License: Non--Commercial](https://img.shields.io/badge/License-Non--Commercial-orange.svg)](#-license)
-[![Tests: 61/61 Passing](https://img.shields.io/badge/Tests-61%2F61%20Passing-brightgreen.svg)](#-testing)
+[![Tests: 111/111 Passing](https://img.shields.io/badge/Tests-111%2F111%20Passing-brightgreen.svg)](#-testing)
 [![Context: Up to 262k](https://img.shields.io/badge/Context-Up%20to%20262k-purple.svg)](#-inference-profiles)
 
 ---

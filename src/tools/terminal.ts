@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import { execa } from 'execa';
 import { ToolDefinition } from '../types.js';
-import { resolveSafePath, isDangerousCommand } from './security.js';
+import { resolveSafePath, classifyCommandSecurity, isDangerousCommand } from './security.js';
 import { isCloudProvider } from '../providers/factory.js';
 
 /**
@@ -53,9 +53,12 @@ export const runCommandTool: ToolDefinition = {
   async execute(args, context) {
     try {
       const workingDir = args.cwd ? resolveSafePath(args.cwd, context.cwd) : context.cwd;
-      const check = isDangerousCommand(args.command);
-      if (check.dangerous && !context.autoApprove) {
-        // High risk command detected
+      const check = classifyCommandSecurity(args.command);
+      if (check.decision === 'deny') {
+        return {
+          result: `Command execution denied: Command is unconditionally prohibited: ${check.reason}`,
+          isError: true
+        };
       }
 
       const isWindows = process.platform === 'win32';

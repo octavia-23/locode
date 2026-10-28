@@ -113,19 +113,36 @@ export function resolveSafePath(filePath: string, cwd: string, allowOutside: boo
   return resolved;
 }
 
+export type CommandSecurityDecision = 'allow' | 'ask' | 'deny';
+
+export interface CommandSecurityEvaluation {
+  decision: CommandSecurityDecision;
+  dangerous: boolean;
+  reason?: string;
+}
+
 /**
- * Checks whether a command string is deemed dangerous or requires high-level confirmation.
+ * Classifies a command into an explicit security decision:
+ * - 'deny': unconditionally prohibited command (e.g. format disk, rm -rf /, shutdown). Never executed.
+ * - 'ask': high-risk command requiring explicit user confirmation.
+ * - 'allow': normal development command allowed if other checks pass.
  */
-export function isDangerousCommand(command: string): { dangerous: boolean; reason?: string } {
+export function classifyCommandSecurity(command: string): CommandSecurityEvaluation {
   const trimmed = command.trim();
 
+  // 1. Unconditional DENY list: Truly prohibited commands that must NEVER execute
+  // Cannot be bypassed by --auto, profile overrides, or approval handlers.
   for (const pattern of DEFAULT_BLOCKED_COMMANDS) {
     if (pattern.test(trimmed)) {
-      return { dangerous: true, reason: `Command matches critical security blocklist: ${pattern}` };
+      return {
+        decision: 'deny',
+        dangerous: true,
+        reason: `Command is prohibited by critical security blocklist: ${pattern}`
+      };
     }
   }
 
-  // High-risk command patterns that always require approval
+  // 2. ASK list: High-risk command patterns that require explicit user approval
   const dangerousPatterns = [
     { pattern: /\b(rm|del|rd|rmdir)\b/i, reason: 'File deletion command' },
     { pattern: /\bgit\s+(reset\s+--hard|clean\s+-fd|push\s+--force)/i, reason: 'Destructive Git operation' },
@@ -136,11 +153,19 @@ export function isDangerousCommand(command: string): { dangerous: boolean; reaso
 
   for (const item of dangerousPatterns) {
     if (item.pattern.test(trimmed)) {
-      return { dangerous: true, reason: item.reason };
+      return { decision: 'ask', dangerous: true, reason: item.reason };
     }
   }
 
-  return { dangerous: false };
+  return { decision: 'allow', dangerous: false };
+}
+
+/**
+ * Checks whether a command string is deemed dangerous or requires high-level confirmation.
+ * Preserves backwards compatibility while utilizing explicit security classification.
+ */
+export function isDangerousCommand(command: string): CommandSecurityEvaluation {
+  return classifyCommandSecurity(command);
 }
 
 /**

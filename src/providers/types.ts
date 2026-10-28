@@ -31,6 +31,7 @@ export interface ChatOptions {
   temperature?: number;
   signal?: AbortSignal;
   timeoutMs?: number;
+  thinking?: { type?: string; budget_tokens?: number } | boolean;
 }
 
 export interface ModelCapabilities {

@@ -7,8 +7,9 @@ import { theme } from '../ui/theme.js';
 import { AgentContext, ChatMessage } from '../types.js';
 import { allTools, toolRegistry, registerDynamicTool, unregisterDynamicTools } from '../tools/index.js';
 import { redactSecrets, redactSecretsFromMessages } from '../utils/secret-redactor.js';
-import { ILLMProvider } from '../providers/types.js';
+import { ILLMProvider, getModelCapabilities } from '../providers/types.js';
 import { createLLMProvider, isCloudProvider, resolveProvider } from '../providers/factory.js';
+import { estimateUsageCost } from '../runtime/pricing.js';
 import { ContextEngine } from './context.js';
 import { TerminalRenderer } from '../ui/renderer.js';
 import { buildSystemPrompt } from './prompt.js';
@@ -170,7 +171,8 @@ export class AgentLoop {
 
     this.executionProfile = resolveExecutionProfile(isCloud);
     this.permissionEngine = new PermissionEngine({
-      autoApprove: this.context.autoApprove
+      autoApprove: this.context.autoApprove,
+      allowNetwork: this.executionProfile.privacyPolicy.allowWebAccess
     });
     this.toolDispatcher = new ToolDispatcher(this.permissionEngine, {
       confirmApproval: async (toolName, args, reason) => {
@@ -218,6 +220,26 @@ export class AgentLoop {
         ...profile.costPolicy
       }
     };
+
+    // Coherent transition: update permission engine network and approval policies
+    this.permissionEngine.setPolicy({
+      allowNetwork: this.executionProfile.privacyPolicy.allowWebAccess,
+      autoApprove: this.context.autoApprove
+    });
+
+    // Synchronize system prompt with updated privacy settings
+    if (this.messages.length > 0 && this.messages[0].role === 'system') {
+      const isCloud = isCloudProvider(this.context.provider);
+      buildSystemPrompt(
+        this.context.cwd,
+        isCloud,
+        this.executionProfile.privacyPolicy.allowFullRepoContext
+      ).then(prompt => {
+        if (this.messages[0]?.role === 'system') {
+          this.messages[0].content = prompt;
+        }
+      }).catch(() => {});
+    }
   }
 
   getToolDispatcher(): ToolDispatcher {
@@ -306,7 +328,12 @@ export class AgentLoop {
       const isCloud = isCloudProvider(context.provider);
       const defaultThresholds = isCloud ? CLOUD_STAGNATION_THRESHOLDS : DEFAULT_STAGNATION_THRESHOLDS;
       this.stagnationDetector = new StagnationDetector(defaultThresholds);
+      this.recoveryController = new RecoveryController(this.stagnationDetector, isCloud ? 10 : 5);
       this.executionProfile = resolveExecutionProfile(isCloud);
+      this.permissionEngine.setPolicy({
+        allowNetwork: this.executionProfile.privacyPolicy.allowWebAccess,
+        autoApprove: this.context.autoApprove
+      });
     }
     this.context.contextEngine = this.contextEngine;
   }
@@ -323,6 +350,21 @@ export class AgentLoop {
       this.stagnationDetector = new StagnationDetector(defaultThresholds);
       this.recoveryController = new RecoveryController(this.stagnationDetector, isCloud ? 10 : 5);
       this.executionProfile = resolveExecutionProfile(isCloud);
+      this.permissionEngine.setPolicy({
+        allowNetwork: this.executionProfile.privacyPolicy.allowWebAccess,
+        autoApprove: this.context.autoApprove
+      });
+      if (this.messages.length > 0 && this.messages[0].role === 'system') {
+        buildSystemPrompt(
+          this.context.cwd,
+          isCloud,
+          this.executionProfile.privacyPolicy.allowFullRepoContext
+        ).then(prompt => {
+          if (this.messages[0]?.role === 'system') {
+            this.messages[0].content = prompt;
+          }
+        }).catch(() => {});
+      }
     }
   }
 
@@ -512,17 +554,33 @@ export class AgentLoop {
       content: processedPrompt
     });
 
-    // Adaptive execution budget:
-    // Decouple read/inspection actions from active mutations so the model never exhausts its budget
-    // while researching code. Strictly bounded by ABSOLUTE_MAX_STEPS to prevent infinite loops.
+    // Adaptive execution budget governed by active HarnessExecutionProfile:
+    // Strictly bounded by ABSOLUTE_MAX_STEPS to prevent runaway loops.
     const isCloud = isCloudProvider(this.context.provider);
-    let safetyCeiling = isCloud ? 100 : 45;
-    const ABSOLUTE_MAX_STEPS = isCloud ? 250 : 60;
+    const ABSOLUTE_MAX_STEPS = isCloud ? 250 : 120;
+    let safetyCeiling = Math.min(this.executionProfile.safetyCeiling, ABSOLUTE_MAX_STEPS);
     let stepCount = 0;
     let readStepCount = 0;
     let hasModifiedCode = false;
     let repairAttempts = 0;
     const maxRepairAttempts = 3;
+    let turnCost = 0;
+
+    // Whole-task timeout enforcement from active execution profile
+    const profileTimeoutMs = this.executionProfile.timeoutMs;
+    const taskAbortController = new AbortController();
+    let taskTimeoutTimer: NodeJS.Timeout | undefined;
+    if (profileTimeoutMs > 0) {
+      taskTimeoutTimer = setTimeout(() => {
+        taskAbortController.abort(new Error(`Task timeout: Exceeded execution profile timeout of ${profileTimeoutMs}ms`));
+      }, profileTimeoutMs);
+    }
+
+    const effectiveSignal = this.context.signal
+      ? AbortSignal.any([this.context.signal, taskAbortController.signal])
+      : taskAbortController.signal;
+
+    try {
 
     const progress: ProgressTracker = {
       recentToolSignatures: [],
@@ -552,6 +610,10 @@ export class AgentLoop {
     const taskRequestsModification = /\b(add|fix|edit|modify|update|change|create|implement|style|improve|refactor|remove|delete|write|build|setup|redesign)\b/i.test(userInput);
 
     while (stepCount < safetyCeiling) {
+      if (effectiveSignal.aborted) {
+        this.renderer.printWarning('Execution cancelled or timed out.');
+        break;
+      }
       stepCount++;
 
       // Run working synthesis ONLY when code has already been modified, approaching true context boundary
@@ -613,15 +675,21 @@ export class AgentLoop {
       //    or has reached a high exploration ceiling (8+ reads) without making edits,
       //    temporarily withdraw passive reads and shell commands so only edit_file/write_file can count as progress.
       const lastVerifPassed = hasModifiedCode && this.contextEngine.getTaskState().lastVerification?.status === 'passed';
-      const shouldForceMutationTools = !isCloud && taskRequestsModification && !lastVerifPassed && (Boolean(progress.singleFileObsession) || readStepCount >= 8);
+      const shouldForceMutationTools = this.executionProfile.forceMutationAfterReads &&
+        taskRequestsModification &&
+        !lastVerifPassed &&
+        (Boolean(progress.singleFileObsession) || readStepCount >= this.executionProfile.maxExplorationReads);
 
       let activeTools = allTools;
+      if (!this.executionProfile.privacyPolicy.allowWebAccess) {
+        activeTools = activeTools.filter(t => t.name !== 'fetch_web' && t.name !== 'search_web');
+      }
       if (lastVerifPassed) {
         // A passed verification belongs to the current file contents. Expose no tools:
         // post-verification edits or shell commands would invalidate the result.
         activeTools = [];
       } else if (shouldForceMutationTools) {
-        activeTools = allTools.filter(t => t.name === 'edit_file' || t.name === 'write_file');
+        activeTools = activeTools.filter(t => t.name === 'edit_file' || t.name === 'write_file');
       }
 
       this.renderer.startSpinner(`thinking (${this.context.model})...`);
@@ -629,11 +697,21 @@ export class AgentLoop {
       let rawResponse: any;
       let rawError: any;
       let streamedTokens = 0;
-      const chatOpts: import('../providers/types.js').ChatOptions = {};
+      const modelCaps = getModelCapabilities(this.provider);
+      const chatOpts: import('../providers/types.js').ChatOptions = {
+        signal: effectiveSignal,
+        timeoutMs: Math.min(profileTimeoutMs || 120000, 120000)
+      };
       if (this.context.maxOutputTokens) {
         chatOpts.maxTokens = this.context.maxOutputTokens;
       }
       if (lastVerifPassed) chatOpts.toolChoice = 'none';
+
+      // enableThinking: map to supported provider options only when the selected model supports them
+      if (this.executionProfile.enableThinking && modelCaps.supportsThinking) {
+        chatOpts.thinking = { type: 'enabled', budget_tokens: this.context.reasoningBudget || 2048 };
+      }
+
       if (progress.consecutiveCycleDetections > 0 || this.stagnationDetector.getRecoveryAttempts() > 0) {
         chatOpts.temperature = 0.35;
         chatOpts.repeatPenalty = 1.18;
@@ -667,13 +745,38 @@ export class AgentLoop {
       // Normalize generation outcome
       const outcome = this.normalizeResponse(rawResponse, rawError);
 
-      // Accumulate usage telemetry
+      // Accumulate usage telemetry and enforce CostPolicy
       if (outcome.usage) {
         this.stats.turns++;
         this.stats.totalTokens += outcome.usage.totalTokens;
         this.stats.promptTokens += outcome.usage.promptTokens;
         this.stats.completionTokens += outcome.usage.completionTokens;
         this.stats.totalDurationMs += outcome.usage.durationMs;
+
+        const costEst = estimateUsageCost(outcome.usage, this.context.model, this.context.provider);
+        if (costEst.isKnown && typeof costEst.cost === 'number') {
+          turnCost += costEst.cost;
+          if (this.executionProfile.costPolicy.alertOnCostThreshold && turnCost >= 0.5) {
+            this.renderer.printWarning(`[Cost Alert] Turn cost reached $${turnCost.toFixed(4)}.`);
+          }
+          if (this.executionProfile.costPolicy.requireConfirmationAboveCost && turnCost >= this.executionProfile.costPolicy.requireConfirmationAboveCost) {
+            if (this.context.interactive !== false && this.toolDispatcher) {
+              const approved = await this.toolDispatcher.requestApproval('cost_limit', { turnCost }, `Estimated turn cost $${turnCost.toFixed(4)} exceeds confirmation threshold ($${this.executionProfile.costPolicy.requireConfirmationAboveCost})`);
+              if (!approved) {
+                this.renderer.printWarning(`Turn execution halted: Cost confirmation declined by user ($${turnCost.toFixed(4)}).`);
+                break;
+              }
+            }
+          }
+          if (this.executionProfile.costPolicy.maxCostPerTurn && turnCost >= this.executionProfile.costPolicy.maxCostPerTurn) {
+            this.renderer.printError(`[Cost Exceeded] Turn cost $${turnCost.toFixed(4)} exceeded maximum allowed cost per turn ($${this.executionProfile.costPolicy.maxCostPerTurn}). Halting turn.`);
+            this.messages.push({
+              role: 'assistant',
+              content: `[EXECUTION HALTED: COST CEILING] The turn exceeded the maximum cost budget of $${this.executionProfile.costPolicy.maxCostPerTurn.toFixed(2)} ($${turnCost.toFixed(4)} spent).`
+            });
+            break;
+          }
+        }
       }
 
       // STATE MACHINE ROUTING
@@ -944,14 +1047,15 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         continue;
       }
 
-      // Progress Guard 2: Trap obsessive single-file read loops & accelerate to action gate (local quantized models only)
-      if (!isCloud) {
+      // Progress Guard 2: Trap obsessive single-file read loops & accelerate to action gate
+      if (this.executionProfile.forceMutationAfterReads) {
         for (const call of toolCalls) {
           if (call.function.name === 'view_file' && call.function.arguments?.path) {
             const p = String(call.function.arguments.path);
             const currentReads = (progress.fileReadTurns.get(p) || 0) + 1;
             progress.fileReadTurns.set(p, currentReads);
-            if (currentReads >= 2 && !hasModifiedCode) {
+            const obsessionThresh = Math.min(2, this.executionProfile.maxExplorationReads);
+            if (currentReads >= obsessionThresh && !hasModifiedCode) {
               progress.singleFileObsession = true;
               progress.obsessedFilePath = p;
               break;
@@ -960,8 +1064,62 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         }
 
         if (progress.singleFileObsession) {
-          readStepCount = Math.max(readStepCount, 2);
+          readStepCount = Math.max(readStepCount, Math.min(2, this.executionProfile.maxExplorationReads));
         }
+      }
+
+      // Safe Concurrency & Parallel Tool Execution:
+      // When allowParallelTools is true, passive read-only tool calls may execute concurrently.
+      // If allowParallelTools is false or ANY tool in the batch mutates state, strictly enforce sequential execution.
+      const canRunParallel = this.executionProfile.allowParallelTools &&
+        toolCalls.length > 1 &&
+        toolCalls.every(c => isPassiveTool(c.function.name));
+
+      if (canRunParallel) {
+        this.renderer.startSpinner(`Executing ${toolCalls.length} read operations in parallel...`);
+        const parallelResults = await Promise.all(
+          toolCalls.map(async (call) => {
+            this.stats.toolCalls++;
+            const tool = toolRegistry.get(call.function.name);
+            if (!tool) {
+              return {
+                call,
+                output: `Tool "${call.function.name}" is not registered.`,
+                isError: true
+              };
+            }
+            const durableResult = await this.toolDispatcher.dispatch(
+              tool,
+              call.function.arguments || {},
+              this.context,
+              call.id,
+              {
+                autoApprove: this.context.autoApprove,
+                allowNetwork: this.executionProfile.privacyPolicy.allowWebAccess,
+                signal: effectiveSignal
+              }
+            );
+            return {
+              call,
+              output: durableResult.output,
+              isError: durableResult.isError
+            };
+          })
+        );
+        this.renderer.stopSpinner();
+
+        for (const res of parallelResults) {
+          readStepCount++;
+          this.renderer.printToolResult(res.call.function.name, res.output, res.isError);
+          this.messages.push({
+            role: 'tool',
+            name: res.call.function.name,
+            tool_call_id: res.call.id,
+            content: res.output
+          });
+          progress.recentToolSignatures.push(`${res.call.function.name}:${JSON.stringify(res.call.function.arguments || {})}`);
+        }
+        continue;
       }
 
       // Execute each tool call sequentially
@@ -995,7 +1153,7 @@ You must now deliver your final summary and conclusion to the user to conclude t
         // can contain many calls, so a turn-level tool list cannot enforce the limit by itself.
         // Once the inspection streak is exhausted, block all non-edit tools, including shell commands.
         const verificationStillCurrent = hasModifiedCode && this.contextEngine.getTaskState().lastVerification?.status === 'passed';
-        const forceActionNow = !isCloud && taskRequestsModification && !verificationStillCurrent && (Boolean(progress.singleFileObsession) || readStepCount >= 8);
+        const forceActionNow = this.executionProfile.forceMutationAfterReads && taskRequestsModification && !verificationStillCurrent && (Boolean(progress.singleFileObsession) || readStepCount >= this.executionProfile.maxExplorationReads);
         if (forceActionNow && toolName !== 'edit_file' && toolName !== 'write_file') {
           this.stats.failedToolCalls++;
           const targetFile = toolArgs.path || (toolArgs.paths && toolArgs.paths[0]) || progress.obsessedFilePath || '';
@@ -1064,7 +1222,11 @@ You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetH
           toolArgs,
           this.context,
           call.id,
-          { autoApprove: this.context.autoApprove }
+          {
+            autoApprove: this.context.autoApprove,
+            allowNetwork: this.executionProfile.privacyPolicy.allowWebAccess,
+            signal: effectiveSignal
+          }
         );
 
         this.renderer.stopSpinner();
@@ -1203,7 +1365,7 @@ You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetH
             // Bounded dynamic leash extension:
             // Extend only for productive, non-thrashing edits, capped strictly at ABSOLUTE_MAX_STEPS
             if (fileContentChanged && (isCloud || editCount <= 4) && safetyCeiling < ABSOLUTE_MAX_STEPS) {
-              safetyCeiling = Math.min(stepCount + 15, ABSOLUTE_MAX_STEPS);
+              safetyCeiling = Math.min(stepCount + 15, ABSOLUTE_MAX_STEPS, this.executionProfile.safetyCeiling * 2);
             }
 
             // Layer 3: Automated Linter / Compiler Self-Healing Loop with failure cap
@@ -1300,5 +1462,8 @@ You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetH
       this.renderer.printAssistantMessage(stopReport);
       this.messages.push({ role: 'assistant', content: stopReport });
     }
+  } finally {
+    if (taskTimeoutTimer) clearTimeout(taskTimeoutTimer);
   }
+}
 }

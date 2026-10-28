@@ -30,6 +30,17 @@ export interface CachedFile {
   timestamp: number;
 }
 
+export type VerificationCategory = 'typecheck' | 'test' | 'build' | 'custom';
+
+export interface VerificationEntry {
+  category: VerificationCategory;
+  status: VerificationStatus;
+  passed: boolean;
+  command: string;
+  summary: string;
+  timestamp: number;
+}
+
 export interface TaskState {
   objective: string;
   currentSubtask?: string;
@@ -42,6 +53,12 @@ export interface TaskState {
     passed: boolean;
     command: string;
     summary: string;
+  };
+  verificationResults?: {
+    typecheck?: VerificationEntry;
+    test?: VerificationEntry;
+    build?: VerificationEntry;
+    custom?: VerificationEntry;
   };
   relevantFiles: string[];
 }
@@ -147,6 +164,28 @@ export class ContextEngine {
       summary
     };
 
+    // Separate type checking, tests, and builds into distinct categories
+    let category: VerificationCategory = 'custom';
+    if (/\b(tsc|typecheck|check|lint|py_compile)\b/i.test(command)) {
+      category = 'typecheck';
+    } else if (/\b(test|pytest|cargo\s+test|go\s+test|jest|vitest|mocha)\b/i.test(command)) {
+      category = 'test';
+    } else if (/\b(build|tsup|webpack|rollup|vite\s+build|cargo\s+build)\b/i.test(command)) {
+      category = 'build';
+    }
+
+    if (!this.taskState.verificationResults) {
+      this.taskState.verificationResults = {};
+    }
+    this.taskState.verificationResults[category] = {
+      category,
+      status: effStatus,
+      passed: effStatus === 'passed',
+      command,
+      summary,
+      timestamp: Date.now()
+    };
+
     if (effStatus === 'passed') {
       // Clear unresolved errors if verification passed
       this.taskState.unresolvedErrors = [];
@@ -156,6 +195,10 @@ export class ContextEngine {
         this.taskState.unresolvedErrors.push(topError);
       }
     }
+  }
+
+  getVerificationResults(): Record<string, VerificationEntry | undefined> {
+    return this.taskState.verificationResults || {};
   }
 
   private extractTopErrorLine(output: string): string {

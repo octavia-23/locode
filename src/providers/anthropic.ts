@@ -1,6 +1,6 @@
 import { ChatMessage, ToolDefinition } from '../types.js';
 import { ILLMProvider, ChatProviderResponse, ChatOptions, ModelCapabilities } from './types.js';
-import { redactSecrets } from '../utils/secret-redactor.js';
+import { redactSecrets, redactValue } from '../utils/secret-redactor.js';
 
 export class AnthropicProvider implements ILLMProvider {
   private model: string;
@@ -127,7 +127,7 @@ export class AnthropicProvider implements ILLMProvider {
               type: 'tool_use',
               id: toolId,
               name: tc.function.name,
-              input: inputArgs || {}
+              input: redactValue(inputArgs || {})
             });
           }
         }
@@ -217,6 +217,10 @@ export class AnthropicProvider implements ILLMProvider {
       (formattedTools[formattedTools.length - 1] as any).cache_control = { type: 'ephemeral' };
       payload.tools = formattedTools;
       if (toolChoice) payload.tool_choice = toolChoice;
+    }
+
+    if (options?.thinking) {
+      payload.thinking = options.thinking;
     }
 
     const headers: Record<string, string> = {

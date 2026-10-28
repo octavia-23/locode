@@ -102,8 +102,10 @@ src/other-module.ts:15:10 - error TS2304: Cannot find name 'foo'.
     });
 
     const checkTarget = await CodeVerifier.runFastLint(tmpDir, 'src/target-file.ts');
-    // Pre-existing unrelated error must NOT fail the fast-lint check on target-file.ts
-    assert.equal(checkTarget.passed, true);
+    // Milestone Requirement 4: Attribution cannot be established to target-file.ts.
+    // Must be reported as 'inconclusive' and NEVER reported as passed!
+    assert.equal(checkTarget.status, 'inconclusive');
+    assert.equal(checkTarget.passed, false);
 
     // 2. Mock runner returning error in the target file
     const targetErrorOutput = `

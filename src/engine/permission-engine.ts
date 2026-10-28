@@ -1,6 +1,6 @@
 import { ToolDefinition, AgentContext } from '../types.js';
 import { PermissionEvaluation, ToolDispatchOptions } from './types.js';
-import { resolveSafePath, isDangerousCommand, isSsrfSafeUrl } from '../tools/security.js';
+import { resolveSafePath, classifyCommandSecurity, isDangerousCommand, isSsrfSafeUrl } from '../tools/security.js';
 
 export interface PermissionPolicy {
   readOnly?: boolean;
@@ -116,23 +116,35 @@ export class PermissionEngine {
       }
     }
 
-    // 5. Dangerous command inspection
+    // 5. Command security classification (deny, ask, allow)
     if (tool.name === 'run_command') {
       const cmd = String(args.command || args.cmd || '').trim();
-      const dangerousCheck = isDangerousCommand(cmd);
-      if (dangerousCheck.dangerous) {
+      const check = classifyCommandSecurity(cmd);
+
+      // Unconditional DENY: Prohibited commands can NEVER execute under any circumstances.
+      // Must not be bypassed by --auto, profile overrides, or missing approval handlers.
+      if (check.decision === 'deny') {
+        return {
+          allowed: false,
+          requiresPrompt: false,
+          reason: `Execution Prohibited: Command is unconditionally denied by security policy: ${check.reason}`
+        };
+      }
+
+      // ASK: High-risk commands requiring explicit approval unless auto-approval is enabled
+      if (check.decision === 'ask') {
         if (!isAutoApprove) {
           if (!isApprovalAvailable) {
             return {
               allowed: false,
               requiresPrompt: false,
-              reason: `Permission Denied: Dangerous command requires approval, but approval is unavailable: ${dangerousCheck.reason}`
+              reason: `Permission Denied: Command requires explicit approval, but approval is unavailable: ${check.reason}`
             };
           }
           return {
             allowed: true,
             requiresPrompt: true,
-            reason: dangerousCheck.reason
+            reason: check.reason
           };
         }
       }

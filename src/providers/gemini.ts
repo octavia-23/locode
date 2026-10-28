@@ -1,6 +1,6 @@
 import { ChatMessage, ToolDefinition } from '../types.js';
 import { ILLMProvider, ChatProviderResponse, ChatOptions, ModelCapabilities } from './types.js';
-import { redactSecrets } from '../utils/secret-redactor.js';
+import { redactSecrets, redactValue } from '../utils/secret-redactor.js';
 
 export interface GeminiPart {
   text?: string;
@@ -235,7 +235,7 @@ export class GeminiProvider implements ILLMProvider {
             parts.push({
               functionCall: {
                 name: tc.function.name,
-                args
+                args: redactValue(args)
               },
               thoughtSignature: signature
             });

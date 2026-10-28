@@ -36,14 +36,80 @@ export function redactSecrets(text: string): string {
   return redacted;
 }
 
-export function redactSecretsFromMessages<T extends { content?: string }>(messages: T[]): T[] {
+/**
+ * Recursively redacts secrets from any value (string, object, array).
+ */
+export function redactValue(val: any): any {
+  if (typeof val === 'string') {
+    return redactSecrets(val);
+  }
+  if (Array.isArray(val)) {
+    return val.map(redactValue);
+  }
+  if (val && typeof val === 'object') {
+    const result: Record<string, any> = {};
+    for (const [k, v] of Object.entries(val)) {
+      result[k] = redactValue(v);
+    }
+    return result;
+  }
+  return val;
+}
+
+export function redactSecretsFromMessages<T extends { content?: string; tool_calls?: any[] }>(messages: T[]): T[] {
   return messages.map(m => {
-    if (!m.content || typeof m.content !== 'string') return m;
-    const cleanContent = redactSecrets(m.content);
-    if (cleanContent === m.content) return m;
+    let changed = false;
+    let cleanContent = m.content;
+    if (typeof m.content === 'string') {
+      cleanContent = redactSecrets(m.content);
+      if (cleanContent !== m.content) changed = true;
+    }
+
+    let cleanToolCalls = m.tool_calls;
+    if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      cleanToolCalls = m.tool_calls.map(tc => {
+        if (!tc?.function?.arguments) return tc;
+        let args = tc.function.arguments;
+        if (typeof args === 'string') {
+          try {
+            const parsed = JSON.parse(args);
+            const redactedObj = redactValue(parsed);
+            return {
+              ...tc,
+              function: {
+                ...tc.function,
+                arguments: JSON.stringify(redactedObj)
+              }
+            };
+          } catch {
+            return {
+              ...tc,
+              function: {
+                ...tc.function,
+                arguments: redactSecrets(args)
+              }
+            };
+          }
+        } else if (typeof args === 'object') {
+          return {
+            ...tc,
+            function: {
+              ...tc.function,
+              arguments: redactValue(args)
+            }
+          };
+        }
+        return tc;
+      });
+      changed = true;
+    }
+
+    if (!changed) return m;
+
     return {
       ...m,
-      content: cleanContent
+      content: cleanContent,
+      tool_calls: cleanToolCalls
     };
   });
 }

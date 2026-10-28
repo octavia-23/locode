@@ -28,6 +28,13 @@ export class ToolDispatcher {
     return this.permissionEngine;
   }
 
+  async requestApproval(toolName: string, args: Record<string, any>, reason?: string): Promise<boolean> {
+    if (this.promptHandler?.confirmApproval) {
+      return await this.promptHandler.confirmApproval(toolName, args, reason);
+    }
+    return false;
+  }
+
   /**
    * Dispatches a single tool call through Schema Validation, Permission Check,
    * Pre-execution snapshotting, Tool Execution, and Durable Result recording.
@@ -139,7 +146,11 @@ export class ToolDispatcher {
         throw new Error('Tool execution was cancelled before start');
       }
 
-      const execResult = await tool.execute(cleanArgs, context);
+      const effectiveContext: AgentContext = options?.signal
+        ? { ...context, signal: options.signal }
+        : context;
+
+      const execResult = await tool.execute(cleanArgs, effectiveContext);
       resultText = execResult.result || '';
       isError = Boolean(execResult.isError);
     } catch (err: any) {

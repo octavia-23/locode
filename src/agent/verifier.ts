@@ -119,11 +119,13 @@ export class CodeVerifier {
           const targetRel = targetFile.replace(/\\/g, '/').toLowerCase();
           const errorLower = vRes.errorOutput.toLowerCase();
           if (!errorLower.includes(baseName) && !errorLower.includes(targetRel)) {
-            // Unrelated pre-existing errors in other files, do not falsely accuse targetFile!
+            // Attribution cannot be established to targetFile. Never report as passed!
             return {
-              status: 'passed',
-              passed: true,
-              command: vRes.command
+              status: 'inconclusive',
+              passed: false,
+              command: vRes.command,
+              errorOutput: vRes.errorOutput,
+              reason: `Verification failed on ${vRes.command}, but attribution to edited file "${targetFile}" is inconclusive.`
             };
           }
         }
@@ -139,9 +141,11 @@ export class CodeVerifier {
         const baseName = path.basename(targetFile).toLowerCase();
         if (!vRes.errorOutput.toLowerCase().includes(baseName)) {
           return {
-            status: 'passed',
-            passed: true,
-            command: vRes.command
+            status: 'inconclusive',
+            passed: false,
+            command: vRes.command,
+            errorOutput: vRes.errorOutput,
+            reason: `Verification failed on ${vRes.command}, but attribution to edited file "${targetFile}" is inconclusive.`
           };
         }
       }

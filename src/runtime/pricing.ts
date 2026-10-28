@@ -24,9 +24,12 @@ export const TRUSTWORTHY_MODEL_PRICING: Record<string, ModelPricing> = {
   'o3-mini': { inputPerMillion: 1.10, outputPerMillion: 4.40 },
 
   // Anthropic
+  'claude-3-5-sonnet': { inputPerMillion: 3.00, outputPerMillion: 15.00 },
   'claude-3-5-sonnet-20241022': { inputPerMillion: 3.00, outputPerMillion: 15.00 },
   'claude-3-5-sonnet-latest': { inputPerMillion: 3.00, outputPerMillion: 15.00 },
+  'claude-3-5-haiku': { inputPerMillion: 0.80, outputPerMillion: 4.00 },
   'claude-3-5-haiku-20241022': { inputPerMillion: 0.80, outputPerMillion: 4.00 },
+  'claude-3-opus': { inputPerMillion: 15.00, outputPerMillion: 75.00 },
   'claude-3-opus-20240229': { inputPerMillion: 15.00, outputPerMillion: 75.00 },
 
   // Google Gemini
@@ -104,5 +107,58 @@ export function estimateUsageCost(
     cost: Number(cost.toFixed(6)),
     promptCost: Number(promptCost.toFixed(6)),
     completionCost: Number(completionCost.toFixed(6))
+  };
+}
+
+export interface PreflightCostEstimate extends CostEstimate {
+  estimatedPromptTokens: number;
+  projectedOutputTokens: number;
+  projectedTurnCost?: number;
+  isExceeded: boolean;
+  reason?: string;
+}
+
+/**
+ * Calculates a conservative pre-flight cost projection before dispatching an LLM request.
+ * Acts BEFORE cloud spend occurs using prompt token estimation and maxOutputTokens bounds.
+ */
+export function estimatePreflightCost(
+  promptTokens: number,
+  maxOutputTokens: number,
+  currentTurnCost: number,
+  modelName: string,
+  providerType?: string,
+  maxCostPerTurn?: number
+): PreflightCostEstimate {
+  const pricing = getModelPricing(modelName, providerType);
+  if (!pricing) {
+    return {
+      isKnown: false,
+      estimatedPromptTokens: promptTokens,
+      projectedOutputTokens: maxOutputTokens,
+      isExceeded: false,
+      reason: `Pricing is unknown for model "${modelName}" (${providerType || 'cloud'}). Spending cannot be predicted.`
+    };
+  }
+
+  const promptCost = (promptTokens * pricing.inputPerMillion) / 1_000_000;
+  const projectedCompletionCost = (maxOutputTokens * pricing.outputPerMillion) / 1_000_000;
+  const projectedRequestCost = promptCost + projectedCompletionCost;
+  const projectedTotalTurnCost = currentTurnCost + projectedRequestCost;
+
+  const isExceeded = typeof maxCostPerTurn === 'number' && maxCostPerTurn > 0 && projectedTotalTurnCost > maxCostPerTurn;
+
+  return {
+    isKnown: true,
+    cost: Number(projectedRequestCost.toFixed(6)),
+    projectedTurnCost: Number(projectedTotalTurnCost.toFixed(6)),
+    promptCost: Number(promptCost.toFixed(6)),
+    completionCost: Number(projectedCompletionCost.toFixed(6)),
+    estimatedPromptTokens: promptTokens,
+    projectedOutputTokens: maxOutputTokens,
+    isExceeded,
+    reason: isExceeded
+      ? `Projected cost ($${projectedTotalTurnCost.toFixed(4)}) would exceed maximum allowed spend per turn ($${maxCostPerTurn.toFixed(2)}).`
+      : undefined
   };
 }

@@ -180,6 +180,8 @@ export class StagnationDetector {
       hash.update('tracked-diff\0').update(diff);
       const untrackedPaths = untracked.split('\0').filter(Boolean).sort();
       for (const relativePath of untrackedPaths) {
+        const normRel = relativePath.replace(/\\/g, '/');
+        if (normRel === '.locode' || normRel.startsWith('.locode/') || normRel.startsWith('.git/')) continue;
         const fullPath = path.resolve(cwd, relativePath);
         const root = path.resolve(cwd) + path.sep;
         if (!fullPath.startsWith(root)) continue;
@@ -195,7 +197,7 @@ export class StagnationDetector {
     } catch {
       // Non-git fallback: recursively hash relevant filenames and file contents.
       const hash = crypto.createHash('sha256');
-      const ignoredDirs = new Set(['.git', 'node_modules', '.venv', 'venv', 'dist', 'build', 'coverage', '.next', 'target']);
+      const ignoredDirs = new Set(['.git', '.locode', 'node_modules', '.venv', 'venv', 'dist', 'build', 'coverage', '.next', 'target']);
       let bytesHashed = 0;
       let filesVisited = 0;
       const maxBytes = 32 * 1024 * 1024;

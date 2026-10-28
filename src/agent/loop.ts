@@ -9,7 +9,7 @@ import { allTools, toolRegistry, registerDynamicTool, unregisterDynamicTools } f
 import { redactSecrets, redactSecretsFromMessages } from '../utils/secret-redactor.js';
 import { ILLMProvider, getModelCapabilities } from '../providers/types.js';
 import { createLLMProvider, isCloudProvider, resolveProvider } from '../providers/factory.js';
-import { estimateUsageCost } from '../runtime/pricing.js';
+import { estimateUsageCost, estimatePreflightCost } from '../runtime/pricing.js';
 import { ContextEngine } from './context.js';
 import { TerminalRenderer } from '../ui/renderer.js';
 import { buildSystemPrompt } from './prompt.js';
@@ -32,6 +32,7 @@ import { PermissionEngine } from '../engine/permission-engine.js';
 import { RecoveryController } from '../engine/recovery-controller.js';
 import { ExecutionState, DurableToolResult } from '../engine/types.js';
 import { HarnessExecutionProfile, resolveExecutionProfile } from '../runtime/profiles.js';
+import { ExecutionJournal } from '../journal/journal.js';
 
 export interface SessionStats {
   turns: number;
@@ -151,6 +152,7 @@ export class AgentLoop {
   private toolDispatcher: ToolDispatcher;
   private recoveryController: RecoveryController;
   private permissionEngine: PermissionEngine;
+  private journal: ExecutionJournal;
 
   constructor(context: AgentContext, renderer: TerminalRenderer, customProvider?: ILLMProvider) {
     this.context = context;
@@ -164,6 +166,7 @@ export class AgentLoop {
     this.checkpointManager = new CheckpointManager(context.cwd);
     this.mcpManager = new MCPManager(context.cwd, { trusted: context.trustProjectMcp ?? false });
     this.sessionMemory = new SessionMemory(context.cwd);
+    this.journal = new ExecutionJournal({ cwd: context.cwd });
 
     const isCloud = isCloudProvider(this.context.provider);
     const defaultThresholds = isCloud ? CLOUD_STAGNATION_THRESHOLDS : DEFAULT_STAGNATION_THRESHOLDS;
@@ -174,29 +177,37 @@ export class AgentLoop {
       autoApprove: this.context.autoApprove,
       allowNetwork: this.executionProfile.privacyPolicy.allowWebAccess
     });
-    this.toolDispatcher = new ToolDispatcher(this.permissionEngine, {
-      confirmApproval: async (toolName, args, reason) => {
-        try {
-          return await confirm({
-            message: `approve ${theme.accent(toolName)}?${reason ? ` (${reason})` : ''}`,
-            default: true
-          });
-        } catch {
-          return false;
+    this.toolDispatcher = new ToolDispatcher(
+      this.permissionEngine,
+      {
+        confirmApproval: async (toolName, args, reason) => {
+          try {
+            return await confirm({
+              message: `approve ${theme.accent(toolName)}?${reason ? ` (${reason})` : ''}`,
+              default: true
+            });
+          } catch {
+            return false;
+          }
+        },
+        onProgress: (prog) => {
+          const sec = Math.floor(prog.elapsedMs / 1000);
+          if (sec >= 1) {
+            const hint = prog.lastOutput ? ` · ${prog.lastOutput.slice(0, 45)}` : '';
+            this.renderer.startSpinner(`Executing... (${sec}s${hint})`);
+          }
         }
       },
-      onProgress: (prog) => {
-        const sec = Math.floor(prog.elapsedMs / 1000);
-        if (sec >= 1) {
-          const hint = prog.lastOutput ? ` · ${prog.lastOutput.slice(0, 45)}` : '';
-          this.renderer.startSpinner(`Executing... (${sec}s${hint})`);
-        }
-      }
-    });
+      this.journal
+    );
     this.recoveryController = new RecoveryController(
       this.stagnationDetector,
       isCloud ? 10 : 5
     );
+  }
+
+  getJournal(): ExecutionJournal {
+    return this.journal;
   }
 
   getState(): ExecutionState {
@@ -256,6 +267,7 @@ export class AgentLoop {
 
   async init() {
     this.state = 'initializing';
+    await this.journal.init();
     const isCloud = isCloudProvider(this.context.provider);
     const allowFullRepo = this.executionProfile.privacyPolicy.allowFullRepoContext;
     this.messages = [{
@@ -549,6 +561,15 @@ export class AgentLoop {
 
     this.contextEngine.setObjective(userInput);
 
+    await this.journal.init();
+    await this.journal.recordEvent('task_started', {
+      objective: userInput,
+      model: this.context.model,
+      provider: this.context.provider,
+      executionProfile: this.executionProfile,
+      cwd: this.context.cwd
+    });
+
     this.messages.push({
       role: 'user',
       content: processedPrompt
@@ -565,6 +586,7 @@ export class AgentLoop {
     let repairAttempts = 0;
     const maxRepairAttempts = 3;
     let turnCost = 0;
+    let endedWithFinalAssistantText = false;
 
     // Whole-task timeout enforcement from active execution profile
     const profileTimeoutMs = this.executionProfile.timeoutMs;
@@ -719,9 +741,42 @@ export class AgentLoop {
         chatOpts.presencePenalty = 0.15;
       }
 
+      // Pre-flight spending control: evaluate conservative projected request cost BEFORE dispatching
+      const outgoingMessages = this.prepareMessagesForProvider(compacted);
+      const estPromptTokens = this.contextEngine.estimateMessagesTokens(outgoingMessages);
+      const projectedOutputTokens = chatOpts.maxTokens || modelCaps.defaultOutputTokens || 4096;
+      const preflightCost = estimatePreflightCost(
+        estPromptTokens,
+        projectedOutputTokens,
+        turnCost,
+        this.context.model,
+        this.context.provider,
+        this.executionProfile.costPolicy.maxCostPerTurn
+      );
+
+      await this.journal.recordEvent('model_request_started', {
+        turn: stepCount,
+        messageCount: outgoingMessages.length,
+        estimatedPromptTokens: estPromptTokens,
+        projectedCost: preflightCost.projectedTurnCost
+      });
+
+      if (preflightCost.isKnown && preflightCost.isExceeded) {
+        this.renderer.printError(`[Pre-Flight Spending Block]: ${preflightCost.reason}`);
+        this.messages.push({
+          role: 'assistant',
+          content: `[EXECUTION BLOCKED: PRE-FLIGHT COST LIMIT] ${preflightCost.reason}`
+        });
+        await this.journal.recordEvent('task_failed', {
+          error: `Pre-flight cost limit exceeded: ${preflightCost.reason}`,
+          consecutiveFailures: 1
+        });
+        break;
+      }
+
       try {
         rawResponse = await this.provider.chat(
-          this.prepareMessagesForProvider(compacted),
+          outgoingMessages,
           activeTools,
           (token) => {
             streamedTokens++;
@@ -744,6 +799,18 @@ export class AgentLoop {
 
       // Normalize generation outcome
       const outcome = this.normalizeResponse(rawResponse, rawError);
+
+      await this.journal.recordEvent('model_response_received', {
+        turn: stepCount,
+        stopReason: outcome.stopReason,
+        usage: outcome.usage ? {
+          promptTokens: outcome.usage.promptTokens,
+          completionTokens: outcome.usage.completionTokens,
+          totalTokens: outcome.usage.totalTokens
+        } : undefined,
+        proposedToolCallsCount: outcome.toolCalls?.length || 0,
+        hasTextContent: Boolean(outcome.cleanedText)
+      });
 
       // Accumulate usage telemetry and enforce CostPolicy
       if (outcome.usage) {
@@ -857,6 +924,14 @@ export class AgentLoop {
           this.renderer.stopSpinner();
 
           this.contextEngine.recordVerificationResult(vResult.passed, vResult.command || 'verify', vResult.errorOutput, vResult.status);
+
+          await this.journal.recordEvent('verification_completed', {
+            command: vResult.command || 'verify',
+            category: 'build',
+            status: vResult.status,
+            passed: vResult.passed,
+            summary: vResult.errorOutput ? vResult.errorOutput.slice(0, 500) : 'Verification passed with 0 errors.'
+          });
 
           // Track verification signal in StagnationDetector
           const currentWs = await StagnationDetector.computeWorkspaceFingerprint(this.context.cwd);
@@ -989,11 +1064,32 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
           recentFiles: this.contextEngine.getTaskState().relevantFiles,
           summary: outcome.rawContent
         });
+
+        await this.journal.recordEvent('task_completed', {
+          finalStatus: 'success',
+          totalTurns: stepCount,
+          totalToolCalls: this.stats.toolCalls,
+          summary: outcome.rawContent
+        });
+        await this.journal.createSnapshot({
+          pendingObjectives: this.contextEngine.getTaskState().pendingObjectives,
+          completedObjectives: this.contextEngine.getTaskState().completedObjectives,
+          decisions: this.contextEngine.getTaskState().decisions
+        });
         break;
       }
 
       // Outcome D: Tool Calls
       const toolCalls = outcome.toolCalls;
+
+      // Persist model's tool-call proposals BEFORE performing side effects (Phase 2 requirement)
+      for (const call of toolCalls) {
+        await this.journal.recordEvent('tool_call_proposed', {
+          toolCallId: call.id || `call_${Date.now()}`,
+          toolName: call.function.name,
+          arguments: call.function.arguments || {}
+        }, call.id);
+      }
 
       // Add assistant's action to message history
       this.messages.push({
@@ -1426,6 +1522,13 @@ You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetH
             const isVerifCmd = /^(python\s+-m\s+py_compile|pytest|npm\s+test|npx\s+tsc|tsc|cargo\s+test|go\s+test)/i.test(cmd);
             if (isVerifCmd) {
               this.contextEngine.recordVerificationResult(!isErr, cmd, isErr ? toolOutput : undefined, isErr ? 'failed' : 'passed');
+              await this.journal.recordEvent('verification_completed', {
+                command: cmd,
+                category: 'test',
+                status: isErr ? 'failed' : 'passed',
+                passed: !isErr,
+                summary: isErr ? (toolOutput ? toolOutput.slice(0, 500) : 'Command failed') : `Command \`${cmd}\` passed with 0 errors.`
+              }).catch(() => {});
               if (!isErr && !toolOutput.trim()) {
                 // Ensure empty clean output explicitly confirms success so local models do not guess or re-verify
                 toolOutput = `[Command \`${cmd}\` exited cleanly with status code 0 and 0 errors. Verification passed. Please formulate your final response to complete the task.]`;
@@ -1455,7 +1558,7 @@ You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetH
     }
 
     const lastMessage = this.messages[this.messages.length - 1];
-    const endedWithFinalAssistantText = lastMessage?.role === 'assistant' && !lastMessage.tool_calls;
+    endedWithFinalAssistantText = Boolean(lastMessage?.role === 'assistant' && !lastMessage.tool_calls);
     if (stepCount >= safetyCeiling && !endedWithFinalAssistantText) {
       const stopReport = `[EXECUTION STOPPED: STEP CEILING] Locode reached its ${safetyCeiling}-step safety ceiling without producing a normal completion. Further tool execution was halted to prevent a runaway loop. Review the latest tool results and unresolved task state before retrying.`;
       this.renderer.printWarning(`Safety ceiling reached (${safetyCeiling} steps) to prevent runaway execution.`);
@@ -1464,6 +1567,16 @@ You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetH
     }
   } finally {
     if (taskTimeoutTimer) clearTimeout(taskTimeoutTimer);
+    if (this.journal.getSnapshot().taskState === 'running') {
+      const isInterrupted = effectiveSignal?.aborted || (stepCount >= safetyCeiling && !endedWithFinalAssistantText);
+      if (isInterrupted) {
+        await this.journal.recordEvent('task_interrupted', {
+          reason: effectiveSignal?.aborted ? 'Aborted by signal' : 'Safety ceiling reached',
+          lastSequence: this.journal.getSnapshot().lastSeq,
+          interruptedToolCalls: []
+        }).catch(() => {});
+      }
+    }
   }
 }
 }

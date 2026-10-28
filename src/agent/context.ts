@@ -4,6 +4,8 @@ import crypto from 'node:crypto';
 import { ChatMessage } from '../types.js';
 import type { VerificationStatus } from './verifier.js';
 
+export type { VerificationStatus };
+
 export interface CompactionConfig {
   maxTokens: number;
   preserveHeadChars?: number;

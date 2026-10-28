@@ -5,6 +5,7 @@ import { ToolDefinition, AgentContext } from '../types.js';
 import { DurableToolResult, ToolDispatchOptions, FileChangeRecord } from './types.js';
 import { ToolSchemaValidator } from './schema-validator.js';
 import { PermissionEngine } from './permission-engine.js';
+import { ExecutionJournal } from '../journal/journal.js';
 
 export interface PromptHandler {
   confirmApproval: (toolName: string, args: Record<string, any>, reason?: string) => Promise<boolean>;
@@ -14,14 +15,28 @@ export interface PromptHandler {
 export class ToolDispatcher {
   private permissionEngine: PermissionEngine;
   private promptHandler?: PromptHandler;
+  private journal?: ExecutionJournal;
 
-  constructor(permissionEngine?: PermissionEngine, promptHandler?: PromptHandler) {
+  constructor(
+    permissionEngine?: PermissionEngine,
+    promptHandler?: PromptHandler,
+    journal?: ExecutionJournal
+  ) {
     this.permissionEngine = permissionEngine || new PermissionEngine();
     this.promptHandler = promptHandler;
+    this.journal = journal;
   }
 
   setPromptHandler(handler: PromptHandler) {
     this.promptHandler = handler;
+  }
+
+  setJournal(journal: ExecutionJournal) {
+    this.journal = journal;
+  }
+
+  getJournal(): ExecutionJournal | undefined {
+    return this.journal;
   }
 
   getPermissionEngine(): PermissionEngine {
@@ -53,6 +68,16 @@ export class ToolDispatcher {
     // STEP 1: Schema Validation
     const validation = ToolSchemaValidator.validate(tool, rawArgs);
     if (!validation.valid) {
+      if (this.journal) {
+        await this.journal.recordEvent('tool_execution_completed', {
+          toolCallId: callId,
+          toolName,
+          status: 'validation_failed',
+          isError: true,
+          durationMs: Date.now() - startTime,
+          outputSummary: `Invalid arguments: ${validation.errors.join(', ')}`
+        }, callId).catch(() => {});
+      }
       return {
         callId,
         toolName,
@@ -69,6 +94,25 @@ export class ToolDispatcher {
     // STEP 2: Permission & Security Check
     const permEval = this.permissionEngine.evaluate(tool, cleanArgs, context, options);
     if (!permEval.allowed) {
+      if (this.journal) {
+        await this.journal.recordEvent('permission_decided', {
+          toolCallId: callId,
+          toolName,
+          decision: 'deny',
+          allowed: false,
+          requiresPrompt: permEval.requiresPrompt,
+          autoApproved: Boolean(options?.autoApprove || context.autoApprove),
+          reason: permEval.reason
+        }, callId).catch(() => {});
+        await this.journal.recordEvent('tool_execution_completed', {
+          toolCallId: callId,
+          toolName,
+          status: 'permission_denied',
+          isError: true,
+          durationMs: Date.now() - startTime,
+          outputSummary: permEval.reason || 'Permission denied'
+        }, callId).catch(() => {});
+      }
       return {
         callId,
         toolName,
@@ -83,6 +127,25 @@ export class ToolDispatcher {
     // STEP 3: User Confirmation if required (Fails closed if approval handler is missing)
     if (permEval.requiresPrompt && !options?.autoApprove && !context.autoApprove) {
       if (!this.promptHandler?.confirmApproval) {
+        if (this.journal) {
+          await this.journal.recordEvent('permission_decided', {
+            toolCallId: callId,
+            toolName,
+            decision: 'ask',
+            allowed: false,
+            requiresPrompt: true,
+            autoApproved: false,
+            reason: 'Approval handler unavailable'
+          }, callId).catch(() => {});
+          await this.journal.recordEvent('tool_execution_completed', {
+            toolCallId: callId,
+            toolName,
+            status: 'permission_denied',
+            isError: true,
+            durationMs: Date.now() - startTime,
+            outputSummary: 'Approval unavailable'
+          }, callId).catch(() => {});
+        }
         return {
           callId,
           toolName,
@@ -95,7 +158,28 @@ export class ToolDispatcher {
       }
 
       const approved = await this.promptHandler.confirmApproval(toolName, cleanArgs, permEval.reason);
+      if (this.journal) {
+        await this.journal.recordEvent('permission_decided', {
+          toolCallId: callId,
+          toolName,
+          decision: 'ask',
+          allowed: approved,
+          requiresPrompt: true,
+          autoApproved: false,
+          reason: approved ? 'User approved' : 'User rejected'
+        }, callId).catch(() => {});
+      }
       if (!approved) {
+        if (this.journal) {
+          await this.journal.recordEvent('tool_execution_completed', {
+            toolCallId: callId,
+            toolName,
+            status: 'permission_denied',
+            isError: true,
+            durationMs: Date.now() - startTime,
+            outputSummary: 'Rejected by user'
+          }, callId).catch(() => {});
+        }
         return {
           callId,
           toolName,
@@ -105,6 +189,18 @@ export class ToolDispatcher {
           isError: true,
           durationMs: Date.now() - startTime
         };
+      }
+    } else {
+      if (this.journal) {
+        await this.journal.recordEvent('permission_decided', {
+          toolCallId: callId,
+          toolName,
+          decision: 'allow',
+          allowed: true,
+          requiresPrompt: false,
+          autoApproved: Boolean(options?.autoApprove || context.autoApprove),
+          reason: 'Auto-approved or allowed by policy'
+        }, callId).catch(() => {});
       }
     }
 
@@ -132,6 +228,14 @@ export class ToolDispatcher {
     }
 
     // STEP 5: Tool Execution
+    if (this.journal) {
+      await this.journal.recordEvent('tool_execution_started', {
+        toolCallId: callId,
+        toolName,
+        startTime
+      }, callId).catch(() => {});
+    }
+
     let resultText = '';
     let isError = false;
 
@@ -175,6 +279,27 @@ export class ToolDispatcher {
     }
 
     const durationMs = Date.now() - startTime;
+
+    if (this.journal) {
+      if (fileChangeRecord && fileChangeRecord.changed) {
+        await this.journal.recordEvent('file_change_recorded', {
+          toolCallId: callId,
+          path: fileChangeRecord.path,
+          beforeHash: fileChangeRecord.hashBefore,
+          afterHash: fileChangeRecord.hashAfter,
+          changed: true
+        }, callId).catch(() => {});
+      }
+
+      await this.journal.recordEvent('tool_execution_completed', {
+        toolCallId: callId,
+        toolName,
+        status: isError ? 'execution_error' : 'success',
+        isError,
+        durationMs,
+        outputSummary: resultText.slice(0, 500)
+      }, callId).catch(() => {});
+    }
 
     return {
       callId,

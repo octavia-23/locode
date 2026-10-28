@@ -4,6 +4,7 @@ import { ToolDefinition } from '../types.js';
 import { resolveSafePath } from './security.js';
 import { MultiStrategyEditEngine } from './edit-engine.js';
 import { isCloudProvider } from '../providers/factory.js';
+import { isSensitiveFile, redactSensitiveFileContent } from '../utils/secret-redactor.js';
 
 export const viewFileTool: ToolDefinition = {
   name: 'view_file',
@@ -34,7 +35,10 @@ export const viewFileTool: ToolDefinition = {
   async execute(args, context) {
     try {
       const fullPath = resolveSafePath(args.path, context.cwd);
-      const content = await fs.readFile(fullPath, 'utf8');
+      let content = await fs.readFile(fullPath, 'utf8');
+      if (isSensitiveFile(args.path)) {
+        content = redactSensitiveFileContent(args.path, content);
+      }
       const lines = content.split('\n');
 
       // Outline Mode for large files
@@ -133,7 +137,10 @@ export const batchReadFilesTool: ToolDefinition = {
       for (const p of paths.slice(0, 10)) { // limit to 10 files per batch
         try {
           const fullPath = resolveSafePath(p, context.cwd);
-          const content = await fs.readFile(fullPath, 'utf8');
+          let content = await fs.readFile(fullPath, 'utf8');
+          if (isSensitiveFile(p)) {
+            content = redactSensitiveFileContent(p, content);
+          }
           const lines = content.split('\n');
           const displayLines = lines.slice(0, maxLines);
           const formatted = displayLines

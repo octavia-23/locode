@@ -1,5 +1,5 @@
 import { ChatMessage, ToolDefinition } from '../types.js';
-import { ILLMProvider, ChatProviderResponse, ChatOptions } from './types.js';
+import { ILLMProvider, ChatProviderResponse, ChatOptions, ModelCapabilities } from './types.js';
 
 export class AnthropicProvider implements ILLMProvider {
   private model: string;
@@ -37,6 +37,19 @@ export class AnthropicProvider implements ILLMProvider {
 
   getModelLimits(): { maxOutputTokens?: number } {
     return { maxOutputTokens: 8192 };
+  }
+
+  getCapabilities(): ModelCapabilities {
+    return {
+      supportsToolCalling: true,
+      supportsStreaming: true,
+      supportsStructuredOutput: true,
+      supportsThinking: this.model.includes('sonnet') || this.model.includes('opus') || this.model.includes('3-7'),
+      supportsUsageReporting: true,
+      maxContextTokens: this.numCtx,
+      maxOutputTokens: 8192,
+      defaultOutputTokens: 8192
+    };
   }
 
   async isHealthy(): Promise<boolean> {
@@ -212,13 +225,19 @@ export class AnthropicProvider implements ILLMProvider {
       'anthropic-beta': 'prompt-caching-2024-07-31'
     };
 
+    const requestTimeout = options?.timeoutMs || 120000;
+    const fetchSignal = options?.signal
+      ? AbortSignal.any([options.signal, AbortSignal.timeout(requestTimeout)])
+      : AbortSignal.timeout(requestTimeout);
+
     // 3. Streaming execution
     if (onToken) {
       payload.stream = true;
       const response = await fetch(`${this.apiBase}/v1/messages`, {
         method: 'POST',
         headers,
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: fetchSignal
       });
 
       if (!response.ok) {
@@ -336,7 +355,8 @@ export class AnthropicProvider implements ILLMProvider {
     const response = await fetch(`${this.apiBase}/v1/messages`, {
       method: 'POST',
       headers,
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: fetchSignal
     });
 
     if (!response.ok) {

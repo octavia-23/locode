@@ -1,5 +1,5 @@
 import { ChatMessage, ToolDefinition } from '../types.js';
-import { ILLMProvider, ChatProviderResponse, ChatOptions } from './types.js';
+import { ILLMProvider, ChatProviderResponse, ChatOptions, ModelCapabilities } from './types.js';
 
 export interface GeminiPart {
   text?: string;
@@ -74,6 +74,19 @@ export class GeminiProvider implements ILLMProvider {
     return { maxOutputTokens: 8192 };
   }
 
+  getCapabilities(): ModelCapabilities {
+    return {
+      supportsToolCalling: true,
+      supportsStreaming: true,
+      supportsStructuredOutput: true,
+      supportsThinking: this.model.includes('3.8') || this.model.includes('thinking'),
+      supportsUsageReporting: true,
+      maxContextTokens: this.numCtx,
+      maxOutputTokens: 8192,
+      defaultOutputTokens: 8192
+    };
+  }
+
   async isHealthy(): Promise<boolean> {
     if (!this.apiKey) return false;
     try {
@@ -103,7 +116,9 @@ export class GeminiProvider implements ILLMProvider {
 
   private async executeGeminiRequest(
     requestBody: any,
-    stream: boolean
+    stream: boolean,
+    callerSignal?: AbortSignal,
+    timeoutMs?: number
   ): Promise<{ response: Response; activeModel: string }> {
     const modelsToTry = [
       this.model,
@@ -112,6 +127,9 @@ export class GeminiProvider implements ILLMProvider {
     const uniqueModels = [...new Set(modelsToTry)];
 
     let lastError: Error | null = null;
+    const effectiveTimeoutMs = timeoutMs || (stream ? 300000 : 120000);
+    const timeoutSignal = AbortSignal.timeout(effectiveTimeoutMs);
+    const combinedSignal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
 
     for (let i = 0; i < uniqueModels.length; i++) {
       const candidateModel = uniqueModels[i];
@@ -124,7 +142,7 @@ export class GeminiProvider implements ILLMProvider {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(requestBody),
-          signal: AbortSignal.timeout(18000)
+          signal: combinedSignal
         });
 
         if (response.status === 503) {
@@ -147,6 +165,9 @@ export class GeminiProvider implements ILLMProvider {
         return { response, activeModel: candidateModel };
       } catch (err: any) {
         lastError = err;
+        if (callerSignal?.aborted || err.name === 'AbortError') {
+          throw err;
+        }
         if (i + 1 < uniqueModels.length) {
           console.log(`\n  ! [${candidateModel}] connection issue (${err.message}). Trying fallback ${uniqueModels[i + 1]}...`);
           this.model = uniqueModels[i + 1];
@@ -299,7 +320,7 @@ export class GeminiProvider implements ILLMProvider {
 
     // 3. Execute with resilience & automatic 503 fallback
     if (onToken) {
-      const { response } = await this.executeGeminiRequest(requestBody, true);
+      const { response } = await this.executeGeminiRequest(requestBody, true, options?.signal, options?.timeoutMs);
 
       if (response.body) {
         const reader = response.body.getReader();
@@ -381,7 +402,7 @@ export class GeminiProvider implements ILLMProvider {
     }
 
     // 4. Non-streaming call with automatic fallback
-    const { response } = await this.executeGeminiRequest(requestBody, false);
+    const { response } = await this.executeGeminiRequest(requestBody, false, options?.signal, options?.timeoutMs);
     const data: any = await response.json();
     const durationMs = Date.now() - startTime;
 

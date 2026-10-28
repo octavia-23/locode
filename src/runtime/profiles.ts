@@ -103,3 +103,133 @@ export const INFERENCE_PROFILES: Record<InferenceProfileName, Partial<LlamaRunti
     profileName: 'custom'
   }
 };
+
+/**
+ * Phase 4: Unified Local and Cloud Execution Profiles
+ */
+export type ProfileMode = 'local' | 'cloud' | 'hybrid';
+
+export interface PrivacyPolicy {
+  /**
+   * If false, never implicitly transfers the full repository map/context to an external cloud model.
+   * Only explicit file mentions (@file) and directly inspected snippets are sent.
+   */
+  allowFullRepoContext: boolean;
+  allowWebAccess: boolean;
+  redactSecrets: boolean;
+}
+
+export interface CostPolicy {
+  maxCostPerTurn?: number;
+  alertOnCostThreshold?: boolean;
+  requireConfirmationAboveCost?: number;
+}
+
+export interface HarnessExecutionProfile {
+  name: string;
+  mode: ProfileMode;
+  safetyCeiling: number;
+  maxExplorationReads: number;
+  forceMutationAfterReads: boolean;
+  allowParallelTools: boolean;
+  enableThinking: boolean;
+  privacyPolicy: PrivacyPolicy;
+  costPolicy: CostPolicy;
+  timeoutMs: number;
+}
+
+export const LOCAL_CONSERVATIVE_PROFILE: HarnessExecutionProfile = {
+  name: 'local-conservative',
+  mode: 'local',
+  safetyCeiling: 45,
+  maxExplorationReads: 2,
+  forceMutationAfterReads: true,
+  allowParallelTools: false,
+  enableThinking: false,
+  privacyPolicy: {
+    allowFullRepoContext: true, // Safe on local device
+    allowWebAccess: true,
+    redactSecrets: false
+  },
+  costPolicy: {},
+  timeoutMs: 180000
+};
+
+export const LOCAL_TURBO_PROFILE: HarnessExecutionProfile = {
+  name: 'local-turbo',
+  mode: 'local',
+  safetyCeiling: 60,
+  maxExplorationReads: 8,
+  forceMutationAfterReads: true,
+  allowParallelTools: false,
+  enableThinking: false,
+  privacyPolicy: {
+    allowFullRepoContext: true,
+    allowWebAccess: true,
+    redactSecrets: false
+  },
+  costPolicy: {},
+  timeoutMs: 240000
+};
+
+export const CLOUD_FRONTIER_PROFILE: HarnessExecutionProfile = {
+  name: 'cloud-frontier',
+  mode: 'cloud',
+  safetyCeiling: 100,
+  maxExplorationReads: 25,
+  forceMutationAfterReads: false,
+  allowParallelTools: true,
+  enableThinking: true,
+  privacyPolicy: {
+    allowFullRepoContext: false, // Explicit Privacy Guard: Never implicitly upload full repo map to cloud
+    allowWebAccess: true,
+    redactSecrets: true
+  },
+  costPolicy: {
+    maxCostPerTurn: 2.0,
+    alertOnCostThreshold: true
+  },
+  timeoutMs: 300000
+};
+
+export const HYBRID_PROFILE: HarnessExecutionProfile = {
+  name: 'hybrid',
+  mode: 'hybrid',
+  safetyCeiling: 75,
+  maxExplorationReads: 6,
+  forceMutationAfterReads: true,
+  allowParallelTools: false,
+  enableThinking: false,
+  privacyPolicy: {
+    allowFullRepoContext: false,
+    allowWebAccess: true,
+    redactSecrets: true
+  },
+  costPolicy: {
+    maxCostPerTurn: 1.0,
+    alertOnCostThreshold: true
+  },
+  timeoutMs: 240000
+};
+
+export function resolveExecutionProfile(
+  isCloud: boolean,
+  customProfile?: Partial<HarnessExecutionProfile>,
+  privacyOverride?: Partial<PrivacyPolicy>
+): HarnessExecutionProfile {
+  const base = isCloud ? CLOUD_FRONTIER_PROFILE : LOCAL_CONSERVATIVE_PROFILE;
+
+  return {
+    ...base,
+    ...customProfile,
+    privacyPolicy: {
+      ...base.privacyPolicy,
+      ...customProfile?.privacyPolicy,
+      ...privacyOverride
+    },
+    costPolicy: {
+      ...base.costPolicy,
+      ...customProfile?.costPolicy
+    }
+  };
+}

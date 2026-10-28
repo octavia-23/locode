@@ -1,5 +1,5 @@
 import { ChatMessage, ToolDefinition } from '../types.js';
-import { ILLMProvider, ChatProviderResponse, ChatOptions } from './types.js';
+import { ILLMProvider, ChatProviderResponse, ChatOptions, ModelCapabilities } from './types.js';
 
 export class OpenAICompatibleProvider implements ILLMProvider {
   private model: string;
@@ -40,6 +40,20 @@ export class OpenAICompatibleProvider implements ILLMProvider {
 
   getModelLimits(): { maxOutputTokens?: number } {
     return { maxOutputTokens: 8192 };
+  }
+
+  getCapabilities(): ModelCapabilities {
+    const isLocal = this.isLocal();
+    return {
+      supportsToolCalling: true,
+      supportsStreaming: true,
+      supportsStructuredOutput: !isLocal,
+      supportsThinking: this.model.includes('r1') || this.model.includes('o1') || this.model.includes('o3') || this.model.includes('thinking'),
+      supportsUsageReporting: true,
+      maxContextTokens: this.numCtx,
+      maxOutputTokens: isLocal ? 4096 : 8192,
+      defaultOutputTokens: isLocal ? 4096 : 8192
+    };
   }
 
   private isLocal(): boolean {
@@ -129,6 +143,11 @@ export class OpenAICompatibleProvider implements ILLMProvider {
       max_tokens: options?.maxTokens || (this.isLocal() ? 4096 : 8192)
     };
 
+    const requestTimeout = options?.timeoutMs || 120000;
+    const fetchSignal = options?.signal
+      ? AbortSignal.any([options.signal, AbortSignal.timeout(requestTimeout)])
+      : AbortSignal.timeout(requestTimeout);
+
     // 1. Streaming execution
     if (onToken) {
       payload.stream = true;
@@ -137,7 +156,8 @@ export class OpenAICompatibleProvider implements ILLMProvider {
       const response = await fetch(`${this.apiBase}/chat/completions`, {
         method: 'POST',
         headers,
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: fetchSignal
       });
 
       if (!response.ok) {
@@ -253,7 +273,8 @@ export class OpenAICompatibleProvider implements ILLMProvider {
     const response = await fetch(`${this.apiBase}/chat/completions`, {
       method: 'POST',
       headers,
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: fetchSignal
     });
 
     if (!response.ok) {

@@ -2,11 +2,15 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execa } from 'execa';
 
+export type VerificationStatus = 'passed' | 'failed' | 'not-run' | 'inconclusive';
+
 export interface VerificationResult {
+  status: VerificationStatus;
   passed: boolean;
   command?: string;
   output?: string;
   errorOutput?: string;
+  reason?: string;
 }
 
 export class CodeVerifier {
@@ -83,6 +87,7 @@ export class CodeVerifier {
         if (res.exitCode !== 0) {
           const combined = `${res.stdout}\n${res.stderr}`.trim();
           return {
+            status: 'failed',
             passed: false,
             command: `python -m py_compile ${targetFile}`,
             errorOutput: this.sanitizeErrorOutput(combined)
@@ -115,7 +120,11 @@ export class CodeVerifier {
           const errorLower = vRes.errorOutput.toLowerCase();
           if (!errorLower.includes(baseName) && !errorLower.includes(targetRel)) {
             // Unrelated pre-existing errors in other files, do not falsely accuse targetFile!
-            return { passed: true, command: vRes.command };
+            return {
+              status: 'passed',
+              passed: true,
+              command: vRes.command
+            };
           }
         }
         return vRes;
@@ -129,23 +138,35 @@ export class CodeVerifier {
       if (!vRes.passed && targetFile && vRes.errorOutput) {
         const baseName = path.basename(targetFile).toLowerCase();
         if (!vRes.errorOutput.toLowerCase().includes(baseName)) {
-          return { passed: true, command: vRes.command };
+          return {
+            status: 'passed',
+            passed: true,
+            command: vRes.command
+          };
         }
       }
       return vRes;
     } catch {}
 
-    return { passed: true };
+    return {
+      status: 'not-run',
+      passed: true,
+      reason: 'No fast linter configured for this workspace'
+    };
   }
 
   /**
-   * Executes the verification command and returns whether the code passed or failed.
+   * Executes the verification command and returns whether the code passed, failed, was not run, or was inconclusive.
    */
   static async run(cwd: string, customCommand?: string): Promise<VerificationResult> {
     const command = customCommand || (await this.detectCommand(cwd));
 
     if (!command) {
-      return { passed: true }; // No verifier configured for this project
+      return {
+        status: 'not-run',
+        passed: false,
+        reason: 'No verification or test command configured for this project.'
+      };
     }
 
     try {
@@ -158,6 +179,7 @@ export class CodeVerifier {
 
       if (res.exitCode === 0) {
         return {
+          status: 'passed',
           passed: true,
           command,
           output: res.stdout.trim()
@@ -169,15 +191,19 @@ export class CodeVerifier {
       const sanitized = this.sanitizeErrorOutput(combined);
 
       return {
+        status: 'failed',
         passed: false,
         command,
         errorOutput: sanitized
       };
     } catch (err: any) {
+      const isTimeout = /timed? out|timeout/i.test(err.message || '');
       return {
+        status: isTimeout ? 'inconclusive' : 'failed',
         passed: false,
         command,
-        errorOutput: err.message || 'Verification process timed out or failed to execute.'
+        errorOutput: err.message || 'Verification process timed out or failed to execute.',
+        reason: isTimeout ? 'Verification execution timed out' : undefined
       };
     }
   }

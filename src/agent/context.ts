@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { ChatMessage } from '../types.js';
+import type { VerificationStatus } from './verifier.js';
 
 export interface CompactionConfig {
   maxTokens: number;
@@ -37,6 +38,7 @@ export interface TaskState {
   decisions: string[];
   unresolvedErrors: string[];
   lastVerification?: {
+    status?: VerificationStatus;
     passed: boolean;
     command: string;
     summary: string;
@@ -123,21 +125,32 @@ export class ContextEngine {
     }
   }
 
-  recordVerificationResult(passed: boolean, command: string, output?: string) {
-    const summary = passed
+  recordVerificationResult(
+    passed: boolean,
+    command: string,
+    output?: string,
+    status?: VerificationStatus
+  ) {
+    const effStatus: VerificationStatus = status || (passed ? 'passed' : 'failed');
+    const summary = effStatus === 'passed'
       ? `PASSED: \`${command}\` (0 errors)`
+      : effStatus === 'not-run'
+      ? `NOT RUN: No test command configured`
+      : effStatus === 'inconclusive'
+      ? `INCONCLUSIVE: \`${command}\` (execution timed out or indeterminate)`
       : `FAILED: \`${command}\` - ${this.extractTopErrorLine(output || '')}`;
     
     this.taskState.lastVerification = {
-      passed,
+      status: effStatus,
+      passed: effStatus === 'passed',
       command,
       summary
     };
 
-    if (passed) {
+    if (effStatus === 'passed') {
       // Clear unresolved errors if verification passed
       this.taskState.unresolvedErrors = [];
-    } else if (output) {
+    } else if (output && effStatus === 'failed') {
       const topError = this.extractTopErrorLine(output);
       if (topError && !this.taskState.unresolvedErrors.includes(topError)) {
         this.taskState.unresolvedErrors.push(topError);

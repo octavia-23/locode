@@ -1,6 +1,6 @@
 import { Agent, setGlobalDispatcher } from 'undici';
 import { ChatMessage, ToolDefinition } from '../types.js';
-import { ILLMProvider, ChatProviderResponse } from './types.js';
+import { ILLMProvider, ChatProviderResponse, ModelCapabilities, ChatOptions } from './types.js';
 import { LlamaCppRuntime } from '../runtime/manager.js';
 import { LlamaRuntimeConfig } from '../runtime/profiles.js';
 import { extractToolCalls } from '../utils/tool-parser.js';
@@ -50,6 +50,19 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
   setNumCtx(numCtx: number): void {
     this.numCtx = numCtx;
     this.runtime.setConfig({ contextSize: numCtx });
+  }
+
+  getCapabilities(): ModelCapabilities {
+    return {
+      supportsToolCalling: true,
+      supportsStreaming: true,
+      supportsStructuredOutput: false,
+      supportsThinking: false,
+      supportsUsageReporting: true,
+      maxContextTokens: this.numCtx,
+      maxOutputTokens: 4096,
+      defaultOutputTokens: 4096
+    };
   }
 
   async isHealthy(): Promise<boolean> {
@@ -102,6 +115,10 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
 
     const startTime = Date.now();
     const endpoint = `${this.runtime.getApiBase()}/chat/completions`;
+    const requestTimeout = options?.timeoutMs || 180000;
+    const fetchSignal = options?.signal
+      ? AbortSignal.any([options.signal, AbortSignal.timeout(requestTimeout)])
+      : AbortSignal.timeout(requestTimeout);
 
     // 1. Streaming support if onToken is provided (primary path in agent loop)
     if (onToken) {
@@ -123,7 +140,8 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
             max_tokens: options?.maxTokens || 4096,
             stream: true,
             stream_options: { include_usage: true }
-          })
+          }),
+          signal: fetchSignal
         });
 
         if (streamResponse.ok && streamResponse.body) {
@@ -256,6 +274,9 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
           throw new Error(`llama-server API error (${streamResponse.status}): ${errText}`);
         }
       } catch (err: any) {
+        if (options?.signal?.aborted || err.name === 'AbortError' || (err.message && err.message.includes('abort'))) {
+          throw err;
+        }
         if (err.message && err.message.includes('llama-server API error')) {
           throw err;
         }
@@ -279,7 +300,8 @@ export class LlamaCppTurboQuantProvider implements ILLMProvider {
         frequency_penalty: options?.frequencyPenalty ?? 0.1,
         repeat_penalty: options?.repeatPenalty ?? 1.1,
         max_tokens: options?.maxTokens || 4096
-      })
+      }),
+      signal: fetchSignal
     });
 
     if (!response.ok) {

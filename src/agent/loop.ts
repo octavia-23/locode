@@ -25,6 +25,11 @@ import {
   DEFAULT_STAGNATION_THRESHOLDS,
   CLOUD_STAGNATION_THRESHOLDS
 } from './stagnation.js';
+import { ToolDispatcher } from '../engine/tool-dispatcher.js';
+import { PermissionEngine } from '../engine/permission-engine.js';
+import { RecoveryController } from '../engine/recovery-controller.js';
+import { ExecutionState, DurableToolResult } from '../engine/types.js';
+import { HarnessExecutionProfile, resolveExecutionProfile } from '../runtime/profiles.js';
 
 export interface SessionStats {
   turns: number;
@@ -166,6 +171,11 @@ export class AgentLoop {
 
   private sessionMemory: SessionMemory;
   private stagnationDetector: StagnationDetector;
+  private state: ExecutionState = 'idle';
+  private executionProfile: HarnessExecutionProfile;
+  private toolDispatcher: ToolDispatcher;
+  private recoveryController: RecoveryController;
+  private permissionEngine: PermissionEngine;
 
   constructor(context: AgentContext, renderer: TerminalRenderer, customProvider?: ILLMProvider) {
     this.context = context;
@@ -183,13 +193,78 @@ export class AgentLoop {
     const isCloud = isCloudProvider(this.context.provider);
     const defaultThresholds = isCloud ? CLOUD_STAGNATION_THRESHOLDS : DEFAULT_STAGNATION_THRESHOLDS;
     this.stagnationDetector = new StagnationDetector({ ...defaultThresholds, ...context.stagnationThresholds });
+
+    this.executionProfile = resolveExecutionProfile(isCloud);
+    this.permissionEngine = new PermissionEngine({
+      autoApprove: this.context.autoApprove
+    });
+    this.toolDispatcher = new ToolDispatcher(this.permissionEngine, {
+      confirmApproval: async (toolName, args, reason) => {
+        try {
+          return await confirm({
+            message: `approve ${theme.accent(toolName)}?${reason ? ` (${reason})` : ''}`,
+            default: true
+          });
+        } catch {
+          return false;
+        }
+      },
+      onProgress: (prog) => {
+        const sec = Math.floor(prog.elapsedMs / 1000);
+        if (sec >= 1) {
+          const hint = prog.lastOutput ? ` · ${prog.lastOutput.slice(0, 45)}` : '';
+          this.renderer.startSpinner(`Executing... (${sec}s${hint})`);
+        }
+      }
+    });
+    this.recoveryController = new RecoveryController(
+      { ...defaultThresholds, ...context.stagnationThresholds },
+      isCloud ? 10 : 5
+    );
+  }
+
+  getState(): ExecutionState {
+    return this.state;
+  }
+
+  getExecutionProfile(): HarnessExecutionProfile {
+    return this.executionProfile;
+  }
+
+  setExecutionProfile(profile: Partial<HarnessExecutionProfile>) {
+    this.executionProfile = {
+      ...this.executionProfile,
+      ...profile,
+      privacyPolicy: {
+        ...this.executionProfile.privacyPolicy,
+        ...profile.privacyPolicy
+      },
+      costPolicy: {
+        ...this.executionProfile.costPolicy,
+        ...profile.costPolicy
+      }
+    };
+  }
+
+  getToolDispatcher(): ToolDispatcher {
+    return this.toolDispatcher;
+  }
+
+  getPermissionEngine(): PermissionEngine {
+    return this.permissionEngine;
+  }
+
+  getRecoveryController(): RecoveryController {
+    return this.recoveryController;
   }
 
   async init() {
+    this.state = 'initializing';
     const isCloud = isCloudProvider(this.context.provider);
+    const allowFullRepo = this.executionProfile.privacyPolicy.allowFullRepoContext;
     this.messages = [{
       role: 'system',
-      content: await buildSystemPrompt(this.context.cwd, isCloud)
+      content: await buildSystemPrompt(this.context.cwd, isCloud, allowFullRepo)
     }];
 
     // Restore previous session memory if available
@@ -241,6 +316,9 @@ export class AgentLoop {
 
   setContext(context: Partial<AgentContext>) {
     this.context = { ...this.context, ...context };
+    if (context.autoApprove !== undefined) {
+      this.permissionEngine.setPolicy({ autoApprove: context.autoApprove });
+    }
     if (context.model) {
       this.provider.setModel(context.model);
     }
@@ -256,6 +334,7 @@ export class AgentLoop {
       const isCloud = isCloudProvider(context.provider);
       const defaultThresholds = isCloud ? CLOUD_STAGNATION_THRESHOLDS : DEFAULT_STAGNATION_THRESHOLDS;
       this.stagnationDetector = new StagnationDetector(defaultThresholds);
+      this.executionProfile = resolveExecutionProfile(isCloud);
     }
     this.context.contextEngine = this.contextEngine;
   }
@@ -267,6 +346,7 @@ export class AgentLoop {
       const isCloud = isCloudProvider(providerType);
       const defaultThresholds = isCloud ? CLOUD_STAGNATION_THRESHOLDS : DEFAULT_STAGNATION_THRESHOLDS;
       this.stagnationDetector = new StagnationDetector(defaultThresholds);
+      this.executionProfile = resolveExecutionProfile(isCloud);
     }
   }
 
@@ -293,9 +373,10 @@ export class AgentLoop {
 
   async clearHistory() {
     const isCloud = isCloudProvider(this.context.provider);
+    const allowFullRepo = this.executionProfile.privacyPolicy.allowFullRepoContext;
     this.messages = [{
       role: 'system',
-      content: await buildSystemPrompt(this.context.cwd, isCloud)
+      content: await buildSystemPrompt(this.context.cwd, isCloud, allowFullRepo)
     }];
     await this.sessionMemory.clearSession();
   }
@@ -545,7 +626,7 @@ export class AgentLoop {
       // 2. If the model is obsessively reading the same file repeatedly (2+ reads),
       //    or has reached a high exploration ceiling (8+ reads) without making edits,
       //    temporarily withdraw passive reads and shell commands so only edit_file/write_file can count as progress.
-      const lastVerifPassed = hasModifiedCode && Boolean(this.contextEngine.getTaskState().lastVerification?.passed);
+      const lastVerifPassed = hasModifiedCode && this.contextEngine.getTaskState().lastVerification?.status === 'passed';
       const shouldForceMutationTools = !isCloud && taskRequestsModification && !lastVerifPassed && (Boolean(progress.singleFileObsession) || readStepCount >= 8);
 
       let activeTools = allTools;
@@ -691,7 +772,7 @@ Please proceed with the next tool call (e.g., view_file, edit_file, run_command)
           const vResult = await CodeVerifier.run(this.context.cwd);
           this.renderer.stopSpinner();
 
-          this.contextEngine.recordVerificationResult(vResult.passed, vResult.command || 'verify', vResult.errorOutput);
+          this.contextEngine.recordVerificationResult(vResult.passed, vResult.command || 'verify', vResult.errorOutput, vResult.status);
 
           // Track verification signal in StagnationDetector
           const currentWs = await StagnationDetector.computeWorkspaceFingerprint(this.context.cwd);
@@ -702,15 +783,15 @@ Please proceed with the next tool call (e.g., view_file, edit_file, run_command)
             normalizedArgs: { command: vResult.command || 'verify' },
             resultFingerprint: StagnationDetector.fingerprintResult(vResult.errorOutput || (vResult.passed ? 'PASSED' : 'FAILED'), !vResult.passed),
             workspaceFingerprint: currentWs,
-            isError: !vResult.passed,
+            isError: vResult.status === 'failed',
             testOutcome: {
-              passed: vResult.passed,
+              passed: vResult.status === 'passed',
               errorSignature: StagnationDetector.extractErrorSignature(vResult.errorOutput || ''),
               command: vResult.command || 'verify'
             }
           });
 
-          if (!vResult.passed) {
+          if (vResult.status === 'failed') {
             repairAttempts++;
 
             // Check if verification failures have stagnated with unchanged error signatures
@@ -797,8 +878,10 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
               content: errorPrompt
             });
             continue; // Continue loop to repair
-          } else if (vResult.command) {
+          } else if (vResult.status === 'passed' && vResult.command) {
             this.renderer.printSuccess(`Verification passed: \`${vResult.command}\` exited with 0 errors.`);
+          } else if (vResult.status === 'inconclusive' && vResult.command) {
+            this.renderer.printWarning(`Verification inconclusive for \`${vResult.command}\`: ${vResult.reason || 'Execution timed out'}`);
           }
         }
 
@@ -952,7 +1035,7 @@ Unresolved blocker: The model was unable to break out of repetitive tool invocat
         // If code has been modified and verification (e.g. py_compile, tsc, npm test) has already PASSED with 0 errors,
         // do not let local models wander into redundant passive inspections or speculative checks. Force turn finalization.
         const lastVerif = this.contextEngine.getTaskState().lastVerification;
-        if (!isCloud && hasModifiedCode && lastVerif && lastVerif.passed) {
+        if (!isCloud && hasModifiedCode && lastVerif && lastVerif.status === 'passed') {
           this.stats.failedToolCalls++;
           const completeDirective = `[GOAL VERIFIED AND COMPLETE]
 Your codebase modifications have already been verified cleanly (${lastVerif.summary}).
@@ -971,7 +1054,7 @@ You must now deliver your final summary and conclusion to the user to conclude t
         // RUNTIME ACTION GATE: re-evaluate before EACH tool in a batch. One model response
         // can contain many calls, so a turn-level tool list cannot enforce the limit by itself.
         // Once the inspection streak is exhausted, block all non-edit tools, including shell commands.
-        const verificationStillCurrent = hasModifiedCode && Boolean(this.contextEngine.getTaskState().lastVerification?.passed);
+        const verificationStillCurrent = hasModifiedCode && this.contextEngine.getTaskState().lastVerification?.status === 'passed';
         const forceActionNow = !isCloud && taskRequestsModification && !verificationStillCurrent && (Boolean(progress.singleFileObsession) || readStepCount >= 8);
         if (forceActionNow && toolName !== 'edit_file' && toolName !== 'write_file') {
           this.stats.failedToolCalls++;
@@ -1028,88 +1111,64 @@ You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetH
           } catch {}
         }
 
-        // Approval Check
-        let isApproved = true;
-        const needsApproval = typeof tool.needsApproval === 'function'
-          ? tool.needsApproval(toolArgs)
-          : tool.needsApproval;
-
-        if (needsApproval && !this.context.autoApprove) {
-          try {
-            isApproved = await confirm({
-              message: `approve ${theme.accent(toolName)}?`,
-              default: true
-            });
-          } catch {
-            isApproved = false;
-          }
+        // Checkpoint record pre-edit file if mutation tool
+        const isFileMutationTool = (toolName === 'edit_file' || toolName === 'write_file') && Boolean(toolArgs.path);
+        if (isFileMutationTool && toolArgs.path) {
+          await this.checkpointManager.recordPreEditFile(toolArgs.path);
         }
 
-        if (!isApproved) {
-          const rejectedMsg = `Execution of "${toolName}" was rejected by the user.`;
-          this.renderer.printError(rejectedMsg);
+        this.renderer.startSpinner(`Executing ${toolName}...`);
+
+        const durableResult = await this.toolDispatcher.dispatch(
+          tool,
+          toolArgs,
+          this.context,
+          call.id,
+          { autoApprove: this.context.autoApprove }
+        );
+
+        this.renderer.stopSpinner();
+
+        if (durableResult.status === 'validation_failed') {
+          this.stats.failedToolCalls++;
+          progress.failedToolCount++;
+          progress.consecutiveToolFailures++;
+          this.renderer.printError(durableResult.output);
           this.messages.push({
             role: 'tool',
             name: toolName,
             tool_call_id: call.id,
-            content: rejectedMsg
+            content: durableResult.output
           });
           continue;
         }
 
-        // Capture the actual pre-edit content. A successful tool result alone is not
-        // progress: write_file may write identical content and edit_file can be a no-op.
-        this.renderer.startSpinner(`Executing ${toolName}...`);
-        let fileContentBefore: string | null = null;
-        const isFileMutationTool = (toolName === 'edit_file' || toolName === 'write_file') && Boolean(toolArgs.path);
-        if (isFileMutationTool && toolArgs.path) {
-          try {
-            fileContentBefore = await fs.readFile(path.resolve(this.context.cwd, toolArgs.path), 'utf8');
-          } catch {
-            fileContentBefore = null;
-          }
-          await this.checkpointManager.recordPreEditFile(toolArgs.path);
-          if (fileContentBefore !== null) {
-            const beforeHash = crypto.createHash('md5').update(fileContentBefore).digest('hex');
-            const knownHashes = progress.fileContentHashes.get(toolArgs.path) || [];
-            if (!knownHashes.includes(beforeHash)) knownHashes.push(beforeHash);
-            if (knownHashes.length > 5) knownHashes.shift();
-            progress.fileContentHashes.set(toolArgs.path, knownHashes);
-          }
+        if (durableResult.status === 'permission_denied') {
+          this.stats.failedToolCalls++;
+          this.renderer.printError(durableResult.output);
+          this.messages.push({
+            role: 'tool',
+            name: toolName,
+            tool_call_id: call.id,
+            content: durableResult.output
+          });
+          continue;
         }
 
-        // Attach progress listener for long-running commands (e.g. run_command)
-        const origOnProgress = this.context.onCommandProgress;
-        this.context.onCommandProgress = (prog) => {
-          const sec = Math.floor(prog.elapsedMs / 1000);
-          if (sec >= 1) {
-            const hint = prog.lastOutput ? ` · ${prog.lastOutput.slice(0, 45)}` : '';
-            this.renderer.startSpinner(`Executing ${toolName}... (${sec}s${hint})`);
-          }
-          if (origOnProgress) origOnProgress(prog);
+        this.renderer.printToolResult(toolName, durableResult.output, durableResult.isError);
+
+        let executionResult: { result: string; isError?: boolean } = {
+          result: durableResult.output,
+          isError: durableResult.isError
         };
 
-        let executionResult: { result: string; isError?: boolean };
-        try {
-          executionResult = await tool.execute(toolArgs, this.context);
-        } catch (err: any) {
-          executionResult = { result: `Tool execution threw error: ${err.message}`, isError: true };
-        } finally {
-          this.context.onCommandProgress = origOnProgress;
-          this.renderer.stopSpinner();
-        }
-
-        this.renderer.printToolResult(toolName, executionResult.result, executionResult.isError);
-
-        let fileContentChanged = false;
-        if (!executionResult.isError && isFileMutationTool && toolArgs.path) {
-          let fileContentAfter: string | null = null;
-          try {
-            fileContentAfter = await fs.readFile(path.resolve(this.context.cwd, toolArgs.path), 'utf8');
-          } catch {
-            fileContentAfter = null;
-          }
-          fileContentChanged = fileContentAfter !== fileContentBefore;
+        const fileContentChanged = Boolean(durableResult.fileChanges?.changed);
+        if (fileContentChanged && toolArgs.path && durableResult.fileChanges?.contentBefore) {
+          const beforeHash = crypto.createHash('md5').update(durableResult.fileChanges.contentBefore).digest('hex');
+          const knownHashes = progress.fileContentHashes.get(toolArgs.path) || [];
+          if (!knownHashes.includes(beforeHash)) knownHashes.push(beforeHash);
+          if (knownHashes.length > 5) knownHashes.shift();
+          progress.fileContentHashes.set(toolArgs.path, knownHashes);
         }
         // Only repository-inspection calls consume this budget. Shell commands are neither
         // source edits nor inspections, and must not disable the action gate.

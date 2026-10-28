@@ -18,11 +18,22 @@ async function loadProjectRules(cwd: string): Promise<string> {
   return '';
 }
 
-export async function buildSystemPrompt(cwd: string, isCloud: boolean = false): Promise<string> {
+export async function buildSystemPrompt(
+  cwd: string,
+  isCloud: boolean = false,
+  allowFullRepoContext?: boolean
+): Promise<string> {
   const customRules = await loadProjectRules(cwd);
   const isWindows = process.platform === 'win32';
-  const repoMapGen = new RepoMapGenerator(cwd);
-  const repoMap = await repoMapGen.generateMap(isCloud ? 75 : 45, isCloud ? 4500 : 2000);
+
+  // Privacy Policy: Never transfer full repository context to a cloud provider implicitly.
+  // Full repository map is only included if explicitly enabled or running locally.
+  const shouldIncludeRepoMap = allowFullRepoContext !== undefined ? allowFullRepoContext : !isCloud;
+  let repoMap = '';
+  if (shouldIncludeRepoMap) {
+    const repoMapGen = new RepoMapGenerator(cwd);
+    repoMap = await repoMapGen.generateMap(isCloud ? 75 : 45, isCloud ? 4500 : 2000);
+  }
 
   const explorationPrinciple = isCloud
     ? `2. ARCHITECTURAL EXPLORATION & THOROUGH INVESTIGATION:

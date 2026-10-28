@@ -60,6 +60,8 @@ export interface AgentContext {
   apiBase?: string;
   apiKey?: string;
   numCtx?: number;
+  interactive?: boolean;
+  trustProjectMcp?: boolean;
   hardwareProfile?: HardwareProfile;
   architectModel?: string;
   mode?: 'worker' | 'architect';

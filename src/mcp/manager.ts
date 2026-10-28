@@ -12,12 +12,27 @@ export interface ActiveMCPServer {
   tools: ToolDefinition[];
 }
 
+export interface MCPOptions {
+  trusted?: boolean;
+  trustChecker?: (serverName: string, config: MCPServerConfig) => Promise<boolean> | boolean;
+}
+
 export class MCPManager {
   private cwd: string;
+  private options: MCPOptions;
   private activeServers: Map<string, ActiveMCPServer> = new Map();
 
-  constructor(cwd: string) {
+  constructor(cwd: string, options?: MCPOptions) {
     this.cwd = cwd;
+    this.options = options || {};
+  }
+
+  setTrusted(trusted: boolean): void {
+    this.options.trusted = trusted;
+  }
+
+  isTrusted(): boolean {
+    return Boolean(this.options.trusted);
   }
 
   async loadConfiguration(): Promise<MCPConfigFile | null> {
@@ -48,6 +63,15 @@ export class MCPManager {
     const loadedTools: ToolDefinition[] = [];
 
     for (const [serverName, serverConfig] of Object.entries(config.mcpServers)) {
+      // Require explicit trust before launching project-supplied MCP server commands
+      const isTrusted = this.options.trusted ||
+        (this.options.trustChecker ? await this.options.trustChecker(serverName, serverConfig) : false);
+
+      if (!isTrusted) {
+        console.warn(`[MCP SECURITY] Server "${serverName}" blocked: project-supplied MCP commands require explicit trust.`);
+        continue;
+      }
+
       try {
         const tools = await this.connectServer(serverName, serverConfig);
         loadedTools.push(...tools);
@@ -152,12 +176,20 @@ export class MCPManager {
     return all;
   }
 
-  async closeAll() {
+  /**
+   * Closes all active MCP servers and returns all registered tool names for unregistration.
+   */
+  async closeAll(): Promise<string[]> {
+    const toolNames: string[] = [];
     for (const s of this.activeServers.values()) {
+      for (const t of s.tools) {
+        toolNames.push(t.name);
+      }
       try {
         await s.client.close();
       } catch {}
     }
     this.activeServers.clear();
+    return toolNames;
   }
 }

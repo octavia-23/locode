@@ -29,6 +29,7 @@ export class LlamaCppRuntime {
   private config: LlamaRuntimeConfig;
   private process: ChildProcess | null = null;
   private isOwnedProcess: boolean = false;
+  private existingServerActive: boolean = false;
   private logBuffer: string[] = [];
   private startupTimeMs: number = 0;
   private lastError?: string;
@@ -84,7 +85,7 @@ export class LlamaCppRuntime {
 
   getStatus(): RuntimeStatus {
     return {
-      isRunning: this.isOwnedProcess ? !!this.process && !this.process.killed : true,
+      isRunning: this.isOwnedProcess ? Boolean(this.process && !this.process.killed) : this.existingServerActive,
       isReady: false,
       pid: this.process?.pid,
       port: this.config.port,
@@ -132,10 +133,20 @@ export class LlamaCppRuntime {
     try {
       const url = `http://${this.config.host}:${this.config.port}/v1/models`;
       const res = await fetch(url, { signal: AbortSignal.timeout(1500) });
-      if (!res.ok) return false;
+      if (!res.ok) {
+        this.existingServerActive = false;
+        return false;
+      }
       const data: any = await res.json();
       const models = (data.data || []).map((m: any) => m.id);
-      if (models.length === 0) return false;
+      if (models.length === 0) {
+        this.existingServerActive = false;
+        return false;
+      }
+
+      if (models.length > 0 && models[0]) {
+        this.config.modelAlias = models[0];
+      }
 
       // Inspect running server's actual context size from /props
       try {
@@ -145,10 +156,13 @@ export class LlamaCppRuntime {
           const propsData: any = await propsRes.json();
           const serverCtx = propsData.default_generation_settings?.n_ctx;
           if (typeof serverCtx === 'number' && serverCtx > 0) {
-            // If the running server has a smaller context size than requested, do NOT reuse it!
+            // If the running server has a smaller context size than requested:
             if (this.config.contextSize && serverCtx < this.config.contextSize) {
-              await this.killProcessOnPort(this.config.port);
-              return false; // Force starting server with requested context size!
+              if (this.config.autoPort) {
+                // Do NOT terminate unowned process; allocate a new port instead
+                this.existingServerActive = false;
+                return false;
+              }
             }
             // Align our runtime config with the running server's actual context size
             this.config.contextSize = serverCtx;
@@ -156,23 +170,24 @@ export class LlamaCppRuntime {
         }
       } catch {}
 
+      this.existingServerActive = true;
       return true;
     } catch {
+      this.existingServerActive = false;
       return false;
     }
   }
 
   async killProcessOnPort(port: number): Promise<void> {
-    try {
-      if (process.platform === 'win32') {
-        const { stdout } = await execa(`powershell -Command "(Get-NetTCPConnection -LocalPort ${port} -ErrorAction SilentlyContinue).OwningProcess"`, { shell: true });
-        const pid = parseInt(stdout.trim(), 10);
-        if (pid && !isNaN(pid) && pid > 0) {
-          process.kill(pid, 'SIGKILL');
-          await new Promise(r => setTimeout(r, 1000));
-        }
-      }
-    } catch {}
+    // Locode must NEVER terminate a process that Locode does not own.
+    // Only an actively owned child process spawned by this instance may be terminated.
+    if (this.isOwnedProcess && this.process && !this.process.killed) {
+      try {
+        this.process.kill('SIGTERM');
+      } catch {}
+      this.process = null;
+      this.isOwnedProcess = false;
+    }
   }
 
   /**

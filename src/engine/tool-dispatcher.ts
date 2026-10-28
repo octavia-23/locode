@@ -31,6 +31,7 @@ export class ToolDispatcher {
   /**
    * Dispatches a single tool call through Schema Validation, Permission Check,
    * Pre-execution snapshotting, Tool Execution, and Durable Result recording.
+   * Strictly fails closed if user approval is required but unavailable.
    */
   async dispatch(
     tool: ToolDefinition,
@@ -72,21 +73,31 @@ export class ToolDispatcher {
       };
     }
 
-    // STEP 3: User Confirmation if required
+    // STEP 3: User Confirmation if required (Fails closed if approval handler is missing)
     if (permEval.requiresPrompt && !options?.autoApprove && !context.autoApprove) {
-      if (this.promptHandler?.confirmApproval) {
-        const approved = await this.promptHandler.confirmApproval(toolName, cleanArgs, permEval.reason);
-        if (!approved) {
-          return {
-            callId,
-            toolName,
-            arguments: cleanArgs,
-            status: 'permission_denied',
-            output: `Execution of "${toolName}" was rejected by user.`,
-            isError: true,
-            durationMs: Date.now() - startTime
-          };
-        }
+      if (!this.promptHandler?.confirmApproval) {
+        return {
+          callId,
+          toolName,
+          arguments: cleanArgs,
+          status: 'permission_denied',
+          output: `Permission Denied: Tool "${toolName}" requires user approval, but approval is unavailable (no prompt handler configured).`,
+          isError: true,
+          durationMs: Date.now() - startTime
+        };
+      }
+
+      const approved = await this.promptHandler.confirmApproval(toolName, cleanArgs, permEval.reason);
+      if (!approved) {
+        return {
+          callId,
+          toolName,
+          arguments: cleanArgs,
+          status: 'permission_denied',
+          output: `Execution of "${toolName}" was rejected by user.`,
+          isError: true,
+          durationMs: Date.now() - startTime
+        };
       }
     }
 

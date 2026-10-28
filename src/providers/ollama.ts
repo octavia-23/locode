@@ -11,11 +11,11 @@ export class OllamaProvider implements ILLMProvider {
 
   constructor(
     model: string = 'qwen2.5-coder:7b',
-    host: string = 'http://127.0.0.1:11434',
+    host?: string,
     numCtx: number = 8192
   ) {
     this.model = model;
-    this.host = host;
+    this.host = host || process.env.OLLAMA_HOST || 'http://127.0.0.1:11434';
     this.numCtx = numCtx;
     this.client = new Ollama({ host: this.host });
   }

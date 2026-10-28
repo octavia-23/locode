@@ -60,5 +60,7 @@ export interface ToolDispatchOptions {
   autoApprove?: boolean;
   allowOutsideWorkspace?: boolean;
   allowNetwork?: boolean;
+  approvalAvailable?: boolean;
+  interactive?: boolean;
   signal?: AbortSignal;
 }

@@ -31,8 +31,12 @@ export class RecoveryController {
   private stagnationDetector: StagnationDetector;
   private maxConsecutiveFailures: number;
 
-  constructor(thresholds?: Partial<StagnationThresholds>, maxConsecutiveFailures: number = 5) {
-    this.stagnationDetector = new StagnationDetector({ ...DEFAULT_STAGNATION_THRESHOLDS, ...thresholds });
+  constructor(thresholdsOrDetector?: Partial<StagnationThresholds> | StagnationDetector, maxConsecutiveFailures: number = 5) {
+    if (thresholdsOrDetector instanceof StagnationDetector) {
+      this.stagnationDetector = thresholdsOrDetector;
+    } else {
+      this.stagnationDetector = new StagnationDetector({ ...DEFAULT_STAGNATION_THRESHOLDS, ...thresholdsOrDetector });
+    }
     this.maxConsecutiveFailures = maxConsecutiveFailures;
   }
 

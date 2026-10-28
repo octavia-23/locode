@@ -5,7 +5,8 @@ import { confirm } from '@inquirer/prompts';
 import chalk from 'chalk';
 import { theme } from '../ui/theme.js';
 import { AgentContext, ChatMessage } from '../types.js';
-import { allTools, toolRegistry } from '../tools/index.js';
+import { allTools, toolRegistry, registerDynamicTool, unregisterDynamicTools } from '../tools/index.js';
+import { redactSecrets, redactSecretsFromMessages } from '../utils/secret-redactor.js';
 import { ILLMProvider } from '../providers/types.js';
 import { createLLMProvider, isCloudProvider, resolveProvider } from '../providers/factory.js';
 import { ContextEngine } from './context.js';
@@ -112,34 +113,7 @@ export interface CycleInfo {
  * Traps period 1 (identical call), period 2 (A-B-A-B ping-pong), period 3, and period 4.
  */
 export function detectToolExecutionCycle(signatures: string[]): CycleInfo {
-  const len = signatures.length;
-  if (len < 4) return { detected: false, period: 0, repetitions: 0, summary: '' };
-
-  for (let p = 1; p <= 4; p++) {
-    const minReps = p === 1 ? 4 : (p === 2 ? 3 : 2);
-    const requiredLen = p * minReps;
-    if (len < requiredLen) continue;
-
-    const pattern = signatures.slice(len - p);
-    let allMatch = true;
-
-    for (let rep = 1; rep < minReps; rep++) {
-      for (let i = 0; i < p; i++) {
-        if (signatures[len - (rep + 1) * p + i] !== pattern[i]) {
-          allMatch = false;
-          break;
-        }
-      }
-      if (!allMatch) break;
-    }
-
-    if (allMatch) {
-      const summary = pattern.map(s => s.split(':')[0]).join(' → ');
-      return { detected: true, period: p, repetitions: minReps, summary };
-    }
-  }
-
-  return { detected: false, period: 0, repetitions: 0, summary: '' };
+  return RecoveryController.detectToolCycle(signatures);
 }
 
 export class AgentLoop {
@@ -187,7 +161,7 @@ export class AgentLoop {
     this.contextEngine = new ContextEngine(context.numCtx || 8192, context.cwd);
     this.context.contextEngine = this.contextEngine;
     this.checkpointManager = new CheckpointManager(context.cwd);
-    this.mcpManager = new MCPManager(context.cwd);
+    this.mcpManager = new MCPManager(context.cwd, { trusted: context.trustProjectMcp ?? false });
     this.sessionMemory = new SessionMemory(context.cwd);
 
     const isCloud = isCloudProvider(this.context.provider);
@@ -218,7 +192,7 @@ export class AgentLoop {
       }
     });
     this.recoveryController = new RecoveryController(
-      { ...defaultThresholds, ...context.stagnationThresholds },
+      this.stagnationDetector,
       isCloud ? 10 : 5
     );
   }
@@ -290,10 +264,7 @@ export class AgentLoop {
     // Connect MCP servers if configured
     const mcpTools = await this.mcpManager.init();
     for (const tool of mcpTools) {
-      toolRegistry.set(tool.name, tool);
-      if (!allTools.some(t => t.name === tool.name)) {
-        allTools.push(tool);
-      }
+      registerDynamicTool(tool);
     }
 
     if (mcpTools.length > 0) {
@@ -311,7 +282,8 @@ export class AgentLoop {
   }
 
   async close() {
-    await this.mcpManager.closeAll();
+    const unregisterToolNames = await this.mcpManager.closeAll();
+    unregisterDynamicTools(unregisterToolNames);
   }
 
   setContext(context: Partial<AgentContext>) {
@@ -343,9 +315,13 @@ export class AgentLoop {
     this.provider = provider;
     if (providerType) {
       this.context.provider = providerType;
+      if (this.context.apiKey && !isCloudProvider(providerType)) {
+        this.context.apiKey = undefined;
+      }
       const isCloud = isCloudProvider(providerType);
       const defaultThresholds = isCloud ? CLOUD_STAGNATION_THRESHOLDS : DEFAULT_STAGNATION_THRESHOLDS;
       this.stagnationDetector = new StagnationDetector(defaultThresholds);
+      this.recoveryController = new RecoveryController(this.stagnationDetector, isCloud ? 10 : 5);
       this.executionProfile = resolveExecutionProfile(isCloud);
     }
   }
@@ -394,15 +370,25 @@ export class AgentLoop {
   }
 
   /**
+   * Enforces cloud privacy and secret-redaction policies at every outgoing request boundary.
+   */
+  private prepareMessagesForProvider(messages: ChatMessage[]): ChatMessage[] {
+    if (this.executionProfile.privacyPolicy.redactSecrets || isCloudProvider(this.context.provider)) {
+      return redactSecretsFromMessages(messages);
+    }
+    return messages;
+  }
+
+  /**
    * Generates a clean Conventional Commit message based on git diff
    */
   async generateCommitMessage(diffText: string): Promise<string> {
     const prompt = `Based on the following git diff, generate a concise Conventional Commit message (e.g. "feat: add user auth" or "fix(parser): handle empty strings"). Output ONLY the commit message without any quotes or explanations.\n\nGit diff:\n${diffText.slice(0, 4000)}`;
 
     try {
-      const res = await this.provider.chat([
+      const res = await this.provider.chat(this.prepareMessagesForProvider([
         { role: 'user', content: prompt }
-      ], []);
+      ]), []);
       return res.content.trim().replace(/^["']|["']$/g, '');
     } catch {
       return 'chore: update project files';
@@ -591,7 +577,7 @@ export class AgentLoop {
             content: '[DIRECTIVE] Working state fold. State in 1 sentence what code modification you will apply next. Then immediately apply it with edit_file or write_file.'
           };
           const preFoldTurn = [...this.messages, synthesisPrompt];
-          const digest = await this.provider.chat(preFoldTurn, [], undefined, { toolChoice: 'none' });
+          const digest = await this.provider.chat(this.prepareMessagesForProvider(preFoldTurn), [], undefined, { toolChoice: 'none' });
           if (digest.content && digest.content.trim()) {
             synthesizedFindings = digest.content.trim();
           }
@@ -657,7 +643,7 @@ export class AgentLoop {
 
       try {
         rawResponse = await this.provider.chat(
-          compacted,
+          this.prepareMessagesForProvider(compacted),
           activeTools,
           (token) => {
             streamedTokens++;
@@ -707,36 +693,31 @@ export class AgentLoop {
         }
       }
 
-      // Outcome B: Empty / Quiet Generation Recovery
+      // Outcome B: Empty / Quiet Generation Recovery (Authoritative RecoveryController)
       if (outcome.type === 'EMPTY_RESPONSE') {
-        progress.consecutiveEmptyResponses++;
         this.stats.emptyGenerations++;
+        const lastToolMsg = [...this.messages].reverse().find(m => m.role === 'tool');
+        const lastOutcomeText = typeof lastToolMsg?.content === 'string' ? lastToolMsg.content : undefined;
+        const action = this.recoveryController.handleEmptyResponse(userInput, lastOutcomeText);
 
-        if (progress.consecutiveEmptyResponses <= 3) {
+        if (action.type === 'warn') {
           this.stats.recoveries++;
           this.renderer.printWarning(
-            `Model generated an empty response without tool calls. Issuing bounded continuation directive (${progress.consecutiveEmptyResponses}/3)...`
+            action.message || 'Model generated an empty response without tool calls. Issuing bounded continuation directive...'
           );
-
-          const lastToolMsg = [...this.messages].reverse().find(m => m.role === 'tool');
-          const recoveryPrompt = `[CONTINUATION INSTRUCTION]
-Your previous response contained no text or tool actions.
-Current Objective: ${userInput}
-${lastToolMsg ? `Most recent tool outcome: ${typeof lastToolMsg.content === 'string' ? lastToolMsg.content.slice(0, 300) : ''}` : ''}
-Please proceed with the next tool call (e.g., view_file, edit_file, run_command) to complete the task, or provide your final answer if finished.`;
-
           this.messages.push({
             role: 'user',
-            content: recoveryPrompt
+            content: action.directive || `[CONTINUATION INSTRUCTION]\nPlease proceed with the next tool call.`
           });
           continue;
         } else {
-          this.renderer.printError('Model returned empty responses repeatedly without progressing. Terminating turn cleanly.');
+          this.renderer.printError(action.message || 'Model returned empty responses repeatedly without progressing. Terminating turn cleanly.');
           break;
         }
       }
 
       // Reset empty response / transient-error counters on productive generation
+      this.recoveryController.resetEmptyResponseCount();
       progress.consecutiveEmptyResponses = 0;
       progress.consecutiveNoProgressCount = 0;
 
@@ -918,90 +899,49 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         tool_calls: toolCalls
       });
 
-      // Progress Guard 1: Detect repetitive identical tool calls and periodic cycles
-      const currentCallSignature = toolCalls
-        .map(tc => `${tc.function.name}:${JSON.stringify(StagnationDetector.normalizeArguments(tc.function.arguments))}`)
-        .join(';');
+      // Progress Guard 1: Authoritative cycle and stagnation evaluation via RecoveryController
+      const recoveryAction = this.recoveryController.evaluateToolCalls(toolCalls, userInput);
 
-      progress.recentToolSignatures.push(currentCallSignature);
-      if (progress.recentToolSignatures.length > 16) {
-        progress.recentToolSignatures.shift();
-      }
-
-      const duplicateCallCount = progress.recentToolSignatures.filter(sig => sig === currentCallSignature).length;
-      const cycle = detectToolExecutionCycle(progress.recentToolSignatures);
-
-      // Check multi-signal stagnation via StagnationDetector
-      const stagnationDiag = this.stagnationDetector.diagnose();
-      const continuingStagnation = stagnationDiag.stagnated && this.stagnationDetector.isContinuingStagnation(toolCalls);
-
-      if (duplicateCallCount >= 4 || cycle.detected || continuingStagnation) {
+      if (recoveryAction.type === 'halt') {
         this.stats.progressLoopsDetected++;
-        progress.consecutiveCycleDetections++;
-        const cycleSummary = cycle.detected
-          ? cycle.summary
-          : (stagnationDiag.stagnated ? stagnationDiag.summary : currentCallSignature);
-
-        const recoveryAttempts = this.stagnationDetector.incrementRecoveryAttempts();
-        const maxRecAttempts = this.stagnationDetector.getThresholds().maxRecoveryAttempts;
-
-        if (recoveryAttempts > maxRecAttempts || progress.consecutiveCycleDetections >= 3) {
-          this.renderer.printWarning(
-            `Model entered persistent stagnation (${cycleSummary}). Halting execution cleanly after ${recoveryAttempts} recovery attempts.`
-          );
-          // Terminate cleanly reporting what was attempted, what remains unresolved, and supporting evidence
+        this.renderer.printWarning(
+          recoveryAction.message || 'Model entered persistent stagnation. Halting execution cleanly.'
+        );
+        this.messages.push({
+          role: 'assistant',
+          content: recoveryAction.directive || `[STAGNATION TERMINATION REPORT]\nReason: Model entered persistent stagnation.`
+        });
+        break;
+      } else if (recoveryAction.type === 'block_repetition') {
+        this.stats.progressLoopsDetected++;
+        this.stats.recoveries++;
+        this.renderer.printWarning(
+          recoveryAction.message || 'Repeated execution cycle detected. Blocking repeated tool actions and enforcing alternative action.'
+        );
+        for (const call of toolCalls) {
           this.messages.push({
-            role: 'assistant',
-            content: `[STAGNATION TERMINATION REPORT]
-Reason: ${stagnationDiag.summary || `Persistent tool repetition: ${cycleSummary}`}
-Evidence:
-${stagnationDiag.evidence?.length ? stagnationDiag.evidence.map(e => `* ${e}`).join('\n') : `* Pattern repeated across ${recoveryAttempts} recovery attempts.`}
-
-Attempted approaches:
-${this.stagnationDetector.getHistory().slice(-6).map(h => `- ${h.normalizedTool}(${JSON.stringify(h.normalizedArgs).slice(0, 80)})`).join('\n')}
-
-Unresolved blocker: The model was unable to break out of repetitive tool invocations or progress the workspace toward completing the objective.`
+            role: 'tool',
+            name: call.function.name,
+            tool_call_id: call.id,
+            content: recoveryAction.directive || '[EXECUTION BLOCKED - CYCLE DETECTED] This tool call was BLOCKED.'
           });
-          break;
-        } else if (progress.consecutiveCycleDetections === 2 || recoveryAttempts === 2) {
-          this.stats.recoveries++;
-          this.renderer.printWarning(
-            `Repeated execution cycle detected (${cycleSummary}). Blocking repeated tool actions and enforcing alternative action.`
-          );
-          const recoveryDirective = stagnationDiag.stagnated
-            ? this.stagnationDetector.buildRecoveryDirective(userInput, stagnationDiag)
-            : `[EXECUTION BLOCKED - CYCLE DETECTED] You have repeated the pattern [${cycleSummary}] multiple times without making progress. This tool call was BLOCKED. You must stop repeating this sequence. Either take a completely different approach or conclude and provide your final response.`;
-
-          for (const call of toolCalls) {
-            this.messages.push({
-              role: 'tool',
-              name: call.function.name,
-              tool_call_id: call.id,
-              content: recoveryDirective
-            });
-          }
-          continue;
-        } else {
-          this.stats.recoveries++;
-          this.renderer.printWarning(
-            `Detected repetitive tool execution loop (${cycleSummary}). Intervening with recovery directive...`
-          );
-          const directive = stagnationDiag.stagnated
-            ? `[PROGRESS GUARD WARNING]\n${this.stagnationDetector.buildRecoveryDirective(userInput, stagnationDiag)}`
-            : `[PROGRESS GUARD WARNING] This exact tool action has been called ${duplicateCallCount >= 4 ? duplicateCallCount : cycle.repetitions} times without making new progress. Do not repeat this identical call. Please inspect an alternate file, run verification via run_command, or provide your final response.`;
-
-          for (const call of toolCalls) {
-            this.messages.push({
-              role: 'tool',
-              name: call.function.name,
-              tool_call_id: call.id,
-              content: directive
-            });
-          }
-          continue;
         }
-      } else {
-        progress.consecutiveCycleDetections = 0;
+        continue;
+      } else if (recoveryAction.type === 'warn') {
+        this.stats.progressLoopsDetected++;
+        this.stats.recoveries++;
+        this.renderer.printWarning(
+          recoveryAction.message || 'Detected repetitive tool execution loop. Intervening with recovery directive...'
+        );
+        for (const call of toolCalls) {
+          this.messages.push({
+            role: 'tool',
+            name: call.function.name,
+            tool_call_id: call.id,
+            content: recoveryAction.directive || '[PROGRESS GUARD WARNING] Please avoid repeating this tool action.'
+          });
+        }
+        continue;
       }
 
       // Progress Guard 2: Trap obsessive single-file read loops & accelerate to action gate (local quantized models only)
@@ -1233,23 +1173,20 @@ You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetH
               progress.obsessedFilePath = '';
               progress.consecutiveCycleDetections = 0;
               this.stagnationDetector.resetRecoveryAttempts();
+              this.recoveryController.resetRepetitionOnRealChange();
               // Reset repetition history only after a real source change, not a no-op write.
               progress.recentToolSignatures = [];
             } else {
               executionResult.result += `\n\n[NO-OP EDIT DETECTED] The operation succeeded but left \"${toolArgs.path}\" unchanged. This is not progress. Do not repeat the same edit/write; inspect the exact target or explain the blocker.`;
             }
 
-            // Detect reversion to a previously observed content state.
+            // Detect reversion to a previously observed content state via authoritative RecoveryController
             let isOscillation = false;
             try {
               const targetFullPath = path.resolve(this.context.cwd, toolArgs.path);
               const currentContent = await fs.readFile(targetFullPath, 'utf8');
-              const contentHash = crypto.createHash('md5').update(currentContent).digest('hex');
-              const pastHashes = progress.fileContentHashes.get(toolArgs.path) || [];
-              if (fileContentChanged && pastHashes.includes(contentHash)) isOscillation = true;
-              if (!pastHashes.includes(contentHash)) pastHashes.push(contentHash);
-              if (pastHashes.length > 5) pastHashes.shift();
-              progress.fileContentHashes.set(toolArgs.path, pastHashes);
+              const oscResult = this.recoveryController.recordFileHash(toolArgs.path, currentContent);
+              if (fileContentChanged && oscResult.isOscillation) isOscillation = true;
             } catch {}
 
             if (isOscillation) {
@@ -1326,7 +1263,7 @@ You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetH
             const cmd = String(toolArgs.command).trim();
             const isVerifCmd = /^(python\s+-m\s+py_compile|pytest|npm\s+test|npx\s+tsc|tsc|cargo\s+test|go\s+test)/i.test(cmd);
             if (isVerifCmd) {
-              this.contextEngine.recordVerificationResult(!isErr, cmd, isErr ? toolOutput : undefined);
+              this.contextEngine.recordVerificationResult(!isErr, cmd, isErr ? toolOutput : undefined, isErr ? 'failed' : 'passed');
               if (!isErr && !toolOutput.trim()) {
                 // Ensure empty clean output explicitly confirms success so local models do not guess or re-verify
                 toolOutput = `[Command \`${cmd}\` exited cleanly with status code 0 and 0 errors. Verification passed. Please formulate your final response to complete the task.]`;

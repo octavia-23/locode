@@ -150,7 +150,7 @@ export class CodeVerifier {
 
     return {
       status: 'not-run',
-      passed: true,
+      passed: false,
       reason: 'No fast linter configured for this workspace'
     };
   }

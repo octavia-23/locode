@@ -1,5 +1,5 @@
 import { ToolDefinition } from '../types.js';
-import { isSsrfSafeUrl } from './security.js';
+import { isSsrfSafeUrl, validateSsrfSafeUrl } from './security.js';
 
 function stripHtml(html: string): string {
   return html
@@ -35,46 +35,71 @@ export const fetchWebTool: ToolDefinition = {
   },
   async execute(args) {
     try {
-      const url = args.url;
-      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+      let currentUrl = args.url;
+      if (!currentUrl.startsWith('http://') && !currentUrl.startsWith('https://')) {
         return { result: 'Invalid URL. Must begin with http:// or https://', isError: true };
       }
 
-      // Check SSRF protection
-      const ssrfCheck = isSsrfSafeUrl(url);
-      if (!ssrfCheck.safe) {
-        return { result: `Security Error: ${ssrfCheck.reason}`, isError: true };
-      }
-
-      // Safe fetch with redirect manual inspection and size limit
+      // Safe fetch with manual redirect inspection, destination IP check, and size limit
       const maxBytes = 2 * 1024 * 1024; // 2MB max download
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000);
+      const maxRedirects = 5;
+      let redirectCount = 0;
+      let finalRes: Response | null = null;
 
-      const res = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        },
-        redirect: 'follow',
-        signal: controller.signal
-      });
-      clearTimeout(timeoutId);
-
-      // Verify final redirected URL for SSRF
-      const finalUrl = res.url;
-      if (finalUrl) {
-        const finalCheck = isSsrfSafeUrl(finalUrl);
-        if (!finalCheck.safe) {
-          return { result: `Security Error after redirect: ${finalCheck.reason}`, isError: true };
+      while (redirectCount <= maxRedirects) {
+        // Validate destination URL and resolved IPs before initiating request
+        const check = await validateSsrfSafeUrl(currentUrl);
+        if (!check.safe) {
+          return {
+            result: `Security Error${redirectCount > 0 ? ' on redirect' : ''}: ${check.reason}`,
+            isError: true
+          };
         }
+
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+        let res: Response;
+        try {
+          res = await fetch(currentUrl, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            },
+            redirect: 'manual',
+            signal: controller.signal
+          });
+        } finally {
+          clearTimeout(timeoutId);
+        }
+
+        // Handle HTTP redirects manually
+        if ([301, 302, 303, 307, 308].includes(res.status)) {
+          const location = res.headers.get('location');
+          if (!location) {
+            return { result: `HTTP redirect (${res.status}) without Location header.`, isError: true };
+          }
+          redirectCount++;
+          if (redirectCount > maxRedirects) {
+            return { result: `Exceeded maximum redirect limit of ${maxRedirects}.`, isError: true };
+          }
+          currentUrl = new URL(location, currentUrl).href;
+          continue;
+        }
+
+        finalRes = res;
+        break;
       }
 
-      if (!res.ok) {
-        return { result: `HTTP request failed with status ${res.status}: ${res.statusText}`, isError: true };
+      if (!finalRes) {
+        return { result: 'Failed to complete HTTP request: no response received.', isError: true };
+      }
+
+      if (!finalRes.ok) {
+        return { result: `HTTP request failed with status ${finalRes.status}: ${finalRes.statusText}`, isError: true };
       }
 
       // Read with stream limit
-      const reader = res.body?.getReader();
+      const reader = finalRes.body?.getReader();
       let raw = '';
       let receivedBytes = 0;
 
@@ -93,7 +118,7 @@ export const fetchWebTool: ToolDefinition = {
           raw += decoder.decode(value, { stream: true });
         }
       } else {
-        raw = await res.text();
+        raw = await finalRes.text();
       }
 
       const clean = stripHtml(raw);
@@ -104,7 +129,7 @@ export const fetchWebTool: ToolDefinition = {
         ? clean.slice(0, maxLen) + `\n... [Content truncated at ${maxLen} characters]`
         : clean;
 
-      return { result: `Content fetched from ${url}:\n\n${preview}` };
+      return { result: `Content fetched from ${args.url}:\n\n${preview}` };
     } catch (err: any) {
       return { result: `Failed to fetch URL: ${err.message}`, isError: true };
     }

@@ -1,5 +1,8 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import syncFs from 'node:fs';
+import dns from 'node:dns/promises';
+import net from 'node:net';
 import { AgentContext } from '../types.js';
 
 export interface SecurityPolicy {
@@ -25,11 +28,14 @@ const DEFAULT_BLOCKED_COMMANDS: RegExp[] = [
 
 /**
  * Validates and resolves a file path against the configured workspace.
- * Throws an error or returns a clean path preventing directory traversal.
+ * Throws an error or returns a clean path preventing directory traversal,
+ * symlink escapes, junction escapes, and unauthorized outside writes.
  */
 export function resolveSafePath(filePath: string, cwd: string, allowOutside: boolean = false): string {
-  const resolved = path.isAbsolute(filePath) ? path.normalize(filePath) : path.normalize(path.resolve(cwd, filePath));
   const normalizedCwd = path.normalize(path.resolve(cwd));
+  const resolved = path.isAbsolute(filePath)
+    ? path.normalize(filePath)
+    : path.normalize(path.resolve(normalizedCwd, filePath));
 
   if (allowOutside) {
     return resolved;
@@ -37,13 +43,71 @@ export function resolveSafePath(filePath: string, cwd: string, allowOutside: boo
 
   // Windows drive check or case-insensitive prefix handling
   const isWindows = process.platform === 'win32';
-  const targetLower = isWindows ? resolved.toLowerCase() : resolved;
-  const cwdLower = isWindows ? normalizedCwd.toLowerCase() : normalizedCwd;
+  const isLexicallyInside = (target: string, base: string) => {
+    const tNorm = isWindows ? target.toLowerCase() : target;
+    const bNorm = isWindows ? base.toLowerCase() : base;
+    return tNorm === bNorm || tNorm.startsWith(bNorm.endsWith(path.sep) ? bNorm : bNorm + path.sep);
+  };
 
-  const isInside = targetLower === cwdLower || targetLower.startsWith(cwdLower + path.sep);
-
-  if (!isInside) {
+  if (!isLexicallyInside(resolved, normalizedCwd)) {
     throw new Error(`Security Violation: Path "${filePath}" resolves outside the allowed workspace (${cwd}).`);
+  }
+
+  // Verify real filesystem containment (symlinks, junctions) if workspace exists on disk
+  if (syncFs.existsSync(normalizedCwd)) {
+    let realCwd: string;
+    try {
+      realCwd = syncFs.realpathSync.native ? syncFs.realpathSync.native(normalizedCwd) : syncFs.realpathSync(normalizedCwd);
+    } catch {
+      realCwd = normalizedCwd;
+    }
+
+    try {
+      const lstat = syncFs.lstatSync(resolved);
+      if (lstat.isSymbolicLink()) {
+        let linkTarget = syncFs.readlinkSync(resolved);
+        if (!path.isAbsolute(linkTarget)) {
+          linkTarget = path.resolve(path.dirname(resolved), linkTarget);
+        }
+        let realLinkTarget: string;
+        try {
+          realLinkTarget = syncFs.realpathSync.native ? syncFs.realpathSync.native(linkTarget) : syncFs.realpathSync(linkTarget);
+        } catch {
+          realLinkTarget = path.normalize(linkTarget);
+        }
+        if (!isLexicallyInside(realLinkTarget, realCwd)) {
+          throw new Error(`Security Violation: Path "${filePath}" resolves via symlink outside the allowed workspace (${cwd}). Target: ${realLinkTarget}`);
+        }
+      }
+
+      const realTarget = syncFs.realpathSync.native ? syncFs.realpathSync.native(resolved) : syncFs.realpathSync(resolved);
+      if (!isLexicallyInside(realTarget, realCwd)) {
+        throw new Error(`Security Violation: Path "${filePath}" resolves via symlink outside the allowed workspace (${cwd}). Target: ${realTarget}`);
+      }
+    } catch (err: any) {
+      if (err.message?.includes('Security Violation')) {
+        throw err;
+      }
+      if (err.code === 'ENOENT') {
+        // Target does not exist yet (e.g. write_file creating a new file)
+        // Inspect the deepest existing ancestor directory to ensure no intermediate symlink escapes
+        let ancestor = path.dirname(resolved);
+        while (ancestor && ancestor !== path.dirname(ancestor)) {
+          if (syncFs.existsSync(ancestor)) {
+            try {
+              const realAncestor = syncFs.realpathSync.native ? syncFs.realpathSync.native(ancestor) : syncFs.realpathSync(ancestor);
+              if (!isLexicallyInside(realAncestor, realCwd)) {
+                throw new Error(`Security Violation: Path "${filePath}" resolves via symlink outside the allowed workspace (${cwd}). Ancestor target: ${realAncestor}`);
+              }
+            } catch (aErr: any) {
+              if (aErr.message?.includes('Security Violation')) throw aErr;
+            }
+            break;
+          }
+          ancestor = path.dirname(ancestor);
+        }
+      }
+    }
   }
 
   return resolved;
@@ -80,7 +144,78 @@ export function isDangerousCommand(command: string): { dangerous: boolean; reaso
 }
 
 /**
- * Audits a URL against SSRF targets (localhost, link-local, private ranges, cloud metadata).
+ * Checks whether an IP address belongs to loopback, private, link-local, or reserved ranges.
+ */
+export function isPrivateOrBlockedIp(ipStr: string): boolean {
+  const ip = ipStr.trim().toLowerCase();
+
+  // IPv4 mapped IPv6 (e.g. ::ffff:127.0.0.1)
+  if (ip.startsWith('::ffff:')) {
+    const rawV4 = ip.slice(7);
+    if (net.isIPv4(rawV4)) {
+      return isPrivateOrBlockedIp(rawV4);
+    }
+  }
+
+  if (net.isIPv4(ip)) {
+    const parts = ip.split('.').map(Number);
+    if (parts.length !== 4 || parts.some(n => isNaN(n) || n < 0 || n > 255)) {
+      return true; // Malformed IPv4
+    }
+    const [b0, b1, b2, b3] = parts;
+
+    // 0.0.0.0/8 (Current network)
+    if (b0 === 0) return true;
+    // 10.0.0.0/8 (Private)
+    if (b0 === 10) return true;
+    // 127.0.0.0/8 (Loopback)
+    if (b0 === 127) return true;
+    // 100.64.0.0/10 (Carrier grade NAT)
+    if (b0 === 100 && b1 >= 64 && b1 <= 127) return true;
+    // 169.254.0.0/16 (Link local / Cloud metadata)
+    if (b0 === 169 && b1 === 254) return true;
+    // 172.16.0.0/12 (Private)
+    if (b0 === 172 && b1 >= 16 && b1 <= 31) return true;
+    // 192.0.0.0/24 (IETF Protocol Assignments)
+    if (b0 === 192 && b1 === 0 && b2 === 0) return true;
+    // 192.0.2.0/24 (TEST-NET-1)
+    if (b0 === 192 && b1 === 0 && b2 === 2) return true;
+    // 192.168.0.0/16 (Private)
+    if (b0 === 192 && b1 === 168) return true;
+    // 198.51.100.0/24 (TEST-NET-2)
+    if (b0 === 198 && b1 === 51 && b2 === 100) return true;
+    // 203.0.113.0/24 (TEST-NET-3)
+    if (b0 === 203 && b1 === 0 && b2 === 113) return true;
+    // 224.0.0.0/4 (Multicast)
+    if (b0 >= 224 && b0 <= 239) return true;
+    // 240.0.0.0/4 (Reserved)
+    if (b0 >= 240) return true;
+    // 255.255.255.255 (Broadcast)
+    if (b0 === 255 && b1 === 255 && b2 === 255 && b3 === 255) return true;
+
+    return false;
+  }
+
+  if (net.isIPv6(ip)) {
+    // ::1 (Loopback)
+    if (ip === '::1' || ip === '0:0:0:0:0:0:0:1') return true;
+    // :: (Unspecified)
+    if (ip === '::' || ip === '0:0:0:0:0:0:0:0') return true;
+    // Unique local: fc00::/7 (starts with fc or fd)
+    if (/^f[cd][0-9a-f]{2}:/i.test(ip) || ip.startsWith('fc') || ip.startsWith('fd')) return true;
+    // Link-local: fe80::/10 (fe80 through febf)
+    if (/^fe[89ab][0-9a-f]:/i.test(ip) || ip.startsWith('fe80:')) return true;
+    // Multicast: ff00::/8
+    if (ip.startsWith('ff')) return true;
+
+    return false;
+  }
+
+  return false;
+}
+
+/**
+ * Audits a URL against static SSRF targets (localhost, link-local, private ranges, cloud metadata).
  */
 export function isSsrfSafeUrl(rawUrl: string): { safe: boolean; reason?: string } {
   let parsed: URL;
@@ -116,24 +251,58 @@ export function isSsrfSafeUrl(rawUrl: string): { safe: boolean; reason?: string 
     return { safe: false, reason: 'SSRF Protection: Requests to cloud metadata endpoints are strictly blocked.' };
   }
 
-  // Private IPv4 ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16)
-  const ipv4Match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
-  if (ipv4Match) {
-    const octets = ipv4Match.slice(1, 5).map(Number);
-    const [o1, o2] = octets;
+  // Direct IP checks
+  if (net.isIP(hostname) && isPrivateOrBlockedIp(hostname)) {
+    return { safe: false, reason: `SSRF Protection: Requests to private/reserved IP "${hostname}" are blocked.` };
+  }
 
-    if (o1 === 10) {
-      return { safe: false, reason: 'SSRF Protection: Requests to private IP range 10.0.0.0/8 are blocked.' };
+  return { safe: true };
+}
+
+/**
+ * Validates a URL against SSRF, resolving DNS to check actual destination IP addresses.
+ */
+export async function validateSsrfSafeUrl(rawUrl: string): Promise<{ safe: boolean; reason?: string }> {
+  // 1. Static validation
+  const staticCheck = isSsrfSafeUrl(rawUrl);
+  if (!staticCheck.safe) {
+    return staticCheck;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return { safe: false, reason: 'Malformed URL' };
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+
+  // 2. Direct IP check
+  if (net.isIP(hostname)) {
+    if (isPrivateOrBlockedIp(hostname)) {
+      return { safe: false, reason: `SSRF Protection: Direct access to private/reserved IP "${hostname}" is blocked.` };
     }
-    if (o1 === 172 && o2 >= 16 && o2 <= 31) {
-      return { safe: false, reason: 'SSRF Protection: Requests to private IP range 172.16.0.0/12 are blocked.' };
+    return { safe: true };
+  }
+
+  // 3. DNS Resolution check (resolves all A and AAAA records)
+  try {
+    const records = await dns.lookup(hostname, { all: true });
+    if (!records || records.length === 0) {
+      return { safe: false, reason: `DNS resolution failed for hostname "${hostname}".` };
     }
-    if (o1 === 192 && o2 === 168) {
-      return { safe: false, reason: 'SSRF Protection: Requests to private IP range 192.168.0.0/16 are blocked.' };
+
+    for (const record of records) {
+      if (isPrivateOrBlockedIp(record.address)) {
+        return {
+          safe: false,
+          reason: `SSRF Protection: Hostname "${hostname}" resolves to blocked IP address (${record.address}).`
+        };
+      }
     }
-    if (o1 === 169 && o2 === 254) {
-      return { safe: false, reason: 'SSRF Protection: Requests to link-local IP range 169.254.0.0/16 are blocked.' };
-    }
+  } catch (err: any) {
+    return { safe: false, reason: `DNS lookup failed for "${hostname}": ${err.message}` };
   }
 
   return { safe: true };

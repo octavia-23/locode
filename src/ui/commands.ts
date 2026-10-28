@@ -261,7 +261,8 @@ export async function handleSlashCommand(
           ...ctx,
           provider: requested,
           model: target.defaultModel,
-          apiKey: targetApiKey || ctx.apiKey,
+          apiKey: targetApiKey,
+          apiBase: undefined,
           numCtx: newNumCtx
         };
 
@@ -270,7 +271,8 @@ export async function handleSlashCommand(
         agent.setContext({
           provider: requested,
           model: target.defaultModel,
-          apiKey: targetApiKey || ctx.apiKey,
+          apiKey: targetApiKey,
+          apiBase: undefined,
           numCtx: newNumCtx
         });
 

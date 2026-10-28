@@ -28,6 +28,7 @@ export class PermissionEngine {
 
   /**
    * Evaluates permissions before any tool execution can begin.
+   * Fails closed whenever required approvals or security checks are unavailable.
    */
   evaluate(
     tool: ToolDefinition,
@@ -38,6 +39,9 @@ export class PermissionEngine {
     const isAutoApprove = options?.autoApprove ?? this.policy.autoApprove ?? context.autoApprove ?? false;
     const allowOutside = options?.allowOutsideWorkspace ?? this.policy.allowOutsideWorkspace ?? false;
     const allowNetwork = options?.allowNetwork ?? this.policy.allowNetwork ?? true;
+    const isApprovalAvailable = options?.approvalAvailable !== false &&
+                                options?.interactive !== false &&
+                                context.interactive !== false;
 
     // 1. Read-only policy enforcement
     if (this.policy.readOnly) {
@@ -77,16 +81,38 @@ export class PermissionEngine {
       }
     }
 
-    // 4. Filesystem path validation
-    const pathArg = args.path || (Array.isArray(args.paths) ? args.paths[0] : undefined);
-    if (pathArg && (tool.name === 'view_file' || tool.name === 'write_file' || tool.name === 'edit_file' || tool.name === 'list_dir')) {
-      try {
-        resolveSafePath(String(pathArg), context.cwd, allowOutside);
-      } catch (err: any) {
-        return {
-          allowed: false,
-          reason: err.message || `Path "${pathArg}" violates workspace containment.`
-        };
+    // 4. Filesystem path validation & containment
+    const isMutatingFileTool = tool.name === 'write_file' || tool.name === 'edit_file';
+    // Mutating file tools NEVER allow writing outside workspace
+    const effectiveAllowOutside = isMutatingFileTool ? false : allowOutside;
+
+    const pathsToCheck: string[] = [];
+    if (typeof args.path === 'string') {
+      pathsToCheck.push(args.path);
+    }
+    if (Array.isArray(args.paths)) {
+      for (const p of args.paths) {
+        if (typeof p === 'string') pathsToCheck.push(p);
+      }
+    }
+
+    const isPathSensitiveTool = tool.name === 'view_file' ||
+                                tool.name === 'batch_read_files' ||
+                                tool.name === 'write_file' ||
+                                tool.name === 'edit_file' ||
+                                tool.name === 'list_dir' ||
+                                tool.name === 'search_code';
+
+    if (isPathSensitiveTool && pathsToCheck.length > 0) {
+      for (const p of pathsToCheck) {
+        try {
+          resolveSafePath(p, context.cwd, effectiveAllowOutside);
+        } catch (err: any) {
+          return {
+            allowed: false,
+            reason: err.message || `Path "${p}" violates workspace containment.`
+          };
+        }
       }
     }
 
@@ -96,6 +122,13 @@ export class PermissionEngine {
       const dangerousCheck = isDangerousCommand(cmd);
       if (dangerousCheck.dangerous) {
         if (!isAutoApprove) {
+          if (!isApprovalAvailable) {
+            return {
+              allowed: false,
+              requiresPrompt: false,
+              reason: `Permission Denied: Dangerous command requires approval, but approval is unavailable: ${dangerousCheck.reason}`
+            };
+          }
           return {
             allowed: true,
             requiresPrompt: true,
@@ -105,12 +138,19 @@ export class PermissionEngine {
       }
     }
 
-    // 6. Interactive approval evaluation
+    // 6. Interactive approval evaluation (Fail-closed when approval is required but unavailable)
     const needsApproval = typeof tool.needsApproval === 'function'
       ? tool.needsApproval(args)
       : tool.needsApproval;
 
     if (needsApproval && !isAutoApprove) {
+      if (!isApprovalAvailable) {
+        return {
+          allowed: false,
+          requiresPrompt: false,
+          reason: `Permission Denied: Tool "${tool.name}" requires user approval, but approval is unavailable (non-interactive context).`
+        };
+      }
       return {
         allowed: true,
         requiresPrompt: true,

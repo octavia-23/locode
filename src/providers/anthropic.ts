@@ -1,5 +1,6 @@
 import { ChatMessage, ToolDefinition } from '../types.js';
 import { ILLMProvider, ChatProviderResponse, ChatOptions, ModelCapabilities } from './types.js';
+import { redactSecrets } from '../utils/secret-redactor.js';
 
 export class AnthropicProvider implements ILLMProvider {
   private model: string;
@@ -84,12 +85,12 @@ export class AnthropicProvider implements ILLMProvider {
 
     for (const msg of messages) {
       if (msg.role === 'system') {
-        if (msg.content) systemParts.push(msg.content);
+        if (msg.content) systemParts.push(redactSecrets(msg.content));
         continue;
       }
 
       if (msg.role === 'user') {
-        const userContent = msg.content || '';
+        const userContent = redactSecrets(msg.content || '');
         const prev = anthropicMessages[anthropicMessages.length - 1];
         if (prev && prev.role === 'user') {
           // Merge consecutive user turns
@@ -107,7 +108,7 @@ export class AnthropicProvider implements ILLMProvider {
       } else if (msg.role === 'assistant') {
         const contentParts: any[] = [];
         if (msg.content) {
-          contentParts.push({ type: 'text', text: msg.content });
+          contentParts.push({ type: 'text', text: redactSecrets(msg.content) });
         }
         if (msg.tool_calls && msg.tool_calls.length > 0) {
           for (let i = 0; i < msg.tool_calls.length; i++) {
@@ -152,7 +153,7 @@ export class AnthropicProvider implements ILLMProvider {
         const toolResultBlock = {
           type: 'tool_result',
           tool_use_id: msg.tool_call_id || 'unknown',
-          content: msg.content || ''
+          content: redactSecrets(msg.content || '')
         };
 
         const prev = anthropicMessages[anthropicMessages.length - 1];

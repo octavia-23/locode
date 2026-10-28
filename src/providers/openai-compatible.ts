@@ -1,5 +1,6 @@
 import { ChatMessage, ToolDefinition } from '../types.js';
 import { ILLMProvider, ChatProviderResponse, ChatOptions, ModelCapabilities } from './types.js';
+import { redactSecrets } from '../utils/secret-redactor.js';
 
 export class OpenAICompatibleProvider implements ILLMProvider {
   private model: string;
@@ -111,7 +112,7 @@ export class OpenAICompatibleProvider implements ILLMProvider {
     }));
 
     const formattedMessages = messages.map(m => {
-      const msg: any = { role: m.role, content: m.content };
+      const msg: any = { role: m.role, content: typeof m.content === 'string' ? redactSecrets(m.content) : m.content };
       if (m.tool_calls) msg.tool_calls = m.tool_calls;
       if (m.name) msg.name = m.name;
       if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;

@@ -21,6 +21,33 @@ for (const tool of allTools) {
   toolRegistry.set(tool.name, tool);
 }
 
+export function registerDynamicTool(tool: ToolDefinition): void {
+  toolRegistry.set(tool.name, tool);
+  if (!allTools.some(t => t.name === tool.name)) {
+    allTools.push(tool);
+  }
+}
+
+export function unregisterDynamicTool(toolName: string): void {
+  toolRegistry.delete(toolName);
+  const idx = allTools.findIndex(t => t.name === toolName);
+  if (idx !== -1) {
+    allTools.splice(idx, 1);
+  }
+}
+
+export function unregisterDynamicTools(toolNames: string[]): void {
+  const set = new Set(toolNames);
+  for (const name of toolNames) {
+    toolRegistry.delete(name);
+  }
+  for (let i = allTools.length - 1; i >= 0; i--) {
+    if (set.has(allTools[i].name)) {
+      allTools.splice(i, 1);
+    }
+  }
+}
+
 export function getOllamaTools() {
   return allTools.map(tool => ({
     type: 'function' as const,

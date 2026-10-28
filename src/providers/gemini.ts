@@ -1,5 +1,6 @@
 import { ChatMessage, ToolDefinition } from '../types.js';
 import { ILLMProvider, ChatProviderResponse, ChatOptions, ModelCapabilities } from './types.js';
+import { redactSecrets } from '../utils/secret-redactor.js';
 
 export interface GeminiPart {
   text?: string;
@@ -200,12 +201,12 @@ export class GeminiProvider implements ILLMProvider {
 
     for (const msg of messages) {
       if (msg.role === 'system') {
-        if (msg.content) systemParts.push(msg.content);
+        if (msg.content) systemParts.push(redactSecrets(msg.content));
         continue;
       }
 
       if (msg.role === 'user') {
-        const parts: GeminiPart[] = [{ text: msg.content || '' }];
+        const parts: GeminiPart[] = [{ text: redactSecrets(msg.content || '') }];
         // Merge with previous turn if it was also 'user' to maintain strict alternating invariant
         const lastContent = contents[contents.length - 1];
         if (lastContent && lastContent.role === 'user') {
@@ -216,7 +217,7 @@ export class GeminiProvider implements ILLMProvider {
       } else if (msg.role === 'assistant') {
         const parts: GeminiPart[] = [];
         if (msg.content) {
-          parts.push({ text: msg.content });
+          parts.push({ text: redactSecrets(msg.content) });
         }
         if (msg.tool_calls && msg.tool_calls.length > 0) {
           for (const tc of msg.tool_calls) {
@@ -253,10 +254,11 @@ export class GeminiProvider implements ILLMProvider {
       } else if (msg.role === 'tool') {
         // Tool results in Gemini are functionResponse parts on a user turn
         let parsed: any;
+        const cleanContent = redactSecrets(msg.content || '');
         try {
-          parsed = JSON.parse(msg.content);
+          parsed = JSON.parse(cleanContent);
         } catch {
-          parsed = { result: msg.content };
+          parsed = { result: cleanContent };
         }
         if (typeof parsed !== 'object' || parsed === null) {
           parsed = { result: parsed };

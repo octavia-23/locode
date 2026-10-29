@@ -31,7 +31,7 @@ export function loadEnvironmentVariables(cwd: string): void {
   }
 
   // Clean empty-string values (e.g. KEY="" in .env shouldn't count as a defined key)
-  for (const key of ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'GROQ_API_KEY']) {
+  for (const key of ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'GROQ_API_KEY', 'NVIDIA_API_KEY', 'NVAPI_KEY']) {
     if (process.env[key] !== undefined && process.env[key]!.trim() === '') {
       delete process.env[key];
     }
@@ -48,6 +48,9 @@ export function getEnvKeyNameForProvider(provider: string): string {
       return 'OPENROUTER_API_KEY';
     case 'groq':
       return 'GROQ_API_KEY';
+    case 'nim':
+    case 'nvidia':
+      return 'NVIDIA_API_KEY';
     case 'openai':
     default:
       return 'OPENAI_API_KEY';
@@ -68,6 +71,9 @@ export function getApiKeyForProvider(provider: string, explicitKey?: string): st
       return (process.env.OPENROUTER_API_KEY || '').trim() || undefined;
     case 'groq':
       return (process.env.GROQ_API_KEY || '').trim() || undefined;
+    case 'nim':
+    case 'nvidia':
+      return (process.env.NVIDIA_API_KEY || process.env.NVAPI_KEY || '').trim() || undefined;
     case 'openai':
       return (process.env.OPENAI_API_KEY || '').trim() || undefined;
     default:

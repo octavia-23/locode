@@ -12,6 +12,8 @@ test('Provider Factory - isCloudProvider identifies cloud vs local runtimes accu
   assert.equal(isCloudProvider('openai'), true);
   assert.equal(isCloudProvider('openrouter'), true);
   assert.equal(isCloudProvider('groq'), true);
+  assert.equal(isCloudProvider('nim'), true);
+  assert.equal(isCloudProvider('nvidia'), true);
   assert.equal(isCloudProvider('llamacpp'), false);
   assert.equal(isCloudProvider('ollama'), false);
   assert.equal(isCloudProvider('lmstudio'), false);
@@ -25,12 +27,16 @@ test('Provider Factory - resolveProvider auto-detects based on model name', () =
   delete process.env.GOOGLE_API_KEY;
   delete process.env.OPENAI_API_KEY;
   delete process.env.OPENROUTER_API_KEY;
+  delete process.env.NVIDIA_API_KEY;
+  delete process.env.NVAPI_KEY;
 
   try {
     assert.equal(resolveProvider({ model: 'gemini-2.0-flash' }), 'gemini');
     assert.equal(resolveProvider({ model: 'gemini-1.5-pro' }), 'gemini');
     assert.equal(resolveProvider({ model: 'claude-3-5-sonnet-20241022' }), 'anthropic');
     assert.equal(resolveProvider({ model: 'claude-3-haiku' }), 'anthropic');
+    assert.equal(resolveProvider({ model: 'nvidia/llama-3.1-nemotron-70b-instruct' }), 'nim');
+    assert.equal(resolveProvider({ model: 'nim/deepseek-r1' }), 'nim');
     assert.equal(resolveProvider({ model: 'gpt-4o' }), 'openai');
     assert.equal(resolveProvider({ model: 'o3-mini' }), 'openai');
     assert.equal(resolveProvider({ model: 'anthropic/claude-3.5-sonnet' }), 'openrouter');
@@ -72,6 +78,10 @@ test('Provider Factory - resolveProvider detects environment variables', () => {
     assert.equal(resolveProvider({}), 'openrouter');
 
     delete process.env.OPENROUTER_API_KEY;
+    process.env.NVIDIA_API_KEY = 'nvapi-test-key';
+    assert.equal(resolveProvider({}), 'nim');
+
+    delete process.env.NVIDIA_API_KEY;
     process.env.OPENAI_API_KEY = 'sk-test-key';
     assert.equal(resolveProvider({}), 'openai');
   } finally {
@@ -122,6 +132,29 @@ test('Provider Factory - createLLMProvider instantiates appropriate provider cla
   });
   assert.ok(openrouter instanceof OpenAICompatibleProvider);
 
+  const nim = createLLMProvider({
+    cwd: process.cwd(),
+    autoApprove: true,
+    ollamaHost: 'http://127.0.0.1:11434',
+    provider: 'nim',
+    apiKey: 'nvapi-dummy-key'
+  });
+  assert.ok(nim instanceof OpenAICompatibleProvider);
+  assert.equal(nim.getModel(), 'meta/llama-3.3-70b-instruct');
+  assert.equal((nim as any).apiBase, 'https://integrate.api.nvidia.com/v1');
+
+  const nvidiaLocal = createLLMProvider({
+    cwd: process.cwd(),
+    autoApprove: true,
+    model: 'deepseek-ai/deepseek-r1',
+    ollamaHost: 'http://127.0.0.1:11434',
+    provider: 'nvidia',
+    apiBase: 'http://localhost:8000/v1'
+  });
+  assert.ok(nvidiaLocal instanceof OpenAICompatibleProvider);
+  assert.equal(nvidiaLocal.getModel(), 'deepseek-ai/deepseek-r1');
+  assert.equal((nvidiaLocal as any).apiBase, 'http://localhost:8000/v1');
+
   const ollama = createLLMProvider({
     cwd: process.cwd(),
     autoApprove: true,
@@ -130,4 +163,28 @@ test('Provider Factory - createLLMProvider instantiates appropriate provider cla
     provider: 'ollama'
   });
   assert.ok(ollama instanceof OllamaProvider);
+});
+
+test('Provider Factory - getApiKeyForProvider & getEnvKeyNameForProvider support NVIDIA NIM', async () => {
+  const { getApiKeyForProvider, getEnvKeyNameForProvider } = await import('../src/utils/config.js');
+  const origEnv = { ...process.env };
+  try {
+    delete process.env.NVIDIA_API_KEY;
+    delete process.env.NVAPI_KEY;
+
+    assert.equal(getEnvKeyNameForProvider('nim'), 'NVIDIA_API_KEY');
+    assert.equal(getEnvKeyNameForProvider('nvidia'), 'NVIDIA_API_KEY');
+    assert.equal(getApiKeyForProvider('nim'), undefined);
+
+    process.env.NVIDIA_API_KEY = 'nvapi-key-123';
+    assert.equal(getApiKeyForProvider('nim'), 'nvapi-key-123');
+    assert.equal(getApiKeyForProvider('nvidia'), 'nvapi-key-123');
+
+    delete process.env.NVIDIA_API_KEY;
+    process.env.NVAPI_KEY = 'nvapi-alt-456';
+    assert.equal(getApiKeyForProvider('nim'), 'nvapi-alt-456');
+    assert.equal(getApiKeyForProvider('nvidia'), 'nvapi-alt-456');
+  } finally {
+    process.env = origEnv;
+  }
 });

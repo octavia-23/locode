@@ -24,7 +24,9 @@ export function isCloudProvider(provider?: string): boolean {
     provider === 'anthropic' ||
     provider === 'openai' ||
     provider === 'openrouter' ||
-    provider === 'groq'
+    provider === 'groq' ||
+    provider === 'nim' ||
+    provider === 'nvidia'
   );
 }
 
@@ -40,6 +42,13 @@ export function resolveProvider(context?: Partial<AgentContext>): ProviderType {
   }
   if (model.startsWith('claude')) {
     return 'anthropic';
+  }
+  if (
+    model.startsWith('nvidia/') ||
+    model.startsWith('nim/') ||
+    model.includes('nemotron')
+  ) {
+    return 'nim';
   }
   if (
     model.startsWith('gpt-') ||
@@ -69,6 +78,9 @@ export function resolveProvider(context?: Partial<AgentContext>): ProviderType {
   }
   if (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) {
     return 'gemini';
+  }
+  if (process.env.NVIDIA_API_KEY || process.env.NVAPI_KEY) {
+    return 'nim';
   }
   if (process.env.GROQ_API_KEY) {
     return 'groq';
@@ -150,6 +162,25 @@ export function createLLMProvider(context: AgentContext): ILLMProvider {
     const validExplicitBase = context.apiBase && context.apiBase.includes('groq')
       ? context.apiBase
       : 'https://api.groq.com/openai/v1';
+    const numCtx = context.numCtx || 131072;
+    return new OpenAICompatibleProvider(model, validExplicitBase, apiKey, numCtx, {
+      'User-Agent': 'Locode/0.1.0'
+    });
+  }
+
+  if (provider === 'nim' || provider === 'nvidia') {
+    const model = context.model || 'meta/llama-3.3-70b-instruct';
+    const validExplicitKey = context.apiKey && !context.apiKey.startsWith('AIza') && !context.apiKey.startsWith('sk-ant-') && !context.apiKey.startsWith('gsk_')
+      ? context.apiKey
+      : undefined;
+    const apiKey = validExplicitKey || process.env.NVIDIA_API_KEY || process.env.NVAPI_KEY || 'not-needed';
+    const validExplicitBase = context.apiBase &&
+      !context.apiBase.includes('anthropic.com') &&
+      !context.apiBase.includes('googleapis.com') &&
+      !context.apiBase.includes('groq.com') &&
+      !context.apiBase.includes('openrouter.ai')
+      ? context.apiBase
+      : 'https://integrate.api.nvidia.com/v1';
     const numCtx = context.numCtx || 131072;
     return new OpenAICompatibleProvider(model, validExplicitBase, apiKey, numCtx, {
       'User-Agent': 'Locode/0.1.0'

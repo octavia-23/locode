@@ -55,7 +55,9 @@ export type ProviderType =
   | 'gemini'
   | 'anthropic'
   | 'openrouter'
-  | 'groq';
+  | 'groq'
+  | 'nim'
+  | 'nvidia';
 
 export interface AgentContext {
   cwd: string;

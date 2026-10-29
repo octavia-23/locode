@@ -225,6 +225,7 @@ export async function handleSlashCommand(
         { name: 'openai', defaultModel: 'gpt-4o', type: 'cloud' },
         { name: 'openrouter', defaultModel: 'anthropic/claude-3.5-sonnet', type: 'cloud' },
         { name: 'groq', defaultModel: 'qwen/qwen3.8-27b', type: 'cloud' },
+        { name: 'nim', defaultModel: 'meta/llama-3.3-70b-instruct', type: 'cloud' },
         { name: 'llamacpp', defaultModel: 'qwen2.5-coder:7b', type: 'local' },
         { name: 'ollama', defaultModel: 'qwen2.5-coder:7b', type: 'local' }
       ];
@@ -256,7 +257,7 @@ export async function handleSlashCommand(
         let newNumCtx = 8192;
         if (requested === 'gemini') newNumCtx = 1048576;
         else if (requested === 'anthropic') newNumCtx = 200000;
-        else if (requested === 'groq') newNumCtx = 131072;
+        else if (requested === 'groq' || requested === 'nim' || requested === 'nvidia') newNumCtx = 131072;
         else if (requested === 'openai' || requested === 'openrouter') newNumCtx = 128000;
         else if (requested === 'llamacpp') newNumCtx = 262144;
 

@@ -42,7 +42,7 @@ program
   .version('0.4.0')
   .argument('[prompt...]', 'Initial coding instruction to execute')
   .option('-m, --model <name>', 'Model to use (or alias for local TurboQuant model)')
-  .option('-p, --provider <type>', 'Provider: gemini | anthropic | openai | openrouter | groq | llamacpp | ollama | lmstudio | vllm')
+  .option('-p, --provider <type>', 'Provider: gemini | anthropic | openai | openrouter | groq | nim | nvidia | llamacpp | ollama | lmstudio | vllm')
   .option('-c, --ctx <number_or_size>', 'Context window size (e.g. 32k, 64k, 128k, 262k)')
   .option('--profile <name>', 'Inference profile: ultra-context | performance | large-context | balanced')
   .option('--model-path <path>', 'Absolute path to local .gguf model file')
@@ -134,7 +134,7 @@ async function main() {
     numCtx = 1048576;
   } else if (chosenProvider === 'anthropic') {
     numCtx = 200000;
-  } else if (chosenProvider === 'groq') {
+  } else if (chosenProvider === 'groq' || chosenProvider === 'nim' || chosenProvider === 'nvidia') {
     numCtx = 131072;
   } else if (chosenProvider === 'openai' || chosenProvider === 'openrouter') {
     numCtx = 128000;
@@ -155,6 +155,8 @@ async function main() {
       modelName = 'anthropic/claude-3.5-sonnet';
     } else if (chosenProvider === 'groq') {
       modelName = 'qwen/qwen3.8-27b';
+    } else if (chosenProvider === 'nim' || chosenProvider === 'nvidia') {
+      modelName = 'meta/llama-3.3-70b-instruct';
     } else if (chosenProvider === 'openai') {
       modelName = 'gpt-4o';
     } else if (chosenProvider === 'llamacpp') {

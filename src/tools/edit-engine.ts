@@ -271,10 +271,18 @@ export class MultiStrategyEditEngine {
     if (!patchCandidate) return { handled: false };
 
     try {
-      // Ensure patch headers if missing
+      // Ensure patch headers if missing and strip optional git diff preamble
       let fullPatch = patchCandidate;
-      if (!fullPatch.startsWith('---')) {
-        fullPatch = `--- a/file\n+++ b/file\n` + fullPatch;
+      const atAtIdx = fullPatch.indexOf('@@');
+      const headerPart = atAtIdx !== -1 ? fullPatch.slice(0, atAtIdx) : fullPatch;
+      if (!headerPart.includes('--- ')) {
+        const hunkPart = atAtIdx !== -1 ? fullPatch.slice(atAtIdx) : fullPatch;
+        fullPatch = `--- a/file\n+++ b/file\n` + hunkPart;
+      } else {
+        const dashDashIdx = fullPatch.indexOf('--- ');
+        if (dashDashIdx > 0) {
+          fullPatch = fullPatch.slice(dashDashIdx);
+        }
       }
 
       const patched = applyPatch(file, fullPatch);
@@ -361,15 +369,16 @@ export class MultiStrategyEditEngine {
     if (targetLines.length === 0 || fileLines.length === 0) return null;
 
     const windowSize = Math.max(1, targetLines.length);
+    const effectiveWindow = Math.max(1, Math.min(windowSize, fileLines.length));
     let bestScore = -1;
     let bestStart = 0;
-    let bestEnd = Math.min(fileLines.length, windowSize);
+    let bestEnd = effectiveWindow;
 
     const targetWords = new Set(target.toLowerCase().match(/\b[a-zA-Z0-9_$]{2,}\b/g) || []);
     if (targetWords.size === 0) return null;
 
-    for (let i = 0; i <= fileLines.length - windowSize; i++) {
-      const windowSlice = fileLines.slice(i, i + windowSize);
+    for (let i = 0; i <= fileLines.length - effectiveWindow; i++) {
+      const windowSlice = fileLines.slice(i, i + effectiveWindow);
       const windowText = windowSlice.join(' ').toLowerCase();
       
       let matches = 0;
@@ -381,7 +390,7 @@ export class MultiStrategyEditEngine {
       if (score > bestScore) {
         bestScore = score;
         bestStart = i;
-        bestEnd = i + windowSize;
+        bestEnd = i + effectiveWindow;
       }
     }
 

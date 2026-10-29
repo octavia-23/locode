@@ -216,10 +216,16 @@ export class CodeVerifier {
           return {
             status: 'failed',
             passed: false,
-            command: `python -m py_compile ${targetFile}`,
+            command: `python -m py_compile ${JSON.stringify(targetFile)}`,
             errorOutput: this.sanitizeErrorOutput(combined)
           };
         }
+        return {
+          status: 'passed',
+          passed: true,
+          command: `python -m py_compile ${JSON.stringify(targetFile)}`,
+          output: res.stdout.trim()
+        };
       } catch {}
     }
 

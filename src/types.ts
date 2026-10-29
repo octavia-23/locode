@@ -79,4 +79,5 @@ export interface AgentContext {
   commandTimeoutMs?: number;
   signal?: AbortSignal;
   onCommandProgress?: (progress: { elapsedMs: number; lastOutput?: string }) => void;
+  journal?: any;
 }

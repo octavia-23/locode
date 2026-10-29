@@ -1,4 +1,5 @@
 import { AgentContext } from '../../types.js';
+import { ExecutionJournal } from '../../journal/journal.js';
 
 export type SubagentRole = 'explorer' | 'architect' | 'verifier';
 
@@ -10,6 +11,7 @@ export interface SubagentSessionConfig {
   allowedTools?: string[];
   initialContext?: string;
   parentSessionId?: string;
+  journal?: ExecutionJournal;
 }
 
 export interface SubagentOutcome {

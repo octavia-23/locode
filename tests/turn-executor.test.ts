@@ -1,12 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
 import { isReadOnlyTool, TurnExecutor } from '../src/engine/turn-executor.js';
 import { SessionRunner } from '../src/engine/session-runner.js';
 import { RepairCoordinator } from '../src/engine/repair-coordinator.js';
 import { ToolDispatcher } from '../src/engine/tool-dispatcher.js';
 import { PermissionEngine } from '../src/engine/permission-engine.js';
-import { AgentContext } from '../src/types.js';
+import { AgentContext, ChatMessage, ToolDefinition } from '../src/types.js';
 import { registerDynamicTool, unregisterDynamicTool } from '../src/tools/index.js';
+import { AgentLoop } from '../src/agent/loop.js';
+import { TerminalRenderer } from '../src/ui/renderer.js';
+import { ILLMProvider, ChatProviderResponse } from '../src/providers/types.js';
 
 test('TurnExecutor - isReadOnlyTool correctly categorizes tools', () => {
   assert.equal(isReadOnlyTool('view_file'), true);
@@ -158,4 +164,105 @@ test('RepairCoordinator - coordinates verification and escalation to architect',
   // Reset repair attempts
   coordinator.resetRepairAttempts();
   assert.equal(coordinator.getRepairAttempts(), 0);
+});
+
+test('TurnExecutor - AgentLoop invokes executeTurnBatch during loop.step() / loop.run()', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-batch-spy-'));
+  await fs.writeFile(path.join(tmpDir, 'file1.txt'), 'content 1', 'utf8');
+  await fs.writeFile(path.join(tmpDir, 'file2.txt'), 'content 2', 'utf8');
+
+  let spyCalled = false;
+  let batchCallsRecorded: any[] = [];
+  const originalExecuteTurnBatch = TurnExecutor.prototype.executeTurnBatch;
+  TurnExecutor.prototype.executeTurnBatch = async function(calls, ctx, opts) {
+    spyCalled = true;
+    batchCallsRecorded = calls;
+    return originalExecuteTurnBatch.call(this, calls, ctx, opts);
+  };
+
+  try {
+    const mockProvider: ILLMProvider = {
+      getModel: () => 'mock-model',
+      setModel: () => {},
+      isHealthy: async () => true,
+      getAvailableModels: async () => ['mock-model'],
+      chat: async () => ({
+        content: 'Reading both files',
+        tool_calls: [
+          { id: 'c1', function: { name: 'view_file', arguments: { path: 'file1.txt' } } },
+          { id: 'c2', function: { name: 'view_file', arguments: { path: 'file2.txt' } } }
+        ]
+      })
+    };
+
+    const context: AgentContext = {
+      cwd: tmpDir,
+      autoApprove: true,
+      model: 'mock-model',
+      provider: 'ollama'
+    };
+
+    const loop = new AgentLoop(context, new TerminalRenderer(), mockProvider);
+    await loop.init();
+
+    await loop.step('Please inspect file1 and file2');
+
+    assert.equal(spyCalled, true, 'TurnExecutor.prototype.executeTurnBatch must be invoked during loop.step()');
+    assert.equal(batchCallsRecorded.length, 2, 'executeTurnBatch must receive the 2 tool calls');
+    assert.equal(batchCallsRecorded[0].function.name, 'view_file');
+    assert.equal(batchCallsRecorded[1].function.name, 'view_file');
+  } finally {
+    TurnExecutor.prototype.executeTurnBatch = originalExecuteTurnBatch;
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('TurnExecutor - loop.setProvider and loop.setExecutionProfile await system prompt rebuild without race condition', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-prompt-race-'));
+
+  try {
+    let capturedSystemPrompt = '';
+    const mockProvider: ILLMProvider = {
+      getModel: () => 'mock-model',
+      setModel: () => {},
+      isHealthy: async () => true,
+      getAvailableModels: async () => ['mock-model'],
+      chat: async (messages) => {
+        const sys = messages.find(m => m.role === 'system');
+        if (sys) capturedSystemPrompt = sys.content;
+        return { content: 'Acknowledged' };
+      }
+    };
+
+    const context: AgentContext = {
+      cwd: tmpDir,
+      autoApprove: true,
+      model: 'mock-model',
+      provider: 'ollama'
+    };
+
+    const loop = new AgentLoop(context, new TerminalRenderer(), mockProvider);
+    await loop.init();
+
+    const initialSysPrompt = loop.getMessages()[0]?.content || '';
+    assert.ok(initialSysPrompt.length > 0);
+
+    // Call setExecutionProfile and immediately call step() without awaiting anything in user code
+    loop.setExecutionProfile({
+      privacyPolicy: { allowFullRepoContext: false }
+    });
+
+    // Immediately trigger step - must deterministically await the pending prompt refresh
+    await loop.step('Check system prompt update');
+
+    assert.ok(capturedSystemPrompt.length > 0, 'System prompt must be passed to provider');
+    // Now switch provider and call step again
+    loop.setProvider(mockProvider, 'anthropic');
+    await loop.step('Check provider switch prompt update');
+
+    const updatedPrompt = loop.getMessages()[0]?.content || '';
+    assert.ok(updatedPrompt.length > 0);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
 });

@@ -214,6 +214,16 @@ export class RepoMapGenerator {
       }
     }
 
+    // Normalize personalization teleport vector to strictly sum to 1.0
+    const teleportSum = teleport.reduce((a, b) => a + b, 0);
+    if (teleportSum <= 0 || !Number.isFinite(teleportSum)) {
+      teleport.fill(1 / n);
+    } else {
+      for (let i = 0; i < n; i++) {
+        teleport[i] /= teleportSum;
+      }
+    }
+
     // 20 iterations guarantee convergence on DAGs and small graphs
     for (let iter = 0; iter < 20; iter++) {
       const nextRanks = new Array<number>(n).fill(0);

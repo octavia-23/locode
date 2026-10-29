@@ -75,7 +75,10 @@ test('SubagentRunner - strictly enforces step budget and halts cleanly', async (
     setModel: () => {},
     isHealthy: async () => true,
     getAvailableModels: async () => ['mock-model'],
-    chat: async () => {
+    chat: async (messages, tools) => {
+      if (!tools || tools.length === 0) {
+        return { content: 'Final synthesis summary after reaching step limit.' };
+      }
       stepCounter++;
       // Continuously return tool calls to simulate an infinite search
       return {
@@ -239,4 +242,218 @@ test('ArchitectEngine - diagnoseWithSubagent produces isolated architect diagnos
   assert.equal(outcome.role, 'architect');
   assert.equal(outcome.success, true);
   assert.ok(outcome.summary.includes('Circular dependency'));
+});
+
+test('SubagentRunner - triggers final tool-free synthesis turn when hitting maxSteps and returns non-empty summary with discovered findings', async () => {
+  let synthesisTriggered = false;
+
+  const mockProvider: ILLMProvider = {
+    getModel: () => 'mock-model',
+    setModel: () => {},
+    isHealthy: async () => true,
+    getAvailableModels: async () => ['mock-model'],
+    chat: async (messages, tools) => {
+      // Final synthesis turn passes empty tools array
+      if (!tools || tools.length === 0) {
+        synthesisTriggered = true;
+        const lastMsg = messages[messages.length - 1];
+        assert.ok(lastMsg.content.includes('maximum tool step limit'));
+        return {
+          content: 'DISCOVERED FINDINGS:\n- Found auth handler in src/auth.ts\n- Found user schema in src/types.ts\nSUGGESTED ACTIONS:\n- Refactor auth middleware'
+        };
+      }
+
+      // Model keeps calling tools right up to maxSteps limit without stopping
+      return {
+        content: 'Inspecting files',
+        tool_calls: [
+          {
+            id: `call_${Date.now()}`,
+            type: 'function',
+            function: {
+              name: 'view_file',
+              arguments: JSON.stringify({ path: 'package.json' })
+            }
+          }
+        ]
+      };
+    }
+  };
+
+  const context: AgentContext = {
+    cwd: process.cwd(),
+    autoApprove: true,
+    model: 'mock-model',
+    ollamaHost: 'http://127.0.0.1:11434',
+    mode: 'worker'
+  };
+
+  const outcome = await SubagentRunner.run(
+    {
+      role: 'explorer',
+      objective: 'Inspect project structure up to max limit',
+      context,
+      maxSteps: 2
+    },
+    mockProvider
+  );
+
+  assert.equal(synthesisTriggered, true, 'Tool-free synthesis turn must be requested when step limit reached');
+  assert.ok(outcome.summary.length > 0, 'Summary must not be empty');
+  assert.ok(outcome.findings.some(f => f.includes('src/auth.ts')));
+  assert.ok(outcome.suggestedActions.some(a => a.includes('Refactor auth middleware')));
+});
+
+test('SubagentRunner - blocks path escaping context.cwd and invalid tool schema via PermissionEngine and SchemaValidator', async () => {
+  const rejectedToolOutputs: string[] = [];
+  let turn = 0;
+
+  const mockProvider: ILLMProvider = {
+    getModel: () => 'mock-model',
+    setModel: () => {},
+    isHealthy: async () => true,
+    getAvailableModels: async () => ['mock-model'],
+    chat: async (messages) => {
+      turn++;
+      const lastToolMsg = messages.filter(m => m.role === 'tool').pop();
+      if (lastToolMsg) {
+        rejectedToolOutputs.push(lastToolMsg.content);
+      }
+
+      if (turn === 1) {
+        // Attempt path escaping workspace cwd
+        return {
+          content: 'Reading /etc/passwd',
+          tool_calls: [
+            {
+              id: 'call-traversal',
+              type: 'function',
+              function: {
+                name: 'view_file',
+                arguments: JSON.stringify({ path: '../../etc/passwd' })
+              }
+            }
+          ]
+        };
+      }
+
+      if (turn === 2) {
+        // Attempt invalid schema: view_file requires path
+        return {
+          content: 'Calling view_file without required path',
+          tool_calls: [
+            {
+              id: 'call-invalid-schema',
+              type: 'function',
+              function: {
+                name: 'view_file',
+                arguments: JSON.stringify({})
+              }
+            }
+          ]
+        };
+      }
+
+      return {
+        content: 'DISCOVERED FINDINGS:\n- Security restrictions working properly\nSUGGESTED ACTIONS:\n- Continue'
+      };
+    }
+  };
+
+  const context: AgentContext = {
+    cwd: process.cwd(),
+    autoApprove: true,
+    model: 'mock-model',
+    ollamaHost: 'http://127.0.0.1:11434',
+    mode: 'worker'
+  };
+
+  const outcome = await SubagentRunner.run(
+    {
+      role: 'explorer',
+      objective: 'Verify permission and schema boundary enforcement',
+      context,
+      maxSteps: 4
+    },
+    mockProvider
+  );
+
+  assert.equal(outcome.success, true);
+  assert.ok(
+    rejectedToolOutputs.some(o => o.includes('resolves outside') || o.includes('workspace') || o.includes('Security Violation') || o.includes('Permission denied')),
+    'Must block path traversal via PermissionEngine'
+  );
+  assert.ok(
+    rejectedToolOutputs.some(o => o.includes('validation failed') || o.includes('path') || o.includes('required')),
+    'Must block invalid schema via ToolSchemaValidator'
+  );
+});
+
+test('SubagentRunner - halts remaining dependent tool calls in batch on fatal error and marks them skipped', async () => {
+  let tool2Executed = false;
+  let tool2SkippedMessageSeen = false;
+
+  const mockProvider: ILLMProvider = {
+    getModel: () => 'mock-model',
+    setModel: () => {},
+    isHealthy: async () => true,
+    getAvailableModels: async () => ['mock-model'],
+    chat: async (messages) => {
+      // Check tool messages in turn 2
+      const toolMsgs = messages.filter(m => m.role === 'tool');
+      if (toolMsgs.length >= 2) {
+        if (toolMsgs.some(m => m.content.includes('[Skipped due to preceding tool error in batch]'))) {
+          tool2SkippedMessageSeen = true;
+        }
+        return {
+          content: 'DISCOVERED FINDINGS:\n- Tool 1 failed, tool 2 was skipped\nSUGGESTED ACTIONS:\n- Fix arguments'
+        };
+      }
+
+      // Propose batch of 2 tool calls where tool 1 fails
+      return {
+        content: 'Executing batch of two tools',
+        tool_calls: [
+          {
+            id: 'call-1-fail',
+            type: 'function',
+            function: {
+              name: 'view_file',
+              arguments: JSON.stringify({ path: '../../etc/shadow' })
+            }
+          },
+          {
+            id: 'call-2-dependent',
+            type: 'function',
+            function: {
+              name: 'view_file',
+              arguments: JSON.stringify({ path: 'package.json' })
+            }
+          }
+        ]
+      };
+    }
+  };
+
+  const context: AgentContext = {
+    cwd: process.cwd(),
+    autoApprove: true,
+    model: 'mock-model',
+    ollamaHost: 'http://127.0.0.1:11434',
+    mode: 'worker'
+  };
+
+  const outcome = await SubagentRunner.run(
+    {
+      role: 'explorer',
+      objective: 'Test batch abort on error',
+      context,
+      maxSteps: 3
+    },
+    mockProvider
+  );
+
+  assert.equal(outcome.success, true);
+  assert.equal(tool2SkippedMessageSeen, true, 'Tool #2 must receive skipped tool response message');
+  assert.ok(outcome.findings.some(f => f.includes('tool 2 was skipped')));
 });

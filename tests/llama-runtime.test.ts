@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
 import { LlamaCppRuntime } from '../src/runtime/manager.js';
 import { LlamaCppTurboQuantProvider } from '../src/providers/llama-cpp.js';
 import { createLLMProvider } from '../src/providers/factory.js';
-import { INFERENCE_PROFILES, resolveProfileForHardware, resolveProfileConfig } from '../src/runtime/profiles.js';
+import { INFERENCE_PROFILES, resolveProfileForHardware, resolveProfileConfig, DEFAULT_QWEN_MODEL_PATH } from '../src/runtime/profiles.js';
 import { RuntimeDetector } from '../src/runtime/detector.js';
 import { AgentContext, ToolDefinition } from '../src/types.js';
 
@@ -201,3 +202,13 @@ test('createLLMProvider - preserves Ollama provider compatibility', () => {
   assert.equal(provider.getModel(), 'qwen2.5-coder:7b');
   assert.equal(provider.getNumCtx?.(), 8192);
 });
+
+test('DEFAULT_QWEN_MODEL_PATH - does not contain hardcoded user path and uses os.homedir or env', async () => {
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  const profilesSource = await fs.readFile(path.join(process.cwd(), 'src/runtime/profiles.ts'), 'utf8');
+  assert.ok(!profilesSource.includes('C:\\Users\\aksha'), 'src/runtime/profiles.ts source must not contain hardcoded personal Windows path');
+  const expectedPrefix = process.env.LOCODE_MODEL_PATH || os.homedir();
+  assert.ok(DEFAULT_QWEN_MODEL_PATH.startsWith(expectedPrefix), 'Should start with LOCODE_MODEL_PATH or os.homedir()');
+});
+

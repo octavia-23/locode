@@ -9,7 +9,7 @@ import { ExecutionJournal } from '../journal/journal.js';
 export interface RepairEvaluationResult {
   passed: boolean;
   shouldContinue: boolean;
-  status: 'passed' | 'repair_feedback' | 'architect_escalated' | 'stagnation_halt';
+  status: 'passed' | 'repair_feedback' | 'architect_escalated' | 'stagnation_halt' | 'not_run' | 'inconclusive';
   vResult?: VerificationResult;
   feedbackDirective?: string;
   architectDiagnosis?: string;
@@ -96,7 +96,25 @@ export class RepairCoordinator {
       };
     }
 
-    // Failure path
+    if (vResult.status === 'not-run') {
+      return {
+        passed: false,
+        shouldContinue: false,
+        status: 'not_run',
+        vResult
+      };
+    }
+
+    if (vResult.status === 'inconclusive') {
+      return {
+        passed: false,
+        shouldContinue: false,
+        status: 'inconclusive',
+        vResult
+      };
+    }
+
+    // Failure path (vResult.status === 'failed')
     this.currentRepairAttempts++;
 
     // Check if verification failures have stagnated with identical error signatures
@@ -112,10 +130,20 @@ export class RepairCoordinator {
           reason: `Verification failure stagnation limit exceeded (${recAttempts} recovery attempts). Halting cleanly with evidence.`
         };
       }
+
+      const recoveryDirective = this.stagnationDetector.buildRecoveryDirective(userInput, stagDiag);
+      return {
+        passed: false,
+        shouldContinue: true,
+        status: 'repair_feedback',
+        vResult,
+        feedbackDirective: recoveryDirective,
+        reason: `Verification failure stagnation detected: ${stagDiag.summary}`
+      };
     }
 
-    // Escalate to Architect Mode if worker failed repeatedly
-    if (this.currentRepairAttempts >= 2) {
+    // Escalate to Architect Mode if worker failed repeatedly or mode is architect
+    if (this.currentRepairAttempts >= 2 || context.mode === 'architect') {
       const diagText = await ArchitectEngine.diagnose(
         vResult.errorOutput || 'Verification test failed without output',
         vResult.command || 'verify',
@@ -125,10 +153,11 @@ export class RepairCoordinator {
       );
 
       const architectDirective =
-        `[ARCHITECT REPAIR DIRECTIVE]\n` +
-        `The worker failed repeated repair attempts. The senior architect diagnosed the issue:\n` +
-        `${diagText}\n\n` +
-        `Apply this fix immediately using 'edit_file'.`;
+        `[AUTONOMOUS VERIFICATION FAILED - ARCHITECT ESCALATION]\n` +
+        `Command executed: \`${vResult.command}\`\n` +
+        `Compiler / Test failure:\n\`\`\`\n${vResult.errorOutput}\n\`\`\`\n\n` +
+        `🏛️ Senior Architect Directive:\n${diagText}\n\n` +
+        `Follow the Senior Architect's diagnosis above. Use 'edit_file' to apply the surgical fix to the affected files. Do not deviate from the plan.`;
 
       return {
         passed: false,
@@ -142,10 +171,10 @@ export class RepairCoordinator {
 
     // Standard repair feedback loop
     const standardDirective =
-      `[VERIFICATION FAILED]\n` +
-      `Command: ${vResult.command}\n` +
-      `Error Output:\n${vResult.errorOutput}\n\n` +
-      `Please analyze the failure trace, locate the source of error, and use 'edit_file' to repair the issue.`;
+      `[AUTONOMOUS VERIFICATION FAILED]\n` +
+      `Command executed: \`${vResult.command}\`\n\n` +
+      `Error output:\n\`\`\`\n${vResult.errorOutput}\n\`\`\`\n\n` +
+      `The modifications introduced compilation, syntax, or test errors. Analyze the stack trace above, locate the offending file and line, and use 'edit_file' to repair the error. Do not complete the task until the error is resolved.`;
 
     return {
       passed: false,

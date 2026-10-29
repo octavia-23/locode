@@ -301,3 +301,32 @@ test('multiEditFileTool - validateSyntax: true rolls back entire transaction if 
   assert.equal(await fs.readFile(file1, 'utf8'), originalA);
   assert.equal(await fs.readFile(file2, 'utf8'), originalB);
 });
+
+test('MultiStrategyEditEngine - findClosestMatch returns non-null match when target block has more lines than file', () => {
+  // File with only 3 lines
+  const file = [
+    'function computeScore(user: User, score: number): number {',
+    '  return score * 1.5;',
+    '}'
+  ].join('\n');
+
+  // Target block hallucinated with 6 lines (more lines than the file, and token differences preventing anchor match)
+  const longTarget = [
+    'function computeScore(user: AppUser, initialScore: number): number {',
+    '  const bonus = 1.5;',
+    '  const adjusted = initialScore * bonus;',
+    '  return adjusted;',
+    '  // end calculation',
+    '}'
+  ].join('\n');
+
+  const res = MultiStrategyEditEngine.apply(file, longTarget, 'replacement', 'math.ts');
+  assert.equal(res.success, false);
+  assert.ok(res.closestMatch !== undefined && res.closestMatch !== null, 'closestMatch should be non-null even when target has more lines than file');
+  assert.equal(res.closestMatch?.startLine, 1);
+  assert.ok(res.closestMatch?.content.includes('computeScore'));
+
+  const directMatch = (MultiStrategyEditEngine as any).findClosestMatch(file, longTarget);
+  assert.ok(directMatch !== null, 'findClosestMatch should return non-null result');
+  assert.equal(directMatch.startLine, 1);
+});

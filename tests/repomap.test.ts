@@ -155,3 +155,60 @@ test('RepoMapGenerator - PageRank personalization boosts focus/dirty files', asy
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('RepoMapGenerator - computePageRank scores sum to ~1.0 with sink nodes and personalization present', () => {
+  const generator = new RepoMapGenerator(process.cwd());
+
+  const entries: any[] = [
+    {
+      relativePath: 'src/a.ts',
+      symbols: [],
+      references: new Set(['b']),
+      imports: new Set(['./b.js']),
+      lineCount: 10
+    },
+    {
+      relativePath: 'src/b.ts',
+      symbols: [],
+      references: new Set(['c']),
+      imports: new Set(['./c.js']),
+      lineCount: 20
+    },
+    // c.ts is a sink node (no imports or references out)
+    {
+      relativePath: 'src/c.ts',
+      symbols: [],
+      references: new Set([]),
+      imports: new Set([]),
+      lineCount: 30
+    },
+    // d.ts is an isolated sink node
+    {
+      relativePath: 'src/d.ts',
+      symbols: [],
+      references: new Set([]),
+      imports: new Set([]),
+      lineCount: 40
+    }
+  ];
+
+  const symbolToFile = new Map<string, string>([
+    ['b', 'src/b.ts'],
+    ['c', 'src/c.ts']
+  ]);
+
+  // Case 1: Without focusFiles
+  generator.computePageRank(entries, symbolToFile);
+  let totalRank = entries.reduce((sum, e) => sum + (e.pageRank || 0), 0);
+  assert.ok(Math.abs(totalRank - 1.0) < 1e-4, `PageRank sum should be ~1.0, got ${totalRank}`);
+
+  // Case 2: With focusFiles (personalization)
+  generator.computePageRank(entries, symbolToFile, ['src/c.ts']);
+  totalRank = entries.reduce((sum, e) => sum + (e.pageRank || 0), 0);
+  assert.ok(Math.abs(totalRank - 1.0) < 1e-4, `PageRank sum with personalization should be ~1.0, got ${totalRank}`);
+
+  // Case 3: With focusFiles that don't match any file (teleport falls back to uniform)
+  generator.computePageRank(entries, symbolToFile, ['src/nonexistent.ts']);
+  totalRank = entries.reduce((sum, e) => sum + (e.pageRank || 0), 0);
+  assert.ok(Math.abs(totalRank - 1.0) < 1e-4, `PageRank sum with unmatched personalization should be ~1.0, got ${totalRank}`);
+});

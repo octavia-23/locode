@@ -347,3 +347,60 @@ test('Context Compaction - SessionMemory and journal snapshots store checkpoint'
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('ContextManager - estimateToolsTokens returns 0 for empty or undefined tools', () => {
+  const cm = new ContextManager(4000);
+  assert.equal(cm.estimateToolsTokens([]), 0, 'Empty tools array must return 0 tokens');
+  assert.equal(cm.estimateToolsTokens(undefined), 0, 'Undefined tools must return 0 tokens');
+});
+
+test('SessionMemory - strips orphaned tool messages on save and load', async () => {
+  const { SessionMemory } = await import('../src/agent/memory.js');
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  const os = await import('node:os');
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-orphaned-tool-'));
+  try {
+    const memory = new SessionMemory(tmpDir);
+    const messagesWithOrphanedTool = [
+      { role: 'tool' as const, content: 'Orphaned tool output from truncated history', tool_call_id: 'call_1' },
+      { role: 'user' as const, content: 'What is the current status?' },
+      { role: 'assistant' as const, content: 'Everything is running smoothly.' }
+    ];
+
+    await memory.saveSession({
+      model: 'test-model',
+      messages: messagesWithOrphanedTool
+    });
+
+    const loaded = await memory.loadSession();
+    assert.ok(loaded);
+    assert.equal(loaded.messages.length, 2);
+    assert.equal(loaded.messages[0].role, 'user', 'First message should be user, not orphaned tool');
+    assert.equal(loaded.messages[0].content, 'What is the current status?');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Context Compaction - compactMessages does not duplicate initialUser prompt', () => {
+  const cm = new ContextManager(300);
+  const initialPrompt = 'Build an ultra-fast search engine with caching and tests';
+  
+  // Create conversation that exceeds budget and triggers fold
+  const messages = [
+    { role: 'system' as const, content: 'You are an AI assistant.' },
+    { role: 'user' as const, content: initialPrompt },
+    { role: 'assistant' as const, content: 'Let us begin.\n'.repeat(30) },
+    { role: 'tool' as const, content: 'view_file results\n'.repeat(30) },
+    { role: 'assistant' as const, content: 'Analyzing...\n'.repeat(30) },
+    { role: 'tool' as const, content: 'edit_file results\n'.repeat(30) },
+    { role: 'assistant' as const, content: 'Finished first phase.\n'.repeat(30) },
+    { role: 'user' as const, content: 'Continue to phase 2' }
+  ];
+
+  const compacted = cm.compactMessages(messages);
+  const userMessages = compacted.filter(m => m.role === 'user' && m.content === initialPrompt);
+  assert.equal(userMessages.length, 1, 'Initial user prompt should appear exactly once in compacted history');
+});

@@ -279,7 +279,7 @@ export class ContextEngine {
   }
 
   estimateToolsTokens(tools?: any[]): number {
-    if (!tools || tools.length === 0) return 2500;
+    if (!tools || tools.length === 0) return 0;
     let charCount = 0;
     for (const t of tools) {
       charCount += (t.name?.length || 0) + (t.description?.length || 0) + JSON.stringify(t.parameters || {}).length;
@@ -865,7 +865,16 @@ export class ContextEngine {
         windowStart--;
       }
 
-      const recentWindow = compacted.slice(windowStart).filter(m => m !== initialUser && m !== systemMsg);
+      let initialUserExcluded = false;
+      const recentWindow = compacted.slice(windowStart).filter(m => {
+        if (m === systemMsg || m.role === 'system') return false;
+        if (m === initialUser) return false;
+        if (!initialUserExcluded && m.role === 'user' && m.content === initialUser.content) {
+          initialUserExcluded = true;
+          return false;
+        }
+        return true;
+      });
 
       const prunedMessages: ChatMessage[] = [
         systemMsg,

@@ -35,7 +35,7 @@ import { HarnessExecutionProfile, resolveExecutionProfile } from '../runtime/pro
 import { ExecutionJournal } from '../journal/journal.js';
 import { JournalRecoveryManager, RecoveryInspectionReport } from '../journal/recovery.js';
 import { SessionRunner } from '../engine/session-runner.js';
-import { TurnExecutor, isReadOnlyTool } from '../engine/turn-executor.js';
+import { TurnExecutor, isReadOnlyTool, NormalizedGeneration, GenerationOutcomeType, TurnBatchProgressTracker as ProgressTracker } from '../engine/turn-executor.js';
 import { RepairCoordinator } from '../engine/repair-coordinator.js';
 
 export interface SessionStats {
@@ -57,55 +57,7 @@ export interface SessionStats {
   tokensAvoidedByDeduplication: number;
 }
 
-export type GenerationOutcomeType =
-  | 'TOOL_CALLS'
-  | 'TEXT_FINAL'
-  | 'EMPTY_RESPONSE'
-  | 'MALFORMED_TOOL_CALL'
-  | 'PROVIDER_ERROR_RETRYABLE'
-  | 'PROVIDER_ERROR_FATAL';
-
-export interface NormalizedGeneration {
-  type: GenerationOutcomeType;
-  rawContent: string;
-  cleanedText: string;
-  toolCalls?: Array<{
-    id?: string;
-    type?: string;
-    function: {
-      name: string;
-      arguments: Record<string, any>;
-    };
-  }>;
-  errorMessage?: string;
-  stopReason?: string;
-  usage?: {
-    promptTokens: number;
-    completionTokens: number;
-    totalTokens: number;
-    durationMs: number;
-    tokensPerSecond: number;
-  };
-}
-
-export interface ProgressTracker {
-  recentToolSignatures: string[];
-  recentFailureSignatures: string[];
-  filesModified: Set<string>;
-  fileReadTurns: Map<string, number>;
-  fileEditCounts: Map<string, number>;
-  fileContentHashes: Map<string, string[]>;
-  fastLintFailuresPerFile: Map<string, number>;
-  consecutiveCycleDetections: number;
-  consecutiveToolFailures: number;
-  successfulToolCount: number;
-  failedToolCount: number;
-  consecutiveNoProgressCount: number;
-  consecutiveEmptyResponses: number;
-  actionNudgeGiven?: boolean;
-  singleFileObsession?: boolean;
-  obsessedFilePath?: string;
-}
+export type { GenerationOutcomeType, NormalizedGeneration, TurnBatchProgressTracker as ProgressTracker } from '../engine/turn-executor.js';
 
 export interface CycleInfo {
   detected: boolean;
@@ -159,6 +111,8 @@ export class AgentLoop {
   private journal: ExecutionJournal;
   private sessionRunner: SessionRunner;
   private repairCoordinator: RepairCoordinator;
+  private turnExecutor: TurnExecutor;
+  private pendingPromptRefresh: Promise<void> | null = null;
 
   constructor(context: AgentContext, renderer: TerminalRenderer, customProvider?: ILLMProvider) {
     this.context = context;
@@ -208,6 +162,13 @@ export class AgentLoop {
       },
       this.journal
     );
+    this.turnExecutor = new TurnExecutor(
+      this.toolDispatcher,
+      this.permissionEngine,
+      this.journal,
+      this.renderer,
+      this.checkpointManager
+    );
     this.recoveryController = new RecoveryController(
       this.stagnationDetector,
       isCloud ? 10 : 5
@@ -224,6 +185,10 @@ export class AgentLoop {
 
   getRepairCoordinator(): RepairCoordinator {
     return this.repairCoordinator;
+  }
+
+  getTurnExecutor(): TurnExecutor {
+    return this.turnExecutor;
   }
 
   /**
@@ -267,6 +232,19 @@ export class AgentLoop {
     return this.executionProfile;
   }
 
+  private async refreshSystemPrompt(): Promise<void> {
+    if (this.messages.length > 0 && this.messages[0].role === 'system') {
+      const isCloud = isCloudProvider(this.context.provider);
+      const allowFullRepo = this.executionProfile.privacyPolicy.allowFullRepoContext;
+      try {
+        const prompt = await buildSystemPrompt(this.context.cwd, isCloud, allowFullRepo);
+        if (this.messages[0]?.role === 'system') {
+          this.messages[0].content = prompt;
+        }
+      } catch {}
+    }
+  }
+
   setExecutionProfile(profile: Partial<HarnessExecutionProfile>) {
     this.executionProfile = {
       ...this.executionProfile,
@@ -288,18 +266,7 @@ export class AgentLoop {
     });
 
     // Synchronize system prompt with updated privacy settings
-    if (this.messages.length > 0 && this.messages[0].role === 'system') {
-      const isCloud = isCloudProvider(this.context.provider);
-      buildSystemPrompt(
-        this.context.cwd,
-        isCloud,
-        this.executionProfile.privacyPolicy.allowFullRepoContext
-      ).then(prompt => {
-        if (this.messages[0]?.role === 'system') {
-          this.messages[0].content = prompt;
-        }
-      }).catch(() => {});
-    }
+    this.pendingPromptRefresh = this.refreshSystemPrompt();
   }
 
   getToolDispatcher(): ToolDispatcher {
@@ -415,17 +382,7 @@ export class AgentLoop {
         allowNetwork: this.executionProfile.privacyPolicy.allowWebAccess,
         autoApprove: this.context.autoApprove
       });
-      if (this.messages.length > 0 && this.messages[0].role === 'system') {
-        buildSystemPrompt(
-          this.context.cwd,
-          isCloud,
-          this.executionProfile.privacyPolicy.allowFullRepoContext
-        ).then(prompt => {
-          if (this.messages[0]?.role === 'system') {
-            this.messages[0].content = prompt;
-          }
-        }).catch(() => {});
-      }
+      this.pendingPromptRefresh = this.refreshSystemPrompt();
     }
   }
 
@@ -506,7 +463,91 @@ export class AgentLoop {
     return TurnExecutor.normalizeResponse(response, rawError);
   }
 
+  async step(userInput?: string): Promise<NormalizedGeneration> {
+    if (this.pendingPromptRefresh) {
+      await this.pendingPromptRefresh;
+      this.pendingPromptRefresh = null;
+    }
+
+    if (this.messages.length === 0) {
+      await this.init();
+    }
+
+    if (userInput) {
+      const { processedPrompt, injectedFiles } = await resolveFileMentions(userInput, this.context.cwd);
+      if (injectedFiles.length > 0) {
+        this.renderer.printMentionedFiles(injectedFiles);
+      }
+      this.contextEngine.setObjective(userInput);
+      this.messages.push({
+        role: 'user',
+        content: processedPrompt
+      });
+    }
+
+    let activeTools = allTools;
+    if (!this.executionProfile.privacyPolicy.allowWebAccess) {
+      activeTools = activeTools.filter(t => t.name !== 'fetch_web' && t.name !== 'search_web');
+    }
+
+    const outgoingMessages = this.prepareMessagesForProvider(this.messages);
+    const chatOpts: import('../providers/types.js').ChatOptions = {
+      signal: this.context.signal
+    };
+    if (this.context.maxOutputTokens) {
+      chatOpts.maxTokens = this.context.maxOutputTokens;
+    }
+
+    let rawResponse: any;
+    let rawError: any;
+    try {
+      rawResponse = await this.provider.chat(outgoingMessages, activeTools, undefined, chatOpts);
+    } catch (err: any) {
+      rawError = err;
+    }
+
+    const outcome = this.normalizeResponse(rawResponse, rawError);
+
+    if (outcome.toolCalls && outcome.toolCalls.length > 0) {
+      this.messages.push({
+        role: 'assistant',
+        content: outcome.cleanedText || '',
+        tool_calls: outcome.toolCalls
+      });
+
+      const batchOutcome = await this.turnExecutor.executeTurnBatch(
+        outcome.toolCalls,
+        this.context,
+        {
+          profile: this.executionProfile,
+          signal: this.context.signal,
+          checkpointManager: this.checkpointManager,
+          renderer: this.renderer,
+          stagnationDetector: this.stagnationDetector,
+          recoveryController: this.recoveryController,
+          contextEngine: this.contextEngine
+        }
+      );
+
+      for (const msg of batchOutcome.toolMessages) {
+        this.messages.push(msg);
+      }
+    } else if (outcome.type === 'TEXT_FINAL' || !outcome.toolCalls || outcome.toolCalls.length === 0) {
+      this.messages.push({
+        role: 'assistant',
+        content: outcome.rawContent || ''
+      });
+    }
+
+    return outcome;
+  }
+
   async run(userInput: string) {
+    if (this.pendingPromptRefresh) {
+      await this.pendingPromptRefresh;
+      this.pendingPromptRefresh = null;
+    }
+
     if (this.messages.length === 0) {
       await this.init();
     }
@@ -582,14 +623,6 @@ export class AgentLoop {
       actionNudgeGiven: false
     };
 
-    const isPassiveTool = (name: string) =>
-      name === 'view_file' ||
-      name === 'search_code' ||
-      name === 'batch_read_files' ||
-      name === 'list_dir' ||
-      name === 'find_by_name' ||
-      name === 'grep_search' ||
-      name === 'file_search';
     const taskRequestsModification = /\b(add|fix|edit|modify|update|change|create|implement|style|improve|refactor|remove|delete|write|build|setup|redesign)\b/i.test(userInput);
 
     while (stepCount < safetyCeiling) {
@@ -919,139 +952,77 @@ export class AgentLoop {
           }
         }
 
-        // Autonomous Verification & Self-Repair Gate
-        if (hasModifiedCode && repairAttempts < maxRepairAttempts) {
-          this.renderer.startSpinner('Running automated verification & health check...');
-          this.stats.verificationRuns++;
-          const vResult = await CodeVerifier.run(this.context.cwd);
-          this.renderer.stopSpinner();
-
-          this.contextEngine.recordVerificationResult(vResult.passed, vResult.command || 'verify', vResult.errorOutput, vResult.status);
-
-          await this.journal.recordEvent('verification_completed', {
-            command: vResult.command || 'verify',
-            category: 'build',
-            status: vResult.status,
-            passed: vResult.passed,
-            summary: vResult.errorOutput ? vResult.errorOutput.slice(0, 500) : 'Verification passed with 0 errors.'
-          });
-
-          // Track verification signal in StagnationDetector
-          const currentWs = await StagnationDetector.computeWorkspaceFingerprint(this.context.cwd);
-          this.stagnationDetector.recordStep({
-            turn: stepCount,
-            toolCallId: `verify-${stepCount}-${repairAttempts}`,
-            normalizedTool: 'verify',
-            normalizedArgs: { command: vResult.command || 'verify' },
-            resultFingerprint: StagnationDetector.fingerprintResult(vResult.errorOutput || (vResult.passed ? 'PASSED' : 'FAILED'), !vResult.passed),
-            workspaceFingerprint: currentWs,
-            isError: vResult.status === 'failed',
-            testOutcome: {
-              passed: vResult.status === 'passed',
-              errorSignature: StagnationDetector.extractErrorSignature(vResult.errorOutput || ''),
-              command: vResult.command || 'verify'
-            }
-          });
-
-          if (vResult.status === 'failed') {
-            repairAttempts++;
-
-            // Check if verification failures have stagnated with unchanged error signatures
-            const stagDiag = this.stagnationDetector.diagnose();
-            if (stagDiag.stagnated) {
-              const recAttempts = this.stagnationDetector.incrementRecoveryAttempts();
-              this.stats.progressLoopsDetected++;
-              this.stats.recoveries++;
-
-              if (recAttempts > this.stagnationDetector.getThresholds().maxRecoveryAttempts) {
-                this.renderer.printWarning(
-                  `Terminating: test failure stagnation limit exceeded (${recAttempts} recovery attempts). Halting cleanly with evidence.`
-                );
-                this.messages.push({
-                  role: 'assistant',
-                  content: `[VERIFICATION STAGNATION TERMINATION]\n${stagDiag.summary}\nEvidence:\n${stagDiag.evidence.join('\n')}\nUnresolved blocker: ${vResult.errorOutput?.slice(0, 500)}`
-                });
-                break;
-              }
-
-              const recoveryDirective = this.stagnationDetector.buildRecoveryDirective(userInput, stagDiag);
-              this.renderer.printWarning(`Test failure stagnation detected: ${stagDiag.summary}. Issuing bounded recovery directive (${recAttempts}/${this.stagnationDetector.getThresholds().maxRecoveryAttempts})...`);
-              this.messages.push({
-                role: 'assistant',
-                content: outcome.rawContent || ''
-              });
-              this.messages.push({
-                role: 'user',
-                content: recoveryDirective
-              });
-              continue;
-            }
-
-            let architectPlan = '';
-            // If verification failed twice or mode is architect, escalate to Architect for root-cause diagnosis
-            if (repairAttempts >= 2 || this.context.mode === 'architect') {
-              const archModel = this.context.architectModel || this.context.model;
-              this.renderer.printWarning(`escalating to architect mode (${archModel}) for diagnosis...`);
-              this.renderer.startSpinner('analyzing cross-file contracts...');
-              architectPlan = await ArchitectEngine.diagnose(
-                vResult.errorOutput || '',
-                vResult.command || '',
-                this.messages,
-                this.context,
-                this.provider
-              );
-              this.renderer.stopSpinner();
-              console.log(`\n  ${theme.strong('architect directive:')}\n  ${theme.muted(architectPlan)}\n`);
-            } else {
-              this.renderer.printWarning(
-                `self-repair [attempt ${repairAttempts}/${maxRepairAttempts}]: \`${vResult.command}\` failed. feeding error trace to model...`
-              );
-            }
-
-            this.messages.push({
-              role: 'assistant',
-              content: outcome.rawContent || ''
-            });
-
-            const errorPrompt = architectPlan
-              ? `[AUTONOMOUS VERIFICATION FAILED - ARCHITECT ESCALATION]
-Command executed: \`${vResult.command}\`
-Compiler / Test failure:
-\`\`\`
-${vResult.errorOutput}
-\`\`\`
-
-🏛️ Senior Architect Directive:
-${architectPlan}
-
-Follow the Senior Architect's diagnosis above. Use 'edit_file' to apply the surgical fix to the affected files. Do not deviate from the plan.`
-              : `[AUTONOMOUS VERIFICATION FAILED]
-Command executed: \`${vResult.command}\`
-
-Error output:
-\`\`\`
-${vResult.errorOutput}
-\`\`\`
-
-The modifications introduced compilation, syntax, or test errors. Analyze the stack trace above, locate the offending file and line, and use 'edit_file' to repair the error. Do not complete the task until the error is resolved.`;
-
-            this.messages.push({
-              role: 'user',
-              content: errorPrompt
-            });
-            continue; // Continue loop to repair
-          } else if (vResult.status === 'passed' && vResult.command) {
-            this.renderer.printSuccess(`Verification passed: \`${vResult.command}\` exited with 0 errors.`);
-          } else if (vResult.status === 'inconclusive' && vResult.command) {
-            this.renderer.printWarning(`Verification inconclusive for \`${vResult.command}\`: ${vResult.reason || 'Execution timed out'}`);
-          }
-        }
-
-        // Clean completion
+        // Push assistant turn message ONCE before entering repair / verification branches
         this.messages.push({
           role: 'assistant',
           content: outcome.rawContent || ''
         });
+
+        // Autonomous Verification & Self-Repair Gate
+        if (hasModifiedCode && this.repairCoordinator.getRepairAttempts() < maxRepairAttempts) {
+          this.renderer.startSpinner('Running automated verification & health check...');
+          this.stats.verificationRuns++;
+          const repairResult = await this.repairCoordinator.runVerificationAndDiagnosis(
+            userInput,
+            stepCount,
+            this.messages,
+            this.context,
+            this.provider,
+            this.journal
+          );
+          this.renderer.stopSpinner();
+
+          if (repairResult.vResult) {
+            this.contextEngine.recordVerificationResult(
+              repairResult.passed,
+              repairResult.vResult.command || 'verify',
+              repairResult.vResult.errorOutput,
+              repairResult.vResult.status
+            );
+          }
+
+          if (repairResult.status === 'passed') {
+            if (repairResult.vResult?.command) {
+              this.renderer.printSuccess(`Verification passed: \`${repairResult.vResult.command}\` exited with 0 errors.`);
+            }
+          } else if (repairResult.status === 'inconclusive') {
+            if (repairResult.vResult?.command) {
+              this.renderer.printWarning(`Verification inconclusive for \`${repairResult.vResult.command}\`: ${repairResult.vResult.reason || 'Execution timed out'}`);
+            }
+          } else if (repairResult.status === 'stagnation_halt') {
+            this.stats.progressLoopsDetected++;
+            this.stats.recoveries++;
+            this.renderer.printWarning(
+              `Terminating: test failure stagnation limit exceeded. Halting cleanly with evidence.`
+            );
+            this.messages.push({
+              role: 'user',
+              content: `[VERIFICATION STAGNATION TERMINATION]\n${repairResult.reason || 'Verification failure stagnation limit exceeded.'}\nUnresolved blocker: ${repairResult.vResult?.errorOutput?.slice(0, 500)}`
+            });
+            break;
+          } else if (repairResult.status === 'architect_escalated') {
+            this.stats.progressLoopsDetected++;
+            const archModel = this.context.architectModel || this.context.model;
+            this.renderer.printWarning(`escalating to architect mode (${archModel}) for diagnosis...`);
+            console.log(`\n  ${theme.strong('architect directive:')}\n  ${theme.muted(repairResult.architectDiagnosis || '')}\n`);
+            this.messages.push({
+              role: 'user',
+              content: repairResult.feedbackDirective || '[ARCHITECT REPAIR DIRECTIVE]'
+            });
+            continue;
+          } else if (repairResult.status === 'repair_feedback') {
+            this.renderer.printWarning(
+              `self-repair [attempt ${this.repairCoordinator.getRepairAttempts()}/${maxRepairAttempts}]: \`${repairResult.vResult?.command}\` failed. feeding error trace to model...`
+            );
+            this.messages.push({
+              role: 'user',
+              content: repairResult.feedbackDirective || '[VERIFICATION FAILED]'
+            });
+            continue;
+          }
+        }
+
+        // Clean completion
         const estTokens = this.contextEngine.estimateMessagesTokens(this.messages);
         const maxTokens = this.contextEngine.getMaxTokens();
         this.renderer.printTelemetry(outcome.usage, {
@@ -1149,433 +1120,37 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         continue;
       }
 
-      // Progress Guard 2: Trap obsessive single-file read loops & accelerate to action gate
-      if (this.executionProfile.forceMutationAfterReads) {
-        for (const call of toolCalls) {
-          if (call.function.name === 'view_file' && call.function.arguments?.path) {
-            const p = String(call.function.arguments.path);
-            const currentReads = (progress.fileReadTurns.get(p) || 0) + 1;
-            progress.fileReadTurns.set(p, currentReads);
-            const obsessionThresh = Math.min(2, this.executionProfile.maxExplorationReads);
-            if (currentReads >= obsessionThresh && !hasModifiedCode) {
-              progress.singleFileObsession = true;
-              progress.obsessedFilePath = p;
-              break;
-            }
-          }
-        }
+      // Delegate tool batch execution to TurnExecutor
+      const batchOutcome = await this.turnExecutor.executeTurnBatch(toolCalls, this.context, {
+        profile: this.executionProfile,
+        progress,
+        stepCount,
+        userInput,
+        hasModifiedCode,
+        readStepCount,
+        safetyCeiling,
+        signal: effectiveSignal,
+        usage: outcome.usage,
+        stopReason: outcome.stopReason,
+        checkpointManager: this.checkpointManager,
+        renderer: this.renderer,
+        stagnationDetector: this.stagnationDetector,
+        recoveryController: this.recoveryController,
+        contextEngine: this.contextEngine
+      });
 
-        if (progress.singleFileObsession) {
-          readStepCount = Math.max(readStepCount, Math.min(2, this.executionProfile.maxExplorationReads));
-        }
+      hasModifiedCode = batchOutcome.hasModifiedCode;
+      readStepCount = batchOutcome.readStepCount;
+      safetyCeiling = batchOutcome.safetyCeiling;
+      this.stats.toolCalls += batchOutcome.toolCallsCount;
+      this.stats.successfulToolCalls += batchOutcome.successfulToolCalls;
+      this.stats.failedToolCalls += batchOutcome.failedToolCalls;
+
+      for (const msg of batchOutcome.toolMessages) {
+        this.messages.push(msg);
       }
 
-      // Safe Concurrency & Parallel Tool Execution via TurnExecutor:
-      // When allowParallelTools is true and all tools are read-only, execute concurrently.
-      const canRunParallel = this.executionProfile.allowParallelTools &&
-        toolCalls.length > 1 &&
-        toolCalls.every(c => isReadOnlyTool(c.function.name));
-
-      if (canRunParallel) {
-        this.renderer.startSpinner(`Executing ${toolCalls.length} read operations in parallel...`);
-        const batchRes = await TurnExecutor.executeToolBatch(
-          toolCalls,
-          this.toolDispatcher,
-          this.context,
-          {
-            allowParallelTools: true,
-            autoApprove: this.context.autoApprove,
-            allowNetwork: this.executionProfile.privacyPolicy.allowWebAccess,
-            signal: effectiveSignal
-          }
-        );
-        this.renderer.stopSpinner();
-
-        for (const res of batchRes.results) {
-          this.stats.toolCalls++;
-          readStepCount++;
-          this.renderer.printToolResult(res.toolName, res.output, res.isError);
-          this.messages.push({
-            role: 'tool',
-            name: res.toolName,
-            tool_call_id: res.callId,
-            content: res.output
-          });
-          progress.recentToolSignatures.push(`${res.toolName}:${JSON.stringify(res.arguments || {})}`);
-        }
-        continue;
-      }
-
-      // Execute each tool call sequentially
-      let shouldTerminateTurn = false;
-      for (const call of toolCalls) {
-        this.stats.toolCalls++;
-        const toolName = call.function.name;
-        const toolArgs = call.function.arguments || {};
-
-        // POST-VERIFICATION COMPLETION GATE (inspired by Cline & Ralph-Loop):
-        // If code has been modified and verification (e.g. py_compile, tsc, npm test) has already PASSED with 0 errors,
-        // do not let local models wander into redundant passive inspections or speculative checks. Force turn finalization.
-        const lastVerif = this.contextEngine.getTaskState().lastVerification;
-        if (!isCloud && hasModifiedCode && lastVerif && lastVerif.status === 'passed') {
-          this.stats.failedToolCalls++;
-          const completeDirective = `[GOAL VERIFIED AND COMPLETE]
-Your codebase modifications have already been verified cleanly (${lastVerif.summary}).
-All further tool execution is disabled to preserve the verified file state.
-You must now deliver your final summary and conclusion to the user to conclude the task.`;
-          this.renderer.printSuccess(`All changes verified cleanly (${lastVerif.summary}). Blocking further tool execution to finalize turn.`);
-          this.messages.push({
-            role: 'tool',
-            name: toolName,
-            tool_call_id: call.id,
-            content: completeDirective
-          });
-          continue;
-        }
-
-        // RUNTIME ACTION GATE: re-evaluate before EACH tool in a batch. One model response
-        // can contain many calls, so a turn-level tool list cannot enforce the limit by itself.
-        // Once the inspection streak is exhausted, block all non-edit tools, including shell commands.
-        const verificationStillCurrent = hasModifiedCode && this.contextEngine.getTaskState().lastVerification?.status === 'passed';
-        const forceActionNow = this.executionProfile.forceMutationAfterReads && taskRequestsModification && !verificationStillCurrent && (Boolean(progress.singleFileObsession) || readStepCount >= this.executionProfile.maxExplorationReads);
-        if (forceActionNow && toolName !== 'edit_file' && toolName !== 'write_file') {
-          this.stats.failedToolCalls++;
-          const targetFile = toolArgs.path || (toolArgs.paths && toolArgs.paths[0]) || progress.obsessedFilePath || '';
-          const targetHint = targetFile ? ` on \"${targetFile}\"` : '';
-          const directive = `[EXECUTION BLOCKED - ACTION REQUIRED] Inspection has repeated without a real file change (${readStepCount} inspections). Tool \"${toolName}\" is blocked now.
-You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetHint}. A shell command or no-op write does not count as progress. If no change is justified, explain the blocker instead of continuing tool calls.`;
-          this.renderer.printWarning(`Blocked \"${toolName}\" — requiring a meaningful file edit or final answer.`);
-          this.messages.push({
-            role: 'tool',
-            name: toolName,
-            tool_call_id: call.id,
-            content: directive
-          });
-          continue;
-        }
-
-        const tool = toolRegistry.get(toolName);
-        if (!tool) {
-          this.stats.failedToolCalls++;
-          const errMsg = `Tool "${toolName}" is not registered. Available tools: ${Array.from(toolRegistry.keys()).join(', ')}`;
-          this.renderer.printError(errMsg);
-          this.messages.push({
-            role: 'tool',
-            name: toolName,
-            tool_call_id: call.id,
-            content: errMsg
-          });
-          continue;
-        }
-
-        this.renderer.printToolCall(toolName, toolArgs);
-
-        // Previews for file edits
-        if (toolName === 'edit_file' && toolArgs.path && toolArgs.target_content && toolArgs.replacement_content) {
-          try {
-            const targetPath = path.resolve(this.context.cwd, toolArgs.path);
-            const currentContent = await fs.readFile(targetPath, 'utf8');
-            const target = toolArgs.target_content;
-            const replacement = toolArgs.replacement_content;
-            const previewNew = currentContent.replace(target, replacement);
-            this.renderer.printDiff(toolArgs.path, currentContent, previewNew);
-          } catch {}
-        } else if (toolName === 'write_file' && toolArgs.path) {
-          try {
-            const targetPath = path.resolve(this.context.cwd, toolArgs.path);
-            let currentContent = '';
-            try {
-              currentContent = await fs.readFile(targetPath, 'utf8');
-              this.renderer.printDiff(toolArgs.path, currentContent, toolArgs.content);
-            } catch {
-              console.log(`${theme.branch}New file: ${theme.path(toolArgs.path)}`);
-            }
-          } catch {}
-        }
-
-        // Checkpoint record pre-edit file if mutation tool
-        const isFileMutationTool = (toolName === 'edit_file' || toolName === 'write_file' || toolName === 'multi_edit_file');
-        if (toolName === 'multi_edit_file') {
-          const paths: string[] = [
-            ...(toolArgs.path ? [toolArgs.path] : []),
-            ...(Array.isArray(toolArgs.files) ? toolArgs.files.map((f: any) => f?.path) : []),
-            ...(Array.isArray(toolArgs.edits) ? toolArgs.edits.map((e: any) => e?.path) : [])
-          ].filter(p => typeof p === 'string');
-          for (const p of new Set(paths)) {
-            await this.checkpointManager.recordPreEditFile(p);
-          }
-        } else if (isFileMutationTool && toolArgs.path) {
-          await this.checkpointManager.recordPreEditFile(toolArgs.path);
-        }
-
-        this.renderer.startSpinner(`Executing ${toolName}...`);
-
-        const durableResult = await this.toolDispatcher.dispatch(
-          tool,
-          toolArgs,
-          this.context,
-          call.id,
-          {
-            autoApprove: this.context.autoApprove,
-            allowNetwork: this.executionProfile.privacyPolicy.allowWebAccess,
-            signal: effectiveSignal
-          }
-        );
-
-        this.renderer.stopSpinner();
-
-        if (durableResult.status === 'validation_failed') {
-          this.stats.failedToolCalls++;
-          progress.failedToolCount++;
-          progress.consecutiveToolFailures++;
-          this.renderer.printError(durableResult.output);
-          this.messages.push({
-            role: 'tool',
-            name: toolName,
-            tool_call_id: call.id,
-            content: durableResult.output
-          });
-          continue;
-        }
-
-        if (durableResult.status === 'permission_denied') {
-          this.stats.failedToolCalls++;
-          this.renderer.printError(durableResult.output);
-          this.messages.push({
-            role: 'tool',
-            name: toolName,
-            tool_call_id: call.id,
-            content: durableResult.output
-          });
-          continue;
-        }
-
-        this.renderer.printToolResult(toolName, durableResult.output, durableResult.isError);
-
-        let executionResult: { result: string; isError?: boolean } = {
-          result: durableResult.output,
-          isError: durableResult.isError
-        };
-
-        const fileContentChanged = Boolean(durableResult.fileChanges?.changed);
-        if (fileContentChanged && toolArgs.path && durableResult.fileChanges?.contentBefore) {
-          const beforeHash = crypto.createHash('md5').update(durableResult.fileChanges.contentBefore).digest('hex');
-          const knownHashes = progress.fileContentHashes.get(toolArgs.path) || [];
-          if (!knownHashes.includes(beforeHash)) knownHashes.push(beforeHash);
-          if (knownHashes.length > 5) knownHashes.shift();
-          progress.fileContentHashes.set(toolArgs.path, knownHashes);
-        }
-        // Only repository-inspection calls consume this budget. Shell commands are neither
-        // source edits nor inspections, and must not disable the action gate.
-        if (isPassiveTool(toolName)) readStepCount++;
-        if (fileContentChanged) readStepCount = 0;
-
-        const isCommandExitDiagnostic = toolName === 'run_command' && !executionResult.result.startsWith('Failed to execute command:');
-        if (executionResult.isError) {
-          this.stats.failedToolCalls++;
-          progress.failedToolCount++;
-          // Non-zero command exit codes (e.g. failing tests/lints) are diagnostic feedback, not tool execution crashes
-          if (!isCommandExitDiagnostic) {
-            progress.consecutiveToolFailures++;
-          } else {
-            progress.consecutiveToolFailures = 0;
-          }
-
-          if (toolName === 'edit_file' || toolName === 'write_file' || toolName === 'multi_edit_file') {
-            progress.singleFileObsession = false;
-            if (toolArgs.path) progress.fileReadTurns.delete(toolArgs.path);
-          }
-
-          if (progress.consecutiveToolFailures >= (isCloud ? 10 : 5)) {
-            this.renderer.printError(
-              `Execution halted: ${progress.consecutiveToolFailures} consecutive tool execution errors encountered. Aborting turn to prevent token waste.`
-            );
-            shouldTerminateTurn = true;
-            this.messages.push({
-              role: 'tool',
-              name: toolName,
-              tool_call_id: call.id,
-              content: executionResult.result
-            });
-            // Ensure any remaining calls in this batch also receive a tool result
-            const currentIdx = toolCalls.indexOf(call);
-            for (let j = currentIdx + 1; j < toolCalls.length; j++) {
-              const skipped = toolCalls[j];
-              this.messages.push({
-                role: 'tool',
-                name: skipped.function.name,
-                tool_call_id: skipped.id,
-                content: '[CANCELLED] Tool execution aborted due to preceding consecutive failures.'
-              });
-            }
-            break;
-          } else if (progress.consecutiveToolFailures >= 3) {
-            executionResult.result += `\n\n[CIRCUIT BREAKER WARNING] ${progress.consecutiveToolFailures} consecutive tool actions have failed. Stop guessing tool arguments. Re-read the target file with 'view_file' or check directory paths before proceeding.`;
-          }
-        } else {
-          this.stats.successfulToolCalls++;
-          progress.successfulToolCount++;
-          progress.consecutiveToolFailures = 0;
-
-          if (toolName === 'multi_edit_file') {
-            const paths: string[] = [
-              ...(toolArgs.path ? [toolArgs.path] : []),
-              ...(Array.isArray(toolArgs.files) ? toolArgs.files.map((f: any) => f?.path) : []),
-              ...(Array.isArray(toolArgs.edits) ? toolArgs.edits.map((e: any) => e?.path) : [])
-            ].filter(p => typeof p === 'string');
-            for (const p of new Set(paths)) {
-              const editCount = (progress.fileEditCounts.get(p) || 0) + 1;
-              progress.fileEditCounts.set(p, editCount);
-              hasModifiedCode = true;
-              progress.filesModified.add(p);
-
-              // Immediate in-line syntax and type diagnostic check
-              try {
-                const lintResult = await CodeVerifier.runFastLint(this.context.cwd, p);
-                if (!lintResult.passed && lintResult.errorOutput) {
-                  executionResult.result += `\n\n[AUTOMATED LINTER / TYPECHECK FEEDBACK]:\nYour modification to "${p}" introduced compiler/type diagnostics (\`${lintResult.command}\`):\n\`\`\`\n${lintResult.errorOutput}\n\`\`\`\nPlease inspect the diagnostic above and resolve it on your next step.`;
-                }
-              } catch {}
-            }
-            progress.singleFileObsession = false;
-            progress.obsessedFilePath = '';
-            progress.consecutiveCycleDetections = 0;
-            this.stagnationDetector.resetRecoveryAttempts();
-            this.recoveryController.resetRepetitionOnRealChange();
-            progress.recentToolSignatures = [];
-          } else if ((toolName === 'edit_file' || toolName === 'write_file') && toolArgs.path) {
-            const editCount = (progress.fileEditCounts.get(toolArgs.path) || 0) + 1;
-            progress.fileEditCounts.set(toolArgs.path, editCount);
-
-            if (fileContentChanged) {
-              hasModifiedCode = true;
-              progress.filesModified.add(toolArgs.path);
-              progress.singleFileObsession = false;
-              progress.obsessedFilePath = '';
-              progress.consecutiveCycleDetections = 0;
-              this.stagnationDetector.resetRecoveryAttempts();
-              this.recoveryController.resetRepetitionOnRealChange();
-              // Reset repetition history only after a real source change, not a no-op write.
-              progress.recentToolSignatures = [];
-            } else {
-              executionResult.result += `\n\n[NO-OP EDIT DETECTED] The operation succeeded but left \"${toolArgs.path}\" unchanged. This is not progress. Do not repeat the same edit/write; inspect the exact target or explain the blocker.`;
-            }
-
-            // Detect reversion to a previously observed content state via authoritative RecoveryController
-            let isOscillation = false;
-            try {
-              const targetFullPath = path.resolve(this.context.cwd, toolArgs.path);
-              const currentContent = await fs.readFile(targetFullPath, 'utf8');
-              const oscResult = this.recoveryController.recordFileHash(toolArgs.path, currentContent);
-              if (fileContentChanged && oscResult.isOscillation) isOscillation = true;
-            } catch {}
-
-            if (isOscillation) {
-              this.renderer.printWarning(`Detected edit oscillation on "${toolArgs.path}" (file reverted to earlier state).`);
-              executionResult.result += `\n\n[OSCILLATION WARNING] Your modification reverted "${toolArgs.path}" to an earlier state from this turn. You are thrashing between alternate versions. Run tests or inspect compiler output before editing this file again.`;
-            }
-
-            const maxEditChurn = isCloud ? 20 : 6;
-            if (editCount > maxEditChurn) {
-              this.renderer.printWarning(`High edit churn on "${toolArgs.path}" (${editCount} edits in single turn).`);
-              executionResult.result += `\n\n[CHURN LIMIT REACHED] "${toolArgs.path}" has been modified ${editCount} times in this turn. Further blind edits are restricted. Please verify the code or finish the task.`;
-            }
-
-            // Bounded dynamic leash extension:
-            // Extend only for productive, non-thrashing edits, capped strictly at ABSOLUTE_MAX_STEPS
-            if (fileContentChanged && (isCloud || editCount <= 4) && safetyCeiling < ABSOLUTE_MAX_STEPS) {
-              safetyCeiling = Math.min(stepCount + 15, ABSOLUTE_MAX_STEPS, this.executionProfile.safetyCeiling * 2);
-            }
-
-            // Layer 3: Automated Linter / Compiler Self-Healing Loop with failure cap
-            try {
-              const lintResult = await CodeVerifier.runFastLint(this.context.cwd, toolArgs.path);
-              if (!lintResult.passed && lintResult.errorOutput) {
-                const fastLintFails = (progress.fastLintFailuresPerFile.get(toolArgs.path) || 0) + 1;
-                progress.fastLintFailuresPerFile.set(toolArgs.path, fastLintFails);
-
-                if (isCloud || fastLintFails <= 2) {
-                  console.log(`${theme.branch}${theme.alert} ${theme.warning(`Auto-lint diagnostic: syntax/type issue in ${toolArgs.path} (\`${lintResult.command}\`)`)}`);
-                  executionResult.result += `\n\n[AUTOMATED LINTER / TYPECHECK FEEDBACK]:\nYour modification to "${toolArgs.path}" introduced compiler/type diagnostics (\`${lintResult.command}\`):\n\`\`\`\n${lintResult.errorOutput}\n\`\`\`\nPlease inspect the diagnostic above and invoke 'edit_file' to resolve it on your next step.`;
-                } else {
-                  console.log(`${theme.branch}${theme.alert} ${theme.warning(`Auto-lint diagnostic limit reached for ${toolArgs.path} (${fastLintFails} failures)`)}`);
-                  executionResult.result += `\n\n[AUTOMATED LINTER CEILING REACHED]:\nRepeated attempts (${fastLintFails}) to auto-heal compiler diagnostics in "${toolArgs.path}" have failed:\n\`\`\`\n${lintResult.errorOutput}\n\`\`\`\nDo not attempt further blind edits to this file. Explain the error or formulate an alternative approach.`;
-                }
-              } else {
-                progress.fastLintFailuresPerFile.set(toolArgs.path, 0);
-              }
-            } catch {}
-          }
-        }
-
-        let toolOutput = executionResult.result || '';
-
-        // Record progress signal in StagnationDetector
-        try {
-          const wsFp = await StagnationDetector.computeWorkspaceFingerprint(this.context.cwd);
-          const isErr = Boolean(executionResult.isError);
-          const testOutcome = toolName === 'run_command'
-            ? {
-                passed: !isErr,
-                errorSignature: StagnationDetector.extractErrorSignature(toolOutput),
-                command: toolArgs.command || toolArgs.cmd
-              }
-            : undefined;
-
-          this.stagnationDetector.recordStep({
-            turn: stepCount,
-            toolCallId: call.id || `tc-${stepCount}-${this.stats.toolCalls}`,
-            normalizedTool: toolName,
-            normalizedArgs: StagnationDetector.normalizeArguments(toolArgs),
-            resultFingerprint: StagnationDetector.fingerprintResult(toolOutput, isErr),
-            workspaceFingerprint: wsFp,
-            isError: isErr,
-            testOutcome,
-            telemetry: {
-              promptTokens: outcome.usage?.promptTokens,
-              completionTokens: outcome.usage?.completionTokens,
-              totalTokens: outcome.usage?.totalTokens,
-              stopReason: outcome.stopReason
-            }
-          });
-
-          // If run_command executed a verification or test command, sync state with ContextEngine
-          if (toolName === 'run_command' && toolArgs.command) {
-            const cmd = String(toolArgs.command).trim();
-            const isVerifCmd = /^(python\s+-m\s+py_compile|pytest|npm\s+test|npx\s+tsc|tsc|cargo\s+test|go\s+test)/i.test(cmd);
-            if (isVerifCmd) {
-              this.contextEngine.recordVerificationResult(!isErr, cmd, isErr ? toolOutput : undefined, isErr ? 'failed' : 'passed');
-              await this.journal.recordEvent('verification_completed', {
-                command: cmd,
-                category: 'test',
-                status: isErr ? 'failed' : 'passed',
-                passed: !isErr,
-                summary: isErr ? (toolOutput ? toolOutput.slice(0, 500) : 'Command failed') : `Command \`${cmd}\` passed with 0 errors.`
-              }).catch(() => {});
-              if (!isErr && !toolOutput.trim()) {
-                // Ensure empty clean output explicitly confirms success so local models do not guess or re-verify
-                toolOutput = `[Command \`${cmd}\` exited cleanly with status code 0 and 0 errors. Verification passed. Please formulate your final response to complete the task.]`;
-              }
-            }
-          }
-        } catch {}
-
-        // Ingest-time safety ceiling: on 262k/large contexts, allow up to 40,000 characters (~10,000 tokens)
-        // so full multi-file views and stack traces are ingested intact without premature truncation.
-        const MAX_TOOL_INGEST_CHARS = this.context.numCtx && this.context.numCtx >= 65536 ? 40000 : 4000;
-        if (toolOutput.length > MAX_TOOL_INGEST_CHARS) {
-          toolOutput = this.contextEngine.compactToolOutput(toolOutput, MAX_TOOL_INGEST_CHARS);
-        }
-
-        this.messages.push({
-          role: 'tool',
-          name: toolName,
-          tool_call_id: call.id,
-          content: toolOutput
-        });
-      }
-
-      if (shouldTerminateTurn) {
+      if (batchOutcome.shouldTerminateTurn) {
         break;
       }
     }

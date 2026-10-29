@@ -46,6 +46,10 @@ export class SessionMemory {
       const data = await fs.readFile(this.sessionFile, 'utf8');
       const parsed = JSON.parse(data) as SerializedSession;
       if (parsed && Array.isArray(parsed.messages)) {
+        // Strip any leading orphaned tool messages
+        while (parsed.messages.length > 0 && parsed.messages[0].role === 'tool') {
+          parsed.messages.shift();
+        }
         return parsed;
       }
       return null;
@@ -70,7 +74,12 @@ export class SessionMemory {
       const nonSystemMessages = sessionData.messages.filter(m => m.role !== 'system');
       
       // Preserve up to the last 20 messages to keep the session compact and fast
-      const savedMessages = nonSystemMessages.slice(-20);
+      let savedMessages = nonSystemMessages.slice(-20);
+
+      // Prevent orphaned tool messages at the beginning of the saved session
+      while (savedMessages.length > 0 && savedMessages[0].role === 'tool') {
+        savedMessages.shift();
+      }
 
       const record: SerializedSession = {
         version: 1,

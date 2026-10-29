@@ -1,3 +1,5 @@
+import os from 'node:os';
+import path from 'node:path';
 import type { HardwareProfile } from '../hardware/detector.js';
 
 export type InferenceProfileName = 'ultra-context' | 'performance' | 'large-context' | 'balanced' | 'custom';
@@ -28,7 +30,14 @@ export interface LlamaRuntimeConfig {
 }
 
 export const DEFAULT_QWEN_MODEL_PATH =
-  'C:\\Users\\aksha\\.cache\\huggingface\\hub\\models--HauhauCS--Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive\\snapshots\\f12a584fecbeb5f20001130d8ecd66c9327ae685\\Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ2_M.gguf';
+  process.env.LOCODE_MODEL_PATH ||
+  path.join(
+    os.homedir(),
+    '.cache',
+    'huggingface',
+    'hub',
+    'models--HauhauCS--Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf'
+  );
 
 export const DEFAULT_QWEN_MODEL_ALIAS = 'locode-qwen35b-a3b';
 

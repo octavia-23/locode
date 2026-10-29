@@ -8,6 +8,9 @@ Tracking the multi-phase autonomous execution spec.
 - [x] **Phase 4**: Isolated Subagent Delegation Architecture (Explorer, Architect, Verifier)
 - [x] **Phase 5**: Compiler-Grade AST RepoMap & Fast Incremental TypeScript Verification
 - [x] **Phase 6**: Multi-File Transactional Edit Engine, Fuzzy Hunk Matching & Final Benchmark Gate
+- [x] **Phase 7.1**: Live TurnExecutor.executeTurnBatch & RepairCoordinator Wiring in src/agent/loop.ts
+- [x] **Phase 7.2**: Deep SubagentRunner Integration with ToolDispatcher, PermissionEngine & Forced Final Synthesis
+- [x] **Phase 7.3**: Line-Level Bug Sweep Across profiles.ts, verifier.ts, memory.ts, context.ts, edit-engine.ts & repomap.ts
 
 ---
 ## Phase Logs
@@ -96,3 +99,49 @@ Tracking the multi-phase autonomous execution spec.
   - `npm test`: 205/205 tests passed (100% pass rate, 0 failures, 0 skipped).
   - `npm run build`: Production build succeeded in 46ms (`dist/index.js`, `dist/cli.js`, `dist/chunk-GLZXSRH5.js`).
   - Security Audit: 0 static API keys or hardcoded secrets detected.
+
+### Phase 7.1: Live TurnExecutor.executeTurnBatch & RepairCoordinator Wiring in src/agent/loop.ts
+- **Status**: Completed `[x]`
+- **Files Created / Modified**:
+  - `src/engine/turn-executor.ts`: Added instance constructor and `executeTurnBatch(...)` to `TurnExecutor` supporting parallel read-only tool execution, action gating, diff previews, checkpoint pre-edit logging (`edit_file`, `write_file`, `multi_edit_file`, `delete_file`, `move_file`), `ToolDispatcher` integration, oscillation checking, churn limits, and fast-lint verification.
+  - `src/engine/repair-coordinator.ts`: Refactored `runVerificationAndDiagnosis(...)` to cleanly handle `not-run` and `inconclusive` statuses without false failure escalation, and support architect mode escalation for repeated failures.
+  - `src/agent/loop.ts`: Replaced 425+ lines of duplicate inline tool dispatch and repair logic with calls to `this.turnExecutor.executeTurnBatch(...)` and `this.repairCoordinator.runVerificationAndDiagnosis(...)`, reducing `loop.ts` from 1,605 to 1,180 lines.
+  - `src/agent/loop.ts`: Fixed unawaited floating promises on system prompt rebuilds in `setExecutionProfile()` and `setProvider()` via `refreshSystemPrompt()` and `pendingPromptRefresh` synchronization. Added `step(userInput?)` method.
+  - `src/agent/loop.ts`: Fixed duplicate assistant message pushes during repair escalation, appending assistant turn message at most once per turn.
+  - `tests/turn-executor.test.ts`: Added integration tests verifying `executeTurnBatch` is invoked by `AgentLoop` during execution and prompt refresh race condition prevention.
+- **Verification**:
+  - `npm run typecheck`: Passed with 0 errors.
+  - `npm test`: 207/207 tests passed (100% pass rate, 0 failures).
+
+### Phase 7.2: Deep SubagentRunner Integration with ToolDispatcher, PermissionEngine & Forced Final Synthesis
+- **Status**: Completed `[x]`
+- **Files Created / Modified**:
+  - `src/agent/subagents/runner.ts`: Routed all subagent tool execution through `ToolDispatcher` and `PermissionEngine`. Enforced `readOnly: true` for explorer and architect roles, strict JSON schema validation, workspace path containment via `resolveSafePath`, secret redaction on tool outputs, and lifecycle tracking in `ExecutionJournal`.
+  - `src/agent/subagents/runner.ts`: Implemented dependent tool failure halting in multi-tool batches, automatically appending `[Skipped due to preceding tool error in batch]` for subsequent tools in the batch and returning to the LLM turn cleanly.
+  - `src/agent/subagents/runner.ts`: Implemented forced final synthesis request with tools disabled (`tools = []`) upon reaching `maxSteps`, with deterministic fallback summarizing tool outputs to guarantee non-empty findings.
+  - `src/agent/subagents/types.ts`: Extended `SubagentSessionConfig` with optional `journal?: ExecutionJournal`.
+  - `src/types.ts`: Extended `AgentContext` with `journal?: any`.
+  - `tests/subagents.test.ts`: Added tests verifying final tool-free synthesis when hitting `maxSteps`, path traversal and schema validation blocking via `PermissionEngine` and `ToolSchemaValidator`, and batch error halting with skipped tool response messages.
+- **Verification**:
+  - `npm run typecheck`: Passed with 0 errors.
+  - `npm test`: 210/210 tests passed (100% pass rate, 0 failures).
+
+### Phase 7.3: Line-Level Bug Sweep Across profiles.ts, verifier.ts, memory.ts, context.ts, edit-engine.ts & repomap.ts
+- **Status**: Completed `[x]`
+- **Bugs Fixed & Locked with Tests**:
+  - **Bug 1 (`src/runtime/profiles.ts`)**: Removed hardcoded personal Windows path, replacing it with `process.env.LOCODE_MODEL_PATH || path.join(os.homedir(), '.cache', 'huggingface', 'hub', 'models--HauhauCS--Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf')`.
+  - **Bug 2 (`src/agent/verifier.ts`)**: Handled file paths with spaces safely in Python fast-lint by quoting command strings with `JSON.stringify(targetFile)` and cleanly returning `passed: true` upon zero exit code.
+  - **Bug 3 (`src/agent/memory.ts`)**: Prevented orphaned `role: 'tool'` messages from corrupting LLM turn boundaries on session load and save by stripping leading tool messages.
+  - **Bug 4 (`src/agent/context.ts`)**: Fixed phantom 2,500 token overhead in `estimateToolsTokens` by returning 0 when tools are empty or undefined, and fixed reference-equality filter in `compactMessages` to exclude matching initial user prompts by content.
+  - **Bug 5 (`src/tools/edit-engine.ts`)**: Fixed unified diff patch preamble handling in `tryUnifiedDiffPatch` (stripping leading git diff headers) and clamped `findClosestMatch` search window (`effectiveWindow = Math.min(windowSize, fileLines.length)`) so closest-match diagnostics succeed even when target blocks exceed file line count.
+  - **Bug 6 (`src/agent/repomap.ts`)**: Normalized personalization teleport vector in `computePageRank` to strictly sum to 1.0, preventing sink node mass dissipation.
+- **Dedicated Regression Tests Added**:
+  - `tests/llama-runtime.test.ts`: Verifies `DEFAULT_QWEN_MODEL_PATH` uses `os.homedir()` / `LOCODE_MODEL_PATH` and source contains no hardcoded personal paths.
+  - `tests/verifier.test.ts`: Verifies `CodeVerifier.runFastLint` safely quotes Python paths with spaces.
+  - `tests/compaction.test.ts`: Verifies `estimateToolsTokens([]) === 0`, `SessionMemory` strips orphaned tool messages, and `compactMessages` does not duplicate `initialUser`.
+  - `tests/edit-engine.test.ts`: Verifies `findClosestMatch` returns non-null closest match when target block exceeds file line count.
+  - `tests/repomap.test.ts`: Verifies `computePageRank` scores strictly sum to ~1.0 with sink nodes and personalization present.
+- **Verification & Final Gate**:
+  - `npm run typecheck`: Passed with 0 errors.
+  - `npm test`: 217/217 tests passed (100% pass rate, 0 failures, 0 skipped).
+  - `npm run build`: Production build succeeded in 82ms (`dist/index.js`, `dist/cli.js`, `dist/chunk-RRM7UUXU.js`).

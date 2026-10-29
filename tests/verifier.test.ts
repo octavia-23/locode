@@ -65,3 +65,24 @@ test('CodeVerifier - verifyFilesFast catches syntax errors in under 50ms without
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('CodeVerifier - runFastLint safely handles Python files with spaces in path', async () => {
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-py-spaces-'));
+  try {
+    const pyFile = path.join(tmpDir, 'my script.py');
+    await fs.writeFile(pyFile, 'def broken_func(\n  return 42\n', 'utf8');
+
+    const result = await CodeVerifier.runFastLint(tmpDir, 'my script.py');
+    if (result.status === 'failed' || result.status === 'passed') {
+      assert.ok(result.command?.includes('"my script.py"'), `Command should properly quote filename with spaces: ${result.command}`);
+    } else {
+      assert.equal(result.status, 'not-run');
+    }
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});

@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { isSensitiveFile, redactSensitiveFileContent } from '../utils/secret-redactor.js';
 
 export interface MentionResolution {
   processedPrompt: string;
@@ -37,7 +38,12 @@ export async function resolveFileMentions(prompt: string, cwd: string): Promise<
     try {
       const stat = await fs.stat(fullPath);
       if (stat.isFile()) {
-        const content = await fs.readFile(fullPath, 'utf8');
+        let content = await fs.readFile(fullPath, 'utf8');
+        // Redact secrets if file is classified as sensitive
+        if (isSensitiveFile(relPath) || isSensitiveFile(fullPath)) {
+          content = redactSensitiveFileContent(relPath, content);
+        }
+
         // Cap single file mention at 600 lines to preserve context window
         const lines = content.split('\n');
         const truncated = lines.slice(0, 600).join('\n');

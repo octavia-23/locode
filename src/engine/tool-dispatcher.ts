@@ -125,7 +125,9 @@ export class ToolDispatcher {
     }
 
     // STEP 3: User Confirmation if required (Fails closed if approval handler is missing)
-    if (permEval.requiresPrompt && !options?.autoApprove && !context.autoApprove) {
+    const isUnredactableSecret = Boolean(permEval.reason?.includes('cannot be safely redacted'));
+    const needsUserPrompt = permEval.requiresPrompt && (isUnredactableSecret || (!options?.autoApprove && !context.autoApprove));
+    if (needsUserPrompt) {
       if (!this.promptHandler?.confirmApproval) {
         if (this.journal) {
           await this.journal.recordEvent('permission_decided', {

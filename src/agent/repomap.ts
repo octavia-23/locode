@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { isSensitiveFile } from '../utils/secret-redactor.js';
 
 export interface FileSymbol {
   kind: 'function' | 'class' | 'interface' | 'type' | 'component' | 'const';
@@ -260,9 +261,8 @@ export class RepoMapGenerator {
         for (const dirent of dirents) {
           if (results.length >= limit) break;
           const name = dirent.name;
-          if (name.startsWith('.') || IGNORED_DIRS.has(name)) continue;
-
           const fullPath = path.join(currentDir, name);
+          if (name.startsWith('.') || IGNORED_DIRS.has(name) || isSensitiveFile(name) || isSensitiveFile(fullPath)) continue;
           if (dirent.isDirectory()) {
             await walk(fullPath);
           } else if (dirent.isFile()) {

@@ -16,7 +16,7 @@ export function isSensitiveFile(filePath: string): boolean {
   if (base === '.env' || base.startsWith('.env.')) return true;
 
   // 2. Private key and certificate files
-  if (/\.(pem|key|pkcs12|p12|pfx|jks|keystore)$/i.test(base)) return true;
+  if (/\.(pem|key|pkcs12|p12|pfx|jks|keystore|kdbx|ovpn|der)$/i.test(base)) return true;
   if (/^id_(rsa|dsa|ecdsa|ed25519)$/i.test(base)) return true;
 
   // 3. Known credential file basenames
@@ -26,6 +26,10 @@ export function isSensitiveFile(filePath: string): boolean {
     'secrets.json',
     'auth.json',
     'token.json',
+    'secrets.yaml',
+    'secrets.yml',
+    'secret.yaml',
+    'secret.yml',
     '.npmrc',
     '.netrc',
     '.dockercfg'
@@ -35,7 +39,30 @@ export function isSensitiveFile(filePath: string): boolean {
 
   // 4. Known secret directory subpaths
   const normalized = filePath.replace(/\\/g, '/').toLowerCase();
-  if (normalized.includes('/.aws/credentials') || normalized.includes('/.docker/config.json')) return true;
+  if (
+    normalized.includes('/.aws/credentials') ||
+    normalized.includes('/.docker/config.json') ||
+    normalized.includes('/.ssh/') ||
+    normalized.includes('/.gnupg/')
+  ) return true;
+
+  return false;
+}
+
+/**
+ * Checks whether a file is an unredactable cryptographic secret or binary credential store
+ * that requires explicit user authorization before cloud transmission.
+ */
+export function isUnredactableSensitiveFile(filePath: string): boolean {
+  if (!filePath || typeof filePath !== 'string') return false;
+  const base = path.basename(filePath).toLowerCase();
+
+  // 1. Binary keystores, certificates, and password databases
+  if (/\.(pkcs12|p12|pfx|jks|keystore|kdbx|der)$/i.test(base)) return true;
+
+  // 2. Raw private key files
+  if (/\.(key|pem)$/i.test(base) && (base.includes('private') || base.includes('secret') || base.startsWith('id_'))) return true;
+  if (/^id_(rsa|dsa|ecdsa|ed25519)$/i.test(base)) return true;
 
   return false;
 }
@@ -45,7 +72,7 @@ export function isSensitiveFile(filePath: string): boolean {
  */
 export function isSensitiveKeyName(key: string): boolean {
   if (!key || typeof key !== 'string') return false;
-  return /secret|password|passwd|token|apikey|api_key|auth|credential|private_key|privatekey|signing_key|client_secret|access_key|accesskey|encryption_key|master_key|salt|hash/i.test(key);
+  return /secret|password|passwd|token|apikey|api_key|auth|credential|private_key|privatekey|signing_key|client_secret|access_key|accesskey|encryption_key|master_key|salt|hash|bearer|jwt|passphrase|secret_key|secretkey|session_id|session_token/i.test(key);
 }
 
 /**
@@ -86,6 +113,12 @@ export function redactStructuredContent(text: string): string {
   result = result.replace(
     /^([ \t]*(?:export[ \t]+)?)([a-zA-Z0-9_.-]*(?:secret|password|passwd|token|api_key|apikey|auth|credential|key|salt)[a-zA-Z0-9_.-]*)([ \t]*[:=][ \t]*)(?:(["'])(?:[\s\S]*?)\4|([^\r\n#]+))/gim,
     (_match, prefix, keyName, separator) => `${prefix}${keyName}${separator}"[REDACTED_SECRET]"`
+  );
+
+  // C. Redact URL query parameters containing credentials (e.g. ?token=secret&api_key=secret)
+  result = result.replace(
+    /([?&](?:token|api_key|apikey|secret|password|access_token|auth)=)[^& \r\n"']+/gi,
+    '$1[REDACTED_SECRET]'
   );
 
   return result;
@@ -163,6 +196,15 @@ export function redactSecretsFromMessages<T extends { content?: string; tool_cal
     if (typeof m.content === 'string') {
       cleanContent = redactSecrets(m.content);
       if (cleanContent !== m.content) changed = true;
+    } else if (Array.isArray(m.content)) {
+      cleanContent = (m.content as any[]).map(part => {
+        if (typeof part === 'string') return redactSecrets(part);
+        if (part && typeof part === 'object') {
+          return redactValue(part);
+        }
+        return part;
+      }) as any;
+      changed = true;
     }
 
     let cleanToolCalls = m.tool_calls;

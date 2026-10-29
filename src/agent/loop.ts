@@ -9,7 +9,7 @@ import { allTools, toolRegistry, registerDynamicTool, unregisterDynamicTools } f
 import { redactSecrets, redactSecretsFromMessages } from '../utils/secret-redactor.js';
 import { ILLMProvider, getModelCapabilities } from '../providers/types.js';
 import { createLLMProvider, isCloudProvider, resolveProvider } from '../providers/factory.js';
-import { estimateUsageCost, estimatePreflightCost } from '../runtime/pricing.js';
+import { estimateUsageCost, estimatePreflightCost, reconcileUsageCost } from '../runtime/pricing.js';
 import { ContextEngine } from './context.js';
 import { TerminalRenderer } from '../ui/renderer.js';
 import { buildSystemPrompt } from './prompt.js';
@@ -33,6 +33,7 @@ import { RecoveryController } from '../engine/recovery-controller.js';
 import { ExecutionState, DurableToolResult } from '../engine/types.js';
 import { HarnessExecutionProfile, resolveExecutionProfile } from '../runtime/profiles.js';
 import { ExecutionJournal } from '../journal/journal.js';
+import { JournalRecoveryManager, RecoveryInspectionReport } from '../journal/recovery.js';
 
 export interface SessionStats {
   turns: number;
@@ -208,6 +209,39 @@ export class AgentLoop {
 
   getJournal(): ExecutionJournal {
     return this.journal;
+  }
+
+  /**
+   * Resumes an interrupted task from the durable execution journal.
+   * Performs workspace hash verification and reconciles interrupted tool calls safely.
+   */
+  async resumeTask(): Promise<RecoveryInspectionReport> {
+    const recoveryManager = new JournalRecoveryManager(this.context.cwd, this.journal.getJournalDir());
+    const report = await recoveryManager.inspectWorkspaceAndJournal();
+
+    if (report.canSafelyResume) {
+      await recoveryManager.applyRecoveryToAgent(this, report);
+      this.renderer.printSuccess(
+        `[Durable Journal Resume] Restored previous task: "${report.snapshot?.objective || 'unspecified'}"`
+      );
+      if (report.reconciledTools.length > 0) {
+        this.renderer.printWarning(
+          `Reconciled ${report.reconciledTools.length} tool calls (${report.reconciledTools.filter(t => t.resolution === 'applied_verified').length} verified edits on disk, 0 duplicated side effects).`
+        );
+      }
+    } else if (report.hasJournal) {
+      this.renderer.printWarning(
+        `[Durable Journal Warning] Cannot automatically resume task: ${report.reason || 'Uncertain state detected.'}`
+      );
+      for (const rec of report.reconciledTools.filter(t => t.requiresUserConfirmation)) {
+        this.renderer.printWarning(`- ${rec.toolName} (${rec.toolCallId}): ${rec.details}`);
+      }
+      for (const div of report.divergences) {
+        this.renderer.printError(`- ${div}`);
+      }
+    }
+
+    return report;
   }
 
   getState(): ExecutionState {
@@ -744,34 +778,66 @@ export class AgentLoop {
       // Pre-flight spending control: evaluate conservative projected request cost BEFORE dispatching
       const outgoingMessages = this.prepareMessagesForProvider(compacted);
       const estPromptTokens = this.contextEngine.estimateMessagesTokens(outgoingMessages);
-      const projectedOutputTokens = chatOpts.maxTokens || modelCaps.defaultOutputTokens || 4096;
-      const preflightCost = estimatePreflightCost(
+      let requestedOutputTokens = chatOpts.maxTokens || modelCaps.defaultOutputTokens || 4096;
+      let preflightCost = estimatePreflightCost(
         estPromptTokens,
-        projectedOutputTokens,
+        requestedOutputTokens,
         turnCost,
         this.context.model,
         this.context.provider,
         this.executionProfile.costPolicy.maxCostPerTurn
       );
 
+      // Reduce output allowance when prospective request would exceed budget (Requirement B.3)
+      if (preflightCost.isKnown && preflightCost.isExceeded) {
+        if (preflightCost.canReduceOutputAllowance && preflightCost.maxAllowableOutputTokens) {
+          const originalTokens = requestedOutputTokens;
+          chatOpts.maxTokens = preflightCost.maxAllowableOutputTokens;
+          this.renderer.printWarning(
+            `[Cost Control] Reduced output allowance from ${originalTokens} to ${chatOpts.maxTokens} tokens to fit within turn budget ($${this.executionProfile.costPolicy.maxCostPerTurn?.toFixed(2)}).`
+          );
+          preflightCost = estimatePreflightCost(
+            estPromptTokens,
+            chatOpts.maxTokens,
+            turnCost,
+            this.context.model,
+            this.context.provider,
+            this.executionProfile.costPolicy.maxCostPerTurn
+          );
+        }
+      }
+
       await this.journal.recordEvent('model_request_started', {
         turn: stepCount,
         messageCount: outgoingMessages.length,
         estimatedPromptTokens: estPromptTokens,
+        bufferedPromptTokens: preflightCost.bufferedPromptTokens,
         projectedCost: preflightCost.projectedTurnCost
       });
 
+      // Stop before sending a request that cannot fit within configured budget (Requirements B.3 & B.4)
       if (preflightCost.isKnown && preflightCost.isExceeded) {
-        this.renderer.printError(`[Pre-Flight Spending Block]: ${preflightCost.reason}`);
-        this.messages.push({
-          role: 'assistant',
-          content: `[EXECUTION BLOCKED: PRE-FLIGHT COST LIMIT] ${preflightCost.reason}`
-        });
-        await this.journal.recordEvent('task_failed', {
-          error: `Pre-flight cost limit exceeded: ${preflightCost.reason}`,
-          consecutiveFailures: 1
-        });
-        break;
+        let overrideApproved = false;
+        if (this.context.interactive !== false && this.toolDispatcher) {
+          overrideApproved = await this.toolDispatcher.requestApproval(
+            'budget_limit',
+            { projectedCost: preflightCost.projectedTurnCost, maxCostPerTurn: this.executionProfile.costPolicy.maxCostPerTurn },
+            `Projected turn cost ($${preflightCost.projectedTurnCost?.toFixed(4)}) exceeds configured turn limit ($${this.executionProfile.costPolicy.maxCostPerTurn?.toFixed(2)}). Authorize request?`
+          );
+        }
+
+        if (!overrideApproved) {
+          this.renderer.printError(`[Pre-Flight Spending Block]: ${preflightCost.reason}`);
+          this.messages.push({
+            role: 'assistant',
+            content: `[EXECUTION BLOCKED: PRE-FLIGHT COST LIMIT] ${preflightCost.reason}`
+          });
+          await this.journal.recordEvent('task_failed', {
+            error: `Pre-flight cost limit exceeded: ${preflightCost.reason}`,
+            consecutiveFailures: 1
+          });
+          break;
+        }
       }
 
       try {
@@ -800,6 +866,15 @@ export class AgentLoop {
       // Normalize generation outcome
       const outcome = this.normalizeResponse(rawResponse, rawError);
 
+      // Reconcile estimates against actual reported usage after each request (Requirement B.6)
+      const reconciled = reconcileUsageCost(
+        preflightCost,
+        outcome.usage,
+        turnCost,
+        this.context.model,
+        this.context.provider
+      );
+
       await this.journal.recordEvent('model_response_received', {
         turn: stepCount,
         stopReason: outcome.stopReason,
@@ -808,6 +883,8 @@ export class AgentLoop {
           completionTokens: outcome.usage.completionTokens,
           totalTokens: outcome.usage.totalTokens
         } : undefined,
+        reconciledCost: reconciled.actualCost,
+        costVariance: reconciled.variance,
         proposedToolCallsCount: outcome.toolCalls?.length || 0,
         hasTextContent: Boolean(outcome.cleanedText)
       });
@@ -820,9 +897,8 @@ export class AgentLoop {
         this.stats.completionTokens += outcome.usage.completionTokens;
         this.stats.totalDurationMs += outcome.usage.durationMs;
 
-        const costEst = estimateUsageCost(outcome.usage, this.context.model, this.context.provider);
-        if (costEst.isKnown && typeof costEst.cost === 'number') {
-          turnCost += costEst.cost;
+        if (reconciled.isKnown) {
+          turnCost = reconciled.reconciledTurnCost;
           if (this.executionProfile.costPolicy.alertOnCostThreshold && turnCost >= 0.5) {
             this.renderer.printWarning(`[Cost Alert] Turn cost reached $${turnCost.toFixed(4)}.`);
           }

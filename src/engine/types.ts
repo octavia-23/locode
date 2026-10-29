@@ -62,5 +62,6 @@ export interface ToolDispatchOptions {
   allowNetwork?: boolean;
   approvalAvailable?: boolean;
   interactive?: boolean;
+  authorizedForCloud?: boolean;
   signal?: AbortSignal;
 }

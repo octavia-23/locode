@@ -7,15 +7,19 @@ import crypto from 'node:crypto';
 import { ExecutionJournal } from '../src/journal/journal.js';
 import { JournalRecoveryManager } from '../src/journal/recovery.js';
 import { CURRENT_JOURNAL_VERSION } from '../src/journal/types.js';
-import { estimatePreflightCost } from '../src/runtime/pricing.js';
+import { estimatePreflightCost, reconcileUsageCost } from '../src/runtime/pricing.js';
 import {
   isSensitiveFile,
   isSensitiveKeyName,
+  isUnredactableSensitiveFile,
   redactStructuredContent,
   redactSensitiveFileContent
 } from '../src/utils/secret-redactor.js';
+import { RepoMapGenerator } from '../src/agent/repomap.js';
+import { ToolDispatcher } from '../src/engine/tool-dispatcher.js';
+import { PermissionEngine } from '../src/engine/permission-engine.js';
 import { AgentLoop } from '../src/agent/loop.js';
-import { AgentContext, ChatMessage } from '../src/types.js';
+import { AgentContext, ChatMessage, ToolDefinition } from '../src/types.js';
 import { TerminalRenderer } from '../src/ui/renderer.js';
 import { ILLMProvider, ChatProviderResponse, ModelCapabilities } from '../src/providers/types.js';
 
@@ -550,6 +554,156 @@ test('Phase 4 - End-to-end crash recovery restores objectives and profile into a
     assert.equal(agent.getExecutionProfile().privacyPolicy.allowWebAccess, false);
     assert.equal(agent.getContextEngine().getTaskState().objective, 'Refactor database models');
     assert.ok(agent.getContextEngine().getTaskState().decisions.includes('Use UUID v4 for primary keys'));
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+// ============================================================================
+// Phase 5: Cost Enforcement, Reconciliation & Cloud Privacy
+// ============================================================================
+
+test('Phase 5 - Cost Enforcement: reduces output allowance when turn budget is tight', () => {
+  // Model claude-3-5-sonnet: $3.00/M prompt, $15.00/M completion
+  // Prompt: 20,000 tokens (buffered to 23,000) = $0.069 prompt cost
+  // Requested output: 4,096 tokens = $0.06144
+  // Total projected: $0.13044
+  // Turn budget: $0.10
+  const estimate = estimatePreflightCost(
+    20_000,
+    4_096,
+    0.0,
+    'claude-3-5-sonnet',
+    'anthropic',
+    0.10
+  );
+
+  assert.equal(estimate.isKnown, true);
+  assert.equal(estimate.isExceeded, true);
+  assert.equal(estimate.canReduceOutputAllowance, true);
+  assert.ok(estimate.maxAllowableOutputTokens! >= 256);
+  assert.ok(estimate.maxAllowableOutputTokens! < 4096);
+});
+
+test('Phase 5 - Cost Enforcement: marks output reduction impossible when prompt cost alone exceeds budget', () => {
+  // Model claude-3-5-sonnet: $3.00/M prompt
+  // Prompt: 100,000 tokens (buffered to 115,000) = $0.345 prompt cost
+  // Turn budget: $0.20
+  const estimate = estimatePreflightCost(
+    100_000,
+    4_096,
+    0.0,
+    'claude-3-5-sonnet',
+    'anthropic',
+    0.20
+  );
+
+  assert.equal(estimate.isKnown, true);
+  assert.equal(estimate.isExceeded, true);
+  assert.equal(estimate.canReduceOutputAllowance, false);
+});
+
+test('Phase 5 - Cost Enforcement: reconciles estimated cost against actual reported token usage', () => {
+  const preflight = estimatePreflightCost(
+    10_000,
+    2_000,
+    0.10,
+    'claude-3-5-sonnet',
+    'anthropic',
+    1.00
+  );
+
+  const reportedUsage = {
+    promptTokens: 9_500,
+    completionTokens: 500,
+    totalTokens: 10_000,
+    durationMs: 1_500
+  };
+
+  const reconciled = reconcileUsageCost(
+    preflight,
+    reportedUsage,
+    0.10,
+    'claude-3-5-sonnet',
+    'anthropic'
+  );
+
+  assert.equal(reconciled.isKnown, true);
+  assert.ok(reconciled.actualCost > 0);
+  assert.ok(reconciled.reconciledTurnCost > 0.10);
+  assert.equal(typeof reconciled.variance, 'number');
+  assert.equal(reconciled.promptTokensActual, 9_500);
+  assert.equal(reconciled.completionTokensActual, 500);
+});
+
+test('Phase 5 - Cloud Privacy: excludes sensitive and credential files from repository map index', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-repomap-privacy-'));
+  try {
+    const srcDir = path.join(tmpDir, 'src');
+    await fs.mkdir(srcDir, { recursive: true });
+
+    // Normal source code files
+    await fs.writeFile(path.join(srcDir, 'app.ts'), 'export function startApp() { return "ok"; }', 'utf8');
+    await fs.writeFile(path.join(srcDir, 'util.ts'), 'export const helper = 42;', 'utf8');
+
+    // Sensitive / secret-bearing files
+    await fs.writeFile(path.join(tmpDir, 'secrets.json'), '{"apiKey": "top-secret-val"}', 'utf8');
+    await fs.writeFile(path.join(tmpDir, 'service-account.json'), '{"private_key_id": "priv-123"}', 'utf8');
+    await fs.writeFile(path.join(tmpDir, '.env.production'), 'DATABASE_PASSWORD=secret', 'utf8');
+    await fs.writeFile(path.join(tmpDir, 'server.key'), '-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----', 'utf8');
+
+    const mapper = new RepoMapGenerator(tmpDir);
+    const map = await mapper.generateMap(2000);
+
+    assert.ok(map.includes('app.ts'), 'Should index app.ts');
+    assert.ok(map.includes('util.ts'), 'Should index util.ts');
+    assert.ok(!map.includes('secrets.json'), 'Must not index secrets.json');
+    assert.ok(!map.includes('service-account.json'), 'Must not index service-account.json');
+    assert.ok(!map.includes('.env.production'), 'Must not index .env.production');
+    assert.ok(!map.includes('server.key'), 'Must not index server.key');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+test('Phase 5 - Cloud Privacy: unredactable sensitive files fail closed under cloud provider when approval is unavailable', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-unredactable-'));
+  try {
+    const keyPath = path.join(tmpDir, 'private.pem');
+    await fs.writeFile(keyPath, '-----BEGIN RSA PRIVATE KEY-----\nsecret_key_bytes\n-----END RSA PRIVATE KEY-----', 'utf8');
+
+    const dummyTool: ToolDefinition = {
+      name: 'read_file',
+      description: 'read file contents',
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      execute: async () => ({ content: 'key contents' })
+    };
+
+    const permEngine = new PermissionEngine({ isCloud: true });
+    // Dispatcher with NO prompt handler configured (headless / non-interactive)
+    const dispatcher = new ToolDispatcher(permEngine);
+
+    const context: AgentContext = {
+      cwd: tmpDir,
+      autoApprove: true, // Even with autoApprove=true!
+      model: 'claude-3-5-sonnet',
+      provider: 'anthropic'
+    };
+
+    const result = await dispatcher.dispatch(dummyTool, { path: keyPath }, context, { autoApprove: true });
+
+    // Must FAIL CLOSED because unredactable private key cannot be sent to cloud without explicit authorization
+    assert.equal(result.status, 'permission_denied');
+    assert.ok(result.isError);
+    assert.ok(result.output.includes('approval is unavailable') || result.output.includes('cannot be safely redacted'));
+
+    // Now test with promptHandler that approves
+    dispatcher.setPromptHandler({
+      confirmApproval: async () => true
+    });
+
+    const approvedResult = await dispatcher.dispatch(dummyTool, { path: keyPath }, context, { autoApprove: true });
+    assert.equal(approvedResult.status, 'success');
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }

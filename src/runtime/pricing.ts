@@ -113,13 +113,56 @@ export function estimateUsageCost(
 export interface PreflightCostEstimate extends CostEstimate {
   estimatedPromptTokens: number;
   projectedOutputTokens: number;
+  bufferedPromptTokens?: number;
   projectedTurnCost?: number;
   isExceeded: boolean;
+  canReduceOutputAllowance?: boolean;
+  maxAllowableOutputTokens?: number;
   reason?: string;
+}
+
+export interface CostReconciliation {
+  isKnown: boolean;
+  estimatedPreflightCost: number;
+  actualCost: number;
+  variance: number;
+  promptTokensActual: number;
+  completionTokensActual: number;
+  reconciledTurnCost: number;
+}
+
+/**
+ * Reconciles pre-flight estimates against actual reported token usage after request execution.
+ */
+export function reconcileUsageCost(
+  estimatedPreflight: PreflightCostEstimate,
+  actualUsage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | undefined,
+  currentTurnCost: number,
+  modelName: string,
+  providerType?: string
+): CostReconciliation {
+  const usageCost = estimateUsageCost(actualUsage, modelName, providerType);
+  const actualCost = usageCost.isKnown && typeof usageCost.cost === 'number'
+    ? usageCost.cost
+    : (estimatedPreflight.cost || 0);
+  const estimated = estimatedPreflight.cost || 0;
+  const variance = Number((actualCost - estimated).toFixed(6));
+  const reconciledTurnCost = Number((currentTurnCost + actualCost).toFixed(6));
+
+  return {
+    isKnown: usageCost.isKnown,
+    estimatedPreflightCost: estimated,
+    actualCost,
+    variance,
+    promptTokensActual: actualUsage?.promptTokens || estimatedPreflight.estimatedPromptTokens,
+    completionTokensActual: actualUsage?.completionTokens || estimatedPreflight.projectedOutputTokens,
+    reconciledTurnCost
+  };
 }
 
 /**
  * Calculates a conservative pre-flight cost projection before dispatching an LLM request.
+ * Incorporates a 15% uncertainty margin for token estimation variance.
  * Acts BEFORE cloud spend occurs using prompt token estimation and maxOutputTokens bounds.
  */
 export function estimatePreflightCost(
@@ -128,7 +171,8 @@ export function estimatePreflightCost(
   currentTurnCost: number,
   modelName: string,
   providerType?: string,
-  maxCostPerTurn?: number
+  maxCostPerTurn?: number,
+  tokenUncertaintyFactor: number = 1.15
 ): PreflightCostEstimate {
   const pricing = getModelPricing(modelName, providerType);
   if (!pricing) {
@@ -141,12 +185,27 @@ export function estimatePreflightCost(
     };
   }
 
-  const promptCost = (promptTokens * pricing.inputPerMillion) / 1_000_000;
+  // Account for estimation uncertainty in prompt token counts
+  const bufferedPromptTokens = Math.ceil(promptTokens * tokenUncertaintyFactor);
+  const promptCost = (bufferedPromptTokens * pricing.inputPerMillion) / 1_000_000;
   const projectedCompletionCost = (maxOutputTokens * pricing.outputPerMillion) / 1_000_000;
   const projectedRequestCost = promptCost + projectedCompletionCost;
   const projectedTotalTurnCost = currentTurnCost + projectedRequestCost;
 
   const isExceeded = typeof maxCostPerTurn === 'number' && maxCostPerTurn > 0 && projectedTotalTurnCost > maxCostPerTurn;
+
+  // Compute potential output allowance reduction if exceeded
+  let maxAllowableOutputTokens = 0;
+  let canReduceOutputAllowance = false;
+
+  if (isExceeded && typeof maxCostPerTurn === 'number' && pricing.outputPerMillion > 0) {
+    const remainingBudget = maxCostPerTurn - currentTurnCost;
+    const availableForOutput = remainingBudget - promptCost;
+    if (availableForOutput > 0) {
+      maxAllowableOutputTokens = Math.floor((availableForOutput * 1_000_000) / pricing.outputPerMillion);
+      canReduceOutputAllowance = maxAllowableOutputTokens >= 256;
+    }
+  }
 
   return {
     isKnown: true,
@@ -155,8 +214,11 @@ export function estimatePreflightCost(
     promptCost: Number(promptCost.toFixed(6)),
     completionCost: Number(projectedCompletionCost.toFixed(6)),
     estimatedPromptTokens: promptTokens,
+    bufferedPromptTokens,
     projectedOutputTokens: maxOutputTokens,
     isExceeded,
+    canReduceOutputAllowance,
+    maxAllowableOutputTokens: isExceeded ? maxAllowableOutputTokens : undefined,
     reason: isExceeded
       ? `Projected cost ($${projectedTotalTurnCost.toFixed(4)}) would exceed maximum allowed spend per turn ($${maxCostPerTurn.toFixed(2)}).`
       : undefined

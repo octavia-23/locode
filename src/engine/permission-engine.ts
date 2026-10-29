@@ -1,6 +1,8 @@
 import { ToolDefinition, AgentContext } from '../types.js';
 import { PermissionEvaluation, ToolDispatchOptions } from './types.js';
 import { resolveSafePath, classifyCommandSecurity, isDangerousCommand, isSsrfSafeUrl } from '../tools/security.js';
+import { isUnredactableSensitiveFile } from '../utils/secret-redactor.js';
+import { isCloudProvider } from '../providers/factory.js';
 
 export interface PermissionPolicy {
   readOnly?: boolean;
@@ -116,7 +118,28 @@ export class PermissionEngine {
       }
     }
 
-    // 5. Command security classification (deny, ask, allow)
+    // 5. Cloud privacy check: unredactable sensitive files require explicit authorization
+    const isCloud = isCloudProvider(context.provider);
+    if (isCloud && pathsToCheck.length > 0) {
+      for (const p of pathsToCheck) {
+        if (isUnredactableSensitiveFile(p)) {
+          if (!isApprovalAvailable && !options?.authorizedForCloud) {
+            return {
+              allowed: false,
+              requiresPrompt: false,
+              reason: `Permission Denied: File "${p}" contains unredactable sensitive cryptographic keys/secrets. Transmission to cloud provider is blocked without explicit interactive authorization.`
+            };
+          }
+          return {
+            allowed: true,
+            requiresPrompt: true,
+            reason: `File "${p}" contains sensitive cryptographic credentials that cannot be safely redacted. Explicit authorization is required to transmit content to cloud provider.`
+          };
+        }
+      }
+    }
+
+    // 6. Command security classification (deny, ask, allow)
     if (tool.name === 'run_command') {
       const cmd = String(args.command || args.cmd || '').trim();
       const check = classifyCommandSecurity(cmd);

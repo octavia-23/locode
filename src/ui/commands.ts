@@ -11,6 +11,7 @@ import { createLLMProvider, isCloudProvider, resolveProvider } from '../provider
 import { getApiKeyForProvider } from '../utils/config.js';
 import { ProviderType } from '../types.js';
 import { theme } from './theme.js';
+import { JournalRecoveryManager } from '../journal/recovery.js';
 
 export async function handleSlashCommand(
   input: string,
@@ -44,6 +45,8 @@ export async function handleSlashCommand(
         ['/file [path]', 'Execute prompt from a text/markdown file'],
         ['/memory', 'View persisted project session memory'],
         ['/clear', 'Reset conversation memory'],
+        ['/resume', 'Resume interrupted task from durable execution journal'],
+        ['/journal', 'Inspect durable execution journal status'],
         ['/tools', 'List registered agent tools'],
         ['/exit', 'Exit locode']
       ];
@@ -459,6 +462,82 @@ export async function handleSlashCommand(
         console.log(`  ${theme.muted('decisions:')}`);
         for (const d of data.lastDecisions) {
           console.log(`    ${theme.bullet} ${theme.muted(d)}`);
+        }
+      }
+      console.log();
+      return true;
+    }
+
+    case '/resume': {
+      renderer.startSpinner('inspecting execution journal and workspace integrity...');
+      const report = await agent.resumeTask();
+      renderer.stopSpinner();
+      if (!report.hasJournal) {
+        console.log(`\n  ${theme.muted('no durable execution journal found in .locode/journal')}\n`);
+      } else if (report.canSafelyResume) {
+        console.log(`\n  ${theme.diamond} ${theme.strong('Durable Journal Resume')}\n`);
+        console.log(`    ${theme.muted('task'.padEnd(14))} ${theme.secondary(report.snapshot?.objective || 'unspecified')}`);
+        console.log(`    ${theme.muted('status'.padEnd(14))} ${theme.check} ${theme.success('resumed safely')}`);
+        if (report.reconciledTools.length > 0) {
+          console.log(`    ${theme.muted('reconciled'.padEnd(14))} ${theme.accent(`${report.reconciledTools.length} tool calls`)}`);
+        }
+        if (report.lastVerification) {
+          console.log(`    ${theme.muted('verification'.padEnd(14))} ${report.lastVerification.isValid ? theme.check + ' ' + theme.success(report.lastVerification.status) : theme.cross + ' ' + theme.error(report.lastVerification.status + ' (' + report.lastVerification.invalidationReason + ')')}`);
+        }
+        console.log();
+      } else {
+        console.log(`\n  ${theme.diamond} ${theme.strong('Journal Recovery Blocked')}\n`);
+        console.log(`    ${theme.muted('reason'.padEnd(14))} ${theme.error(report.reason || 'Uncertain state detected')}`);
+        if (report.divergences.length > 0) {
+          console.log(`    ${theme.muted('divergences:')}`);
+          for (const d of report.divergences) {
+            console.log(`      ${theme.bullet} ${theme.error(d)}`);
+          }
+        }
+        if (report.reconciledTools.length > 0) {
+          console.log(`    ${theme.muted('uncertain tools:')}`);
+          for (const t of report.reconciledTools) {
+            console.log(`      ${theme.bullet} ${theme.secondary(t.toolName)}: ${theme.muted(t.details)}`);
+          }
+        }
+        console.log();
+      }
+      return true;
+    }
+
+    case '/journal': {
+      const journalDir = path.join(cwd, '.locode', 'journal');
+      const recoveryManager = new JournalRecoveryManager(cwd, journalDir);
+      renderer.startSpinner('reading durable execution journal...');
+      const report = await recoveryManager.inspectWorkspaceAndJournal();
+      renderer.stopSpinner();
+
+      if (!report.hasJournal) {
+        console.log(`\n  ${theme.muted('no durable execution journal found in .locode/journal')}\n`);
+        return true;
+      }
+
+      console.log(`\n  ${theme.diamond} ${theme.strong('Durable Execution Journal')}\n`);
+      console.log(`    ${theme.muted('session id'.padEnd(16))} ${theme.secondary(report.sessionId || 'n/a')}`);
+      console.log(`    ${theme.muted('task id'.padEnd(16))} ${theme.secondary(report.taskId || 'n/a')}`);
+      console.log(`    ${theme.muted('task state'.padEnd(16))} ${theme.secondary(report.taskState || 'unknown')}`);
+      console.log(`    ${theme.muted('objective'.padEnd(16))} ${theme.secondary(report.snapshot?.objective || 'none')}`);
+      console.log(`    ${theme.muted('safe to resume'.padEnd(16))} ${report.canSafelyResume ? theme.check + ' ' + theme.success('yes') : theme.cross + ' ' + theme.error('no')}`);
+      if (report.reason) {
+        console.log(`    ${theme.muted('resume note'.padEnd(16))} ${theme.muted(report.reason)}`);
+      }
+      if (report.snapshot) {
+        console.log(`    ${theme.muted('last sequence'.padEnd(16))} ${theme.secondary(String(report.snapshot.lastSeq))}`);
+        console.log(`    ${theme.muted('recorded tools'.padEnd(16))} ${theme.secondary(String(Object.keys(report.snapshot.toolCalls).length))}`);
+        console.log(`    ${theme.muted('tracked files'.padEnd(16))} ${theme.secondary(String(Object.keys(report.snapshot.fileHashes).length))}`);
+      }
+      if (report.lastVerification) {
+        console.log(`    ${theme.muted('last verify'.padEnd(16))} ${theme.code(report.lastVerification.command)} -> ${report.lastVerification.status} (valid: ${report.lastVerification.isValid})`);
+      }
+      if (report.reconciledTools.length > 0) {
+        console.log(`\n    ${theme.muted('tool reconciliations:')}`);
+        for (const t of report.reconciledTools) {
+          console.log(`      ${theme.bullet} ${theme.secondary(t.toolName)} (${t.toolCallId}): ${theme.muted(t.resolution)} - ${t.details}`);
         }
       }
       console.log();

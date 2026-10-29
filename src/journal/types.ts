@@ -54,6 +54,8 @@ export interface ModelResponseReceivedPayload {
     completionTokens: number;
     totalTokens: number;
   };
+  reconciledCost?: number;
+  costVariance?: number;
   proposedToolCallsCount: number;
   hasTextContent: boolean;
 }

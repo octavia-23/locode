@@ -52,6 +52,7 @@ program
   .option('--api-key <key>', 'API key for cloud or OpenAI-compatible provider')
   .option('-y, --yes', 'Automatically approve all tool executions without prompting', false)
   .option('--auto', 'Run in Autonomous Mode (alias for -y, --yes)', false)
+  .option('--resume', 'Resume interrupted task from durable execution journal', false)
   .option('-f, --file <path>', 'Load prompt from a text/markdown file')
   .option('-d, --dir <path>', 'Workspace directory', process.cwd())
   .option('--architect <model>', 'Secondary deep reasoning / architect model for complex bug escalation')
@@ -246,6 +247,18 @@ async function main() {
         `unable to connect to ${provName} at ${context.apiBase || context.ollamaHost}.\n` +
         `  ensure local LLM backend is running.`
       );
+    }
+  }
+
+  // Resume task if requested via CLI
+  if (options.resume) {
+    renderer.printHeader(context.model, context.cwd, context.autoApprove, context.hardwareProfile, context.numCtx, context.provider);
+    console.log(`  ${theme.promptGlyph} ${theme.strong('Resuming interrupted task from execution journal...')}\n`);
+    const report = await agent.resumeTask();
+    if (report.canSafelyResume && report.snapshot?.objective && !promptArgs) {
+      await agent.run(`Continue previous task: ${report.snapshot.objective}`);
+      renderer.stopSpinner();
+      return;
     }
   }
 

@@ -130,3 +130,28 @@ export function formatString(s: string) { return s.trim(); }
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('RepoMapGenerator - PageRank personalization boosts focus/dirty files', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-repomap-focus-'));
+
+  try {
+    const srcDir = path.join(tmpDir, 'src');
+    await fs.mkdir(srcDir, { recursive: true });
+
+    await fs.writeFile(path.join(srcDir, 'core.ts'), 'export class CoreService {}', 'utf8');
+    await fs.writeFile(path.join(srcDir, 'auth.ts'), 'import { CoreService } from "./core.js"; export class AuthService {}', 'utf8');
+    await fs.writeFile(path.join(srcDir, 'target-leaf.ts'), 'export function leafOperation() {}', 'utf8');
+
+    const generator = new RepoMapGenerator(tmpDir);
+    // Explicitly focus on target-leaf.ts (e.g. edited file / working set)
+    const focusedMap = await generator.generateMap(10, 2000, ['src/target-leaf.ts']);
+
+    assert.ok(focusedMap.includes('target-leaf.ts'));
+    assert.ok(focusedMap.includes('leafOperation'));
+    const targetIdx = focusedMap.indexOf('target-leaf.ts');
+    const coreIdx = focusedMap.indexOf('core.ts');
+    assert.ok(targetIdx < coreIdx, `Focused file (idx ${targetIdx}) must rank ahead of un-focused files (idx ${coreIdx})`);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});

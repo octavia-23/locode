@@ -1,3 +1,5 @@
+import type { HardwareProfile } from '../hardware/detector.js';
+
 export type InferenceProfileName = 'ultra-context' | 'performance' | 'large-context' | 'balanced' | 'custom';
 
 export interface LlamaRuntimeConfig {
@@ -56,8 +58,8 @@ export const INFERENCE_PROFILES: Record<InferenceProfileName, Partial<LlamaRunti
     batchSize: 2048,
     ubatchSize: 512,
     flashAttention: true,
-    cacheTypeK: 'turbo4',
-    cacheTypeV: 'turbo4',
+    cacheTypeK: 'q4_0',
+    cacheTypeV: 'q4_0',
     noMmap: true,
     mlock: true,
     threads: 12,
@@ -67,7 +69,7 @@ export const INFERENCE_PROFILES: Record<InferenceProfileName, Partial<LlamaRunti
   },
   'large-context': {
     profileName: 'large-context',
-    contextSize: 65536,
+    contextSize: 131072,
     nCpuMoe: 24,
     nGpuLayers: 999,
     batchSize: 2048,
@@ -84,14 +86,14 @@ export const INFERENCE_PROFILES: Record<InferenceProfileName, Partial<LlamaRunti
   },
   balanced: {
     profileName: 'balanced',
-    contextSize: 16384,
+    contextSize: 65536,
     nCpuMoe: 28,
     nGpuLayers: 999,
     batchSize: 1024,
     ubatchSize: 256,
     flashAttention: true,
-    cacheTypeK: 'turbo4',
-    cacheTypeV: 'turbo4',
+    cacheTypeK: 'q8_0',
+    cacheTypeV: 'q8_0',
     noMmap: false,
     mlock: false,
     threads: 8,
@@ -103,6 +105,71 @@ export const INFERENCE_PROFILES: Record<InferenceProfileName, Partial<LlamaRunti
     profileName: 'custom'
   }
 };
+
+/**
+ * Resolves a full runtime configuration given a profile name and optional overrides.
+ */
+export function resolveProfileConfig(
+  profileName: InferenceProfileName = 'balanced',
+  overrides?: Partial<LlamaRuntimeConfig>
+): LlamaRuntimeConfig {
+  const baseProfile = INFERENCE_PROFILES[profileName] || INFERENCE_PROFILES.balanced;
+  return {
+    profileName,
+    modelPath: process.env.LOCODE_LOCAL_MODEL_PATH || DEFAULT_QWEN_MODEL_PATH,
+    modelAlias: DEFAULT_QWEN_MODEL_ALIAS,
+    serverPath: process.env.LOCODE_LLAMA_SERVER_PATH,
+    host: '127.0.0.1',
+    port: process.env.LOCODE_LOCAL_MODEL_PORT ? parseInt(process.env.LOCODE_LOCAL_MODEL_PORT, 10) : 8081,
+    autoPort: true,
+    autoStart: process.env.LOCODE_LOCAL_MODEL_AUTO_START !== 'false',
+    contextSize: baseProfile.contextSize || 65536,
+    nCpuMoe: baseProfile.nCpuMoe ?? 28,
+    nGpuLayers: baseProfile.nGpuLayers ?? 999,
+    batchSize: baseProfile.batchSize ?? 1024,
+    ubatchSize: baseProfile.ubatchSize ?? 256,
+    flashAttention: baseProfile.flashAttention ?? true,
+    cacheTypeK: baseProfile.cacheTypeK || 'q8_0',
+    cacheTypeV: baseProfile.cacheTypeV || 'q8_0',
+    noMmap: baseProfile.noMmap ?? false,
+    mlock: baseProfile.mlock ?? false,
+    threads: baseProfile.threads ?? 8,
+    jinja: baseProfile.jinja ?? true,
+    cacheReuse: baseProfile.cacheReuse ?? 256,
+    reasoningFormat: baseProfile.reasoningFormat || 'none',
+    ...baseProfile,
+    ...overrides
+  };
+}
+
+/**
+ * Hardware-adaptive profile mapper:
+ * - < 10240 MB effective VRAM/unified RAM -> 'performance' (32768, q4_0 KV)
+ * - 10240 MB - 24576 MB effective VRAM/unified RAM -> 'balanced' (65536, q8_0 KV)
+ * - 24577 MB - 49152 MB effective VRAM/unified RAM -> 'large-context' (131072, turbo4 KV)
+ * - > 49152 MB effective VRAM/unified RAM -> 'ultra-context' (262144, turbo4/turbo3 KV)
+ */
+export function resolveProfileForHardware(
+  profile: HardwareProfile,
+  overrides?: Partial<LlamaRuntimeConfig>
+): LlamaRuntimeConfig {
+  const effectiveMemoryMb = (profile.totalVramMb && profile.totalVramMb > 0)
+    ? profile.totalVramMb
+    : profile.totalRamMb;
+  let selectedProfile: InferenceProfileName;
+
+  if (effectiveMemoryMb < 10240) {
+    selectedProfile = 'performance';
+  } else if (effectiveMemoryMb <= 24576) {
+    selectedProfile = 'balanced';
+  } else if (effectiveMemoryMb <= 49152) {
+    selectedProfile = 'large-context';
+  } else {
+    selectedProfile = 'ultra-context';
+  }
+
+  return resolveProfileConfig(selectedProfile, overrides);
+}
 
 /**
  * Phase 4: Unified Local and Cloud Execution Profiles

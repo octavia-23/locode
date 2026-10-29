@@ -172,6 +172,11 @@ export class TerminalRenderer {
     } else if (name === 'edit_file') {
       const p = args.path || args.target_file || '';
       console.log(`${theme.actionDot} Update ${theme.path(p)}`);
+    } else if (name === 'multi_edit_file') {
+      const fileCount = Array.isArray(args.files) ? args.files.length : (args.path ? 1 : (Array.isArray(args.edits) ? new Set(args.edits.map((e: any) => e.path)).size : 0));
+      console.log(`${theme.actionDot} Multi-edit ${theme.path(args.path || `${fileCount} file(s)`)}`);
+    } else if (name === 'delegate_task') {
+      console.log(`${theme.actionDot} Delegate to ${theme.code(args.role || 'subagent')}: ${theme.dim(args.instruction || '')}`);
     } else if (name === 'write_file') {
       const p = args.path || '';
       console.log(`${theme.actionDot} Write ${theme.path(p)}`);

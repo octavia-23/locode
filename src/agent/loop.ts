@@ -34,6 +34,9 @@ import { ExecutionState, DurableToolResult } from '../engine/types.js';
 import { HarnessExecutionProfile, resolveExecutionProfile } from '../runtime/profiles.js';
 import { ExecutionJournal } from '../journal/journal.js';
 import { JournalRecoveryManager, RecoveryInspectionReport } from '../journal/recovery.js';
+import { SessionRunner } from '../engine/session-runner.js';
+import { TurnExecutor, isReadOnlyTool } from '../engine/turn-executor.js';
+import { RepairCoordinator } from '../engine/repair-coordinator.js';
 
 export interface SessionStats {
   turns: number;
@@ -154,6 +157,8 @@ export class AgentLoop {
   private recoveryController: RecoveryController;
   private permissionEngine: PermissionEngine;
   private journal: ExecutionJournal;
+  private sessionRunner: SessionRunner;
+  private repairCoordinator: RepairCoordinator;
 
   constructor(context: AgentContext, renderer: TerminalRenderer, customProvider?: ILLMProvider) {
     this.context = context;
@@ -168,10 +173,12 @@ export class AgentLoop {
     this.mcpManager = new MCPManager(context.cwd, { trusted: context.trustProjectMcp ?? false });
     this.sessionMemory = new SessionMemory(context.cwd);
     this.journal = new ExecutionJournal({ cwd: context.cwd });
+    this.sessionRunner = new SessionRunner(context.cwd, this.journal, this.sessionMemory);
 
     const isCloud = isCloudProvider(this.context.provider);
     const defaultThresholds = isCloud ? CLOUD_STAGNATION_THRESHOLDS : DEFAULT_STAGNATION_THRESHOLDS;
     this.stagnationDetector = new StagnationDetector({ ...defaultThresholds, ...context.stagnationThresholds });
+    this.repairCoordinator = new RepairCoordinator(context.cwd, this.checkpointManager, this.stagnationDetector);
 
     this.executionProfile = resolveExecutionProfile(isCloud);
     this.permissionEngine = new PermissionEngine({
@@ -209,6 +216,14 @@ export class AgentLoop {
 
   getJournal(): ExecutionJournal {
     return this.journal;
+  }
+
+  getSessionRunner(): SessionRunner {
+    return this.sessionRunner;
+  }
+
+  getRepairCoordinator(): RepairCoordinator {
+    return this.repairCoordinator;
   }
 
   /**
@@ -487,96 +502,8 @@ export class AgentLoop {
    * Normalizes raw LLM generation results into structured outcomes,
    * cleanly distinguishing text responses, tool calls, empty responses, and provider errors.
    */
-  private normalizeResponse(response: any, rawError?: any): NormalizedGeneration {
-    if (rawError) {
-      const cause = rawError.cause ? ` (${rawError.cause.code || rawError.cause.message || rawError.cause})` : '';
-      const msg = (rawError.message || String(rawError)) + cause;
-      const isRetryable = /timeout|econnreset|econnrefused|fetch failed|network|socket|503|502|429/i.test(msg);
-      return {
-        type: isRetryable ? 'PROVIDER_ERROR_RETRYABLE' : 'PROVIDER_ERROR_FATAL',
-        rawContent: '',
-        cleanedText: '',
-        errorMessage: msg
-      };
-    }
-
-    const content = response.content || '';
-    let toolCalls = response.tool_calls;
-
-    // Standardize tool calls if present
-    let formattedToolCalls: Array<{ id?: string; type?: string; function: { name: string; arguments: Record<string, any> } }> | undefined;
-    if (toolCalls && Array.isArray(toolCalls) && toolCalls.length > 0) {
-      formattedToolCalls = toolCalls.map((tc: any, idx: number) => {
-        let args = tc.function?.arguments;
-        if (typeof args === 'string') {
-          try {
-            args = JSON.parse(args);
-          } catch {
-            args = {};
-          }
-        }
-        return {
-          id: tc.id || `call_${Date.now()}_${idx}`,
-          type: 'function',
-          function: {
-            name: tc.function?.name || '',
-            arguments: args || {}
-          },
-          ...(tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : {}),
-          ...(tc.thought_signature ? { thought_signature: tc.thought_signature } : {})
-        };
-      });
-    }
-
-    // Clean text and check for fallback tool call extraction
-    let cleanedText = content.trim();
-
-    if (!formattedToolCalls || formattedToolCalls.length === 0) {
-      // Qwen 35B A3B / MoE Tool Call Rescue:
-      // Rescue tool calls that were serialized as XML, Python calls, or JSON into message content
-      const extracted = extractToolCalls(content);
-      if (extracted.hasToolCalls) {
-        formattedToolCalls = extracted.toolCalls;
-        cleanedText = extracted.cleanedText;
-      }
-    } else {
-      // Native tool calls present: strip any leaked XML / JSON tags from cleanedText
-      cleanedText = cleanedText
-        .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
-        .replace(/<(?:function|call)[=:\s]+[\s\S]*?<\/(?:function|call)>/gi, '')
-        .replace(/```(?:tool_call|json)?\s*\{\s*"name"\s*:\s*"[^"]+".*?\}\s*```/gis, '')
-        .trim();
-    }
-
-    if (formattedToolCalls && formattedToolCalls.length > 0) {
-      return {
-        type: 'TOOL_CALLS',
-        rawContent: content,
-        cleanedText,
-        toolCalls: formattedToolCalls,
-        stopReason: response.stopReason,
-        usage: response.usage
-      };
-    }
-
-    // If completely empty or whitespace only
-    if (!cleanedText && !content.trim()) {
-      return {
-        type: 'EMPTY_RESPONSE',
-        rawContent: '',
-        cleanedText: '',
-        stopReason: response.stopReason,
-        usage: response.usage
-      };
-    }
-
-    return {
-      type: 'TEXT_FINAL',
-      rawContent: content,
-      cleanedText,
-      stopReason: response.stopReason,
-      usage: response.usage
-    };
+  public normalizeResponse(response: any, rawError?: any): NormalizedGeneration {
+    return TurnExecutor.normalizeResponse(response, rawError);
   }
 
   async run(userInput: string) {
@@ -1133,12 +1060,14 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         });
 
         // Save session memory for instant recall next time
+        const checkpointSummary = this.contextEngine.getLatestCheckpoint();
         await this.sessionMemory.saveSession({
           model: this.context.model,
           messages: this.messages,
           lastDecisions: this.contextEngine.getTaskState().decisions,
           recentFiles: this.contextEngine.getTaskState().relevantFiles,
-          summary: outcome.rawContent
+          summary: outcome.rawContent,
+          checkpoint: checkpointSummary
         });
 
         await this.journal.recordEvent('task_completed', {
@@ -1150,7 +1079,8 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         await this.journal.createSnapshot({
           pendingObjectives: this.contextEngine.getTaskState().pendingObjectives,
           completedObjectives: this.contextEngine.getTaskState().completedObjectives,
-          decisions: this.contextEngine.getTaskState().decisions
+          decisions: this.contextEngine.getTaskState().decisions,
+          checkpoint: checkpointSummary
         });
         break;
       }
@@ -1240,56 +1170,38 @@ The modifications introduced compilation, syntax, or test errors. Analyze the st
         }
       }
 
-      // Safe Concurrency & Parallel Tool Execution:
-      // When allowParallelTools is true, passive read-only tool calls may execute concurrently.
-      // If allowParallelTools is false or ANY tool in the batch mutates state, strictly enforce sequential execution.
+      // Safe Concurrency & Parallel Tool Execution via TurnExecutor:
+      // When allowParallelTools is true and all tools are read-only, execute concurrently.
       const canRunParallel = this.executionProfile.allowParallelTools &&
         toolCalls.length > 1 &&
-        toolCalls.every(c => isPassiveTool(c.function.name));
+        toolCalls.every(c => isReadOnlyTool(c.function.name));
 
       if (canRunParallel) {
         this.renderer.startSpinner(`Executing ${toolCalls.length} read operations in parallel...`);
-        const parallelResults = await Promise.all(
-          toolCalls.map(async (call) => {
-            this.stats.toolCalls++;
-            const tool = toolRegistry.get(call.function.name);
-            if (!tool) {
-              return {
-                call,
-                output: `Tool "${call.function.name}" is not registered.`,
-                isError: true
-              };
-            }
-            const durableResult = await this.toolDispatcher.dispatch(
-              tool,
-              call.function.arguments || {},
-              this.context,
-              call.id,
-              {
-                autoApprove: this.context.autoApprove,
-                allowNetwork: this.executionProfile.privacyPolicy.allowWebAccess,
-                signal: effectiveSignal
-              }
-            );
-            return {
-              call,
-              output: durableResult.output,
-              isError: durableResult.isError
-            };
-          })
+        const batchRes = await TurnExecutor.executeToolBatch(
+          toolCalls,
+          this.toolDispatcher,
+          this.context,
+          {
+            allowParallelTools: true,
+            autoApprove: this.context.autoApprove,
+            allowNetwork: this.executionProfile.privacyPolicy.allowWebAccess,
+            signal: effectiveSignal
+          }
         );
         this.renderer.stopSpinner();
 
-        for (const res of parallelResults) {
+        for (const res of batchRes.results) {
+          this.stats.toolCalls++;
           readStepCount++;
-          this.renderer.printToolResult(res.call.function.name, res.output, res.isError);
+          this.renderer.printToolResult(res.toolName, res.output, res.isError);
           this.messages.push({
             role: 'tool',
-            name: res.call.function.name,
-            tool_call_id: res.call.id,
+            name: res.toolName,
+            tool_call_id: res.callId,
             content: res.output
           });
-          progress.recentToolSignatures.push(`${res.call.function.name}:${JSON.stringify(res.call.function.arguments || {})}`);
+          progress.recentToolSignatures.push(`${res.toolName}:${JSON.stringify(res.arguments || {})}`);
         }
         continue;
       }
@@ -1382,8 +1294,17 @@ You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetH
         }
 
         // Checkpoint record pre-edit file if mutation tool
-        const isFileMutationTool = (toolName === 'edit_file' || toolName === 'write_file') && Boolean(toolArgs.path);
-        if (isFileMutationTool && toolArgs.path) {
+        const isFileMutationTool = (toolName === 'edit_file' || toolName === 'write_file' || toolName === 'multi_edit_file');
+        if (toolName === 'multi_edit_file') {
+          const paths: string[] = [
+            ...(toolArgs.path ? [toolArgs.path] : []),
+            ...(Array.isArray(toolArgs.files) ? toolArgs.files.map((f: any) => f?.path) : []),
+            ...(Array.isArray(toolArgs.edits) ? toolArgs.edits.map((e: any) => e?.path) : [])
+          ].filter(p => typeof p === 'string');
+          for (const p of new Set(paths)) {
+            await this.checkpointManager.recordPreEditFile(p);
+          }
+        } else if (isFileMutationTool && toolArgs.path) {
           await this.checkpointManager.recordPreEditFile(toolArgs.path);
         }
 
@@ -1460,7 +1381,7 @@ You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetH
             progress.consecutiveToolFailures = 0;
           }
 
-          if (toolName === 'edit_file' || toolName === 'write_file') {
+          if (toolName === 'edit_file' || toolName === 'write_file' || toolName === 'multi_edit_file') {
             progress.singleFileObsession = false;
             if (toolArgs.path) progress.fileReadTurns.delete(toolArgs.path);
           }
@@ -1496,7 +1417,33 @@ You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetH
           progress.successfulToolCount++;
           progress.consecutiveToolFailures = 0;
 
-          if ((toolName === 'edit_file' || toolName === 'write_file') && toolArgs.path) {
+          if (toolName === 'multi_edit_file') {
+            const paths: string[] = [
+              ...(toolArgs.path ? [toolArgs.path] : []),
+              ...(Array.isArray(toolArgs.files) ? toolArgs.files.map((f: any) => f?.path) : []),
+              ...(Array.isArray(toolArgs.edits) ? toolArgs.edits.map((e: any) => e?.path) : [])
+            ].filter(p => typeof p === 'string');
+            for (const p of new Set(paths)) {
+              const editCount = (progress.fileEditCounts.get(p) || 0) + 1;
+              progress.fileEditCounts.set(p, editCount);
+              hasModifiedCode = true;
+              progress.filesModified.add(p);
+
+              // Immediate in-line syntax and type diagnostic check
+              try {
+                const lintResult = await CodeVerifier.runFastLint(this.context.cwd, p);
+                if (!lintResult.passed && lintResult.errorOutput) {
+                  executionResult.result += `\n\n[AUTOMATED LINTER / TYPECHECK FEEDBACK]:\nYour modification to "${p}" introduced compiler/type diagnostics (\`${lintResult.command}\`):\n\`\`\`\n${lintResult.errorOutput}\n\`\`\`\nPlease inspect the diagnostic above and resolve it on your next step.`;
+                }
+              } catch {}
+            }
+            progress.singleFileObsession = false;
+            progress.obsessedFilePath = '';
+            progress.consecutiveCycleDetections = 0;
+            this.stagnationDetector.resetRecoveryAttempts();
+            this.recoveryController.resetRepetitionOnRealChange();
+            progress.recentToolSignatures = [];
+          } else if ((toolName === 'edit_file' || toolName === 'write_file') && toolArgs.path) {
             const editCount = (progress.fileEditCounts.get(toolArgs.path) || 0) + 1;
             progress.fileEditCounts.set(toolArgs.path, editCount);
 

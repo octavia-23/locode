@@ -8,6 +8,7 @@ export interface SerializedSession {
   cwd: string;
   model: string;
   summary?: string;
+  checkpoint?: string;
   lastDecisions: string[];
   recentFiles: string[];
   messages: ChatMessage[];
@@ -59,6 +60,7 @@ export class SessionMemory {
     lastDecisions?: string[];
     recentFiles?: string[];
     summary?: string;
+    checkpoint?: string;
   }): Promise<void> {
     try {
       await fs.mkdir(this.sessionDir, { recursive: true });
@@ -76,6 +78,7 @@ export class SessionMemory {
         cwd: this.cwd,
         model: sessionData.model,
         summary: sessionData.summary,
+        checkpoint: sessionData.checkpoint,
         lastDecisions: sessionData.lastDecisions || [],
         recentFiles: sessionData.recentFiles || [],
         messages: savedMessages

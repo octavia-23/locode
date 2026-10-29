@@ -360,6 +360,7 @@ export class ExecutionJournal {
     pendingObjectives?: string[];
     completedObjectives?: string[];
     decisions?: string[];
+    checkpoint?: string;
   }): Promise<DurableJournalSnapshot> {
     if (additionalState) {
       if (additionalState.pendingObjectives) {
@@ -370,6 +371,9 @@ export class ExecutionJournal {
       }
       if (additionalState.decisions) {
         this.snapshot.decisions = [...additionalState.decisions];
+      }
+      if (additionalState.checkpoint) {
+        this.snapshot.checkpoint = additionalState.checkpoint;
       }
     }
 

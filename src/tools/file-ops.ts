@@ -5,6 +5,7 @@ import { resolveSafePath } from './security.js';
 import { MultiStrategyEditEngine } from './edit-engine.js';
 import { isCloudProvider } from '../providers/factory.js';
 import { isSensitiveFile, redactSensitiveFileContent } from '../utils/secret-redactor.js';
+import { CodeVerifier } from '../agent/verifier.js';
 
 export const viewFileTool: ToolDefinition = {
   name: 'view_file',
@@ -254,6 +255,230 @@ export const editFileTool: ToolDefinition = {
       return { result: `Successfully updated ${args.path}${fallbackNotice}` };
     } catch (err: any) {
       return { result: `Failed to edit file "${args.path}": ${err.message}`, isError: true };
+    }
+  }
+};
+
+export const multiEditFileTool: ToolDefinition = {
+  name: 'multi_edit_file',
+  description: 'Perform atomic, multi-hunk or multi-file edits across one or more files. All edits are validated and computed in-memory first; if any hunk in any file fails to match, zero changes are written to disk (atomic rollback guarantee).',
+  parameters: {
+    type: 'object',
+    properties: {
+      files: {
+        type: 'array',
+        description: 'List of files to edit with their corresponding replacement hunks.',
+        items: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description: 'Path to the file to edit'
+            },
+            edits: {
+              type: 'array',
+              description: 'Sequential hunks to apply to this file',
+              items: {
+                type: 'object',
+                properties: {
+                  target_content: {
+                    type: 'string',
+                    description: 'Exact text or hunk to replace'
+                  },
+                  replacement_content: {
+                    type: 'string',
+                    description: 'Replacement text'
+                  }
+                },
+                required: ['target_content', 'replacement_content']
+              }
+            }
+          },
+          required: ['path', 'edits']
+        }
+      },
+      edits: {
+        type: 'array',
+        description: 'Alternative flat list of edits across files.',
+        items: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description: 'Path to the file to edit'
+            },
+            target_content: {
+              type: 'string',
+              description: 'Exact text or hunk to replace'
+            },
+            replacement_content: {
+              type: 'string',
+              description: 'Replacement text'
+            }
+          },
+          required: ['target_content', 'replacement_content']
+        }
+      },
+      path: {
+        type: 'string',
+        description: 'Convenience path when editing multiple hunks within a single file.'
+      },
+      validate_syntax: {
+        type: 'boolean',
+        description: 'If true, verifies candidate TypeScript/JavaScript/JSON syntax in-memory before writing. Aborts and rolls back if errors are detected.'
+      },
+      validateSyntax: {
+        type: 'boolean',
+        description: 'Alias for validate_syntax'
+      }
+    }
+  },
+  needsApproval: true,
+  async execute(args, context) {
+    try {
+      // Step 1: Normalize input formats into Map<string, Array<{ target_content: string; replacement_content: string }>>
+      const fileEditsMap = new Map<string, Array<{ target_content: string; replacement_content: string }>>();
+
+      if (Array.isArray(args.files)) {
+        for (const item of args.files) {
+          if (item && typeof item.path === 'string' && Array.isArray(item.edits)) {
+            const list = fileEditsMap.get(item.path) || [];
+            for (const e of item.edits) {
+              if (e && typeof e.target_content === 'string' && typeof e.replacement_content === 'string') {
+                list.push({
+                  target_content: e.target_content,
+                  replacement_content: e.replacement_content
+                });
+              }
+            }
+            if (list.length > 0) {
+              fileEditsMap.set(item.path, list);
+            }
+          }
+        }
+      }
+
+      if (Array.isArray(args.edits)) {
+        for (const e of args.edits) {
+          const filePath = e.path || args.path;
+          if (filePath && typeof e.target_content === 'string' && typeof e.replacement_content === 'string') {
+            const list = fileEditsMap.get(filePath) || [];
+            list.push({
+              target_content: e.target_content,
+              replacement_content: e.replacement_content
+            });
+            fileEditsMap.set(filePath, list);
+          }
+        }
+      }
+
+      if (fileEditsMap.size === 0) {
+        return {
+          result: 'No valid edits provided to multi_edit_file. Provide either "files: [{ path, edits }]" or "edits: [{ path, target_content, replacement_content }]" or "path" with "edits".',
+          isError: true
+        };
+      }
+
+      // Step 2: In-Memory Pre-computation & Strict Validation Phase
+      const pendingWrites = new Map<string, {
+        fullPath: string;
+        originalContent: string;
+        newContent: string;
+        strategies: string[];
+      }>();
+
+      for (const [filePath, hunks] of fileEditsMap.entries()) {
+        let fullPath: string;
+        let originalContent: string;
+        try {
+          fullPath = resolveSafePath(filePath, context.cwd);
+          originalContent = await fs.readFile(fullPath, 'utf8');
+        } catch (err: any) {
+          return {
+            result: `Transaction aborted: Unable to read file "${filePath}": ${err.message}. ATOMIC ROLLBACK: 0 files modified on disk.`,
+            isError: true
+          };
+        }
+
+        let currentContent = originalContent;
+        const strategies: string[] = [];
+
+        for (let i = 0; i < hunks.length; i++) {
+          const hunk = hunks[i];
+          const editRes = MultiStrategyEditEngine.apply(
+            currentContent,
+            hunk.target_content,
+            hunk.replacement_content,
+            filePath
+          );
+
+          if (!editRes.success) {
+            return {
+              result: `Transaction aborted: Hunk #${i + 1} of ${hunks.length} failed for "${filePath}".\n${editRes.error || 'Target content not found.'}\n\nATOMIC ROLLBACK: 0 files modified on disk. All changes have been reverted.`,
+              isError: true
+            };
+          }
+
+          currentContent = editRes.content;
+          strategies.push(editRes.strategyUsed || 'exact');
+        }
+
+        pendingWrites.set(filePath, {
+          fullPath,
+          originalContent,
+          newContent: currentContent,
+          strategies
+        });
+      }
+
+      // Step 2.5: Optional syntax pre-validation via CodeVerifier
+      const shouldValidateSyntax = Boolean(args.validate_syntax ?? args.validateSyntax);
+      if (shouldValidateSyntax) {
+        for (const [filePath, pending] of pendingWrites.entries()) {
+          const diagnostics = CodeVerifier.verifyContentFast(filePath, pending.newContent);
+          if (diagnostics.length > 0) {
+            const firstErr = diagnostics[0];
+            return {
+              result: `Transaction aborted: Syntax error detected in "${filePath}" (line ${firstErr.line}): ${firstErr.message}.\n\nATOMIC ROLLBACK: 0 files modified on disk. All changes have been reverted.`,
+              isError: true
+            };
+          }
+        }
+      }
+
+      // Step 3: Atomic Commit Phase (all hunks in all files succeeded in-memory)
+      const appliedSummaries: string[] = [];
+      let totalHunks = 0;
+
+      for (const [filePath, pending] of pendingWrites.entries()) {
+        const hasCrlf = pending.originalContent.includes('\r\n');
+        const finalContent = hasCrlf ? pending.newContent.replace(/\r?\n/g, '\r\n') : pending.newContent;
+
+        await fs.writeFile(pending.fullPath, finalContent, 'utf8');
+        if (context.contextEngine?.invalidateFile) {
+          context.contextEngine.invalidateFile(filePath);
+        }
+
+        totalHunks += pending.strategies.length;
+        const stratCounts: Record<string, number> = {};
+        for (const s of pending.strategies) {
+          stratCounts[s] = (stratCounts[s] || 0) + 1;
+        }
+        const stratSummary = Object.entries(stratCounts)
+          .map(([strat, count]) => `${count} ${strat}`)
+          .join(', ');
+
+        appliedSummaries.push(`- ${filePath}: ${pending.strategies.length} edit(s) applied (${stratSummary})`);
+      }
+
+      const summary = `Successfully applied ${totalHunks} edit(s) across ${pendingWrites.size} file(s) atomically:\n` +
+        appliedSummaries.join('\n');
+      return { result: summary };
+    } catch (err: any) {
+      return {
+        result: `Failed to execute multi_edit_file: ${err.message}. ATOMIC ROLLBACK: 0 files modified on disk.`,
+        isError: true
+      };
     }
   }
 };

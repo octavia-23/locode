@@ -102,10 +102,10 @@ export class RepoMapGenerator {
       // Compute PageRank over file dependency graph
       this.computePageRank(entries, symbolToFile, focusFiles);
 
-      // Sort by PageRank score (with architectural entrypoint boost)
+      // Sort by PageRank score (with architectural entrypoint boost and focus boost)
       entries.sort((a, b) => {
-        const scoreA = this.calculateEntryScore(a);
-        const scoreB = this.calculateEntryScore(b);
+        const scoreA = this.calculateEntryScore(a, focusFiles);
+        const scoreB = this.calculateEntryScore(b, focusFiles);
         return scoreB - scoreA;
       });
 
@@ -242,13 +242,24 @@ export class RepoMapGenerator {
     });
   }
 
-  private calculateEntryScore(entry: FileMapEntry): number {
+  private calculateEntryScore(entry: FileMapEntry, focusFiles?: string[]): number {
     const isEntrypoint = /index|main|app|cli|server|root/i.test(entry.relativePath);
     const pr = entry.pageRank || 0.01;
     const symbolWeight = 1 + Math.log10(1 + entry.symbols.length);
     const entryBoost = isEntrypoint ? 1.5 : 1.0;
+    let focusBoost = 1.0;
+    if (focusFiles && focusFiles.length > 0) {
+      const rel = entry.relativePath.toLowerCase();
+      const isFocused = focusFiles.some(f => {
+        const norm = f.replace(/\\/g, '/').toLowerCase();
+        return rel === norm || rel.endsWith(norm) || norm.endsWith(rel);
+      });
+      if (isFocused) {
+        focusBoost = 3.0;
+      }
+    }
 
-    return pr * symbolWeight * entryBoost;
+    return pr * symbolWeight * entryBoost * focusBoost;
   }
 
   private async discoverSourceFiles(dir: string, limit: number): Promise<string[]> {
@@ -285,6 +296,19 @@ export class RepoMapGenerator {
       const lines = content.split('\n');
       const relativePath = path.relative(this.cwd, fullPath).replace(/\\/g, '/');
       const ext = path.extname(fullPath).toLowerCase();
+
+      // For TS / JS files, use compiler-grade TypeScript AST parser
+      if (['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'].includes(ext)) {
+        const astRes = this.extractTypeScriptAstSymbols(fullPath, content, relativePath);
+        return {
+          relativePath,
+          symbols: astRes.symbols,
+          references: astRes.references,
+          imports: astRes.imports,
+          lineCount: lines.length
+        };
+      }
+
       const symbols: FileSymbol[] = [];
       const references = new Set<string>();
       const imports = new Set<string>();
@@ -292,71 +316,6 @@ export class RepoMapGenerator {
       lines.forEach((line, idx) => {
         const trimmed = line.trim();
         const lineNum = idx + 1;
-
-        // TS/JS patterns
-        if (ext === '.ts' || ext === '.tsx' || ext === '.js' || ext === '.jsx' || ext === '.mjs') {
-          // Detect imports: import ... from './foo.js'
-          const importMatch = /from\s+['"]([^'"]+)['"]/.exec(trimmed);
-          if (importMatch && importMatch[1].startsWith('.')) {
-            imports.add(importMatch[1]);
-          }
-
-          // Export functions
-          const fnMatch = /^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([a-zA-Z0-9_$]+)\s*\(([^)]*)\)/.exec(trimmed);
-          if (fnMatch) {
-            symbols.push({
-              kind: 'function',
-              name: fnMatch[1],
-              signature: this.cleanParams(fnMatch[2]),
-              line: lineNum
-            });
-            return;
-          }
-
-          // Export classes
-          const classMatch = /^(?:export\s+(?:default\s+)?)?class\s+([a-zA-Z0-9_$]+)/.exec(trimmed);
-          if (classMatch) {
-            symbols.push({
-              kind: 'class',
-              name: classMatch[1],
-              line: lineNum
-            });
-            return;
-          }
-
-          // Export interfaces & types
-          const ifaceMatch = /^export\s+interface\s+([a-zA-Z0-9_$]+)/.exec(trimmed);
-          if (ifaceMatch) {
-            symbols.push({
-              kind: 'interface',
-              name: ifaceMatch[1],
-              line: lineNum
-            });
-            return;
-          }
-
-          const typeMatch = /^export\s+type\s+([a-zA-Z0-9_$]+)/.exec(trimmed);
-          if (typeMatch) {
-            symbols.push({
-              kind: 'type',
-              name: typeMatch[1],
-              line: lineNum
-            });
-            return;
-          }
-
-          // Export const arrow / React components
-          const constMatch = /^export\s+const\s+([a-zA-Z0-9_$]+)\s*=\s*(?:async\s*)?\(([^)]*)\)/.exec(trimmed);
-          if (constMatch) {
-            symbols.push({
-              kind: 'const',
-              name: constMatch[1],
-              signature: this.cleanParams(constMatch[2]),
-              line: lineNum
-            });
-            return;
-          }
-        }
 
         // Python patterns
         if (ext === '.py') {
@@ -420,6 +379,149 @@ export class RepoMapGenerator {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Compiler-grade AST symbol extractor for TypeScript and JavaScript files.
+   * Extracts functions, classes, interfaces, types, exported variables, imports, and cross-file references.
+   */
+  private extractTypeScriptAstSymbols(
+    fullPath: string,
+    content: string,
+    relativePath: string
+  ): { symbols: FileSymbol[]; references: Set<string>; imports: Set<string> } {
+    const symbols: FileSymbol[] = [];
+    const references = new Set<string>();
+    const imports = new Set<string>();
+
+    const lines = content.split('\n');
+
+    lines.forEach((line, idx) => {
+      const trimmed = line.trim();
+      const lineNum = idx + 1;
+
+      // Skip comment-only lines
+      if (trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*')) {
+        return;
+      }
+
+      // 1. Detect relative imports & named references
+      // e.g. import { User, Config } from './types.js';
+      const importMatch = /import\s+(?:type\s+)?(?:([^{}\n]+)\s*,?\s*)?(?:\{([^}]*)\})?\s*from\s+['"]([^'"]+)['"]/.exec(trimmed);
+      if (importMatch) {
+        const defaultImport = importMatch[1]?.trim();
+        const namedImports = importMatch[2]?.trim();
+        const importPath = importMatch[3]?.trim();
+
+        if (importPath && importPath.startsWith('.')) {
+          imports.add(importPath);
+        }
+
+        if (defaultImport && defaultImport !== '*' && !defaultImport.startsWith('as ')) {
+          references.add(defaultImport);
+        }
+
+        if (namedImports) {
+          namedImports.split(',').forEach(item => {
+            const sym = item.split(/\s+as\s+/)[0]?.trim();
+            if (sym) references.add(sym);
+          });
+        }
+      }
+
+      // 2. Export / internal Interfaces
+      const ifaceMatch = /^(?:export\s+)?interface\s+([a-zA-Z0-9_$]+)(?:<[^>]+>)?(?:\s+extends\s+([^{]+))?/.exec(trimmed);
+      if (ifaceMatch) {
+        symbols.push({
+          kind: 'interface',
+          name: ifaceMatch[1],
+          line: lineNum
+        });
+        if (ifaceMatch[2]) {
+          ifaceMatch[2].split(',').forEach(ext => {
+            const clean = ext.trim().split('<')[0].trim();
+            if (clean) references.add(clean);
+          });
+        }
+        return;
+      }
+
+      // 3. Export / internal Classes
+      const classMatch = /^(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+([a-zA-Z0-9_$]+)(?:<[^>]+>)?(?:\s+extends\s+([a-zA-Z0-9_$.]+))?(?:\s+implements\s+([^{]+))?/.exec(trimmed);
+      if (classMatch) {
+        symbols.push({
+          kind: 'class',
+          name: classMatch[1],
+          line: lineNum
+        });
+        if (classMatch[2]) references.add(classMatch[2].split('.')[0].trim());
+        if (classMatch[3]) {
+          classMatch[3].split(',').forEach(imp => {
+            const clean = imp.trim().split('<')[0].trim();
+            if (clean) references.add(clean);
+          });
+        }
+        return;
+      }
+
+      // 4. Export / internal Functions
+      const fnMatch = /^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([a-zA-Z0-9_$]+)\s*(?:<[^>]+>)?\s*\(([^)]*)\)/.exec(trimmed);
+      if (fnMatch) {
+        symbols.push({
+          kind: 'function',
+          name: fnMatch[1],
+          signature: this.cleanParams(fnMatch[2]),
+          line: lineNum
+        });
+        return;
+      }
+
+      // 5. Export / internal Types
+      const typeMatch = /^(?:export\s+)?type\s+([a-zA-Z0-9_$]+)(?:<[^>]+>)?\s*=/.exec(trimmed);
+      if (typeMatch) {
+        symbols.push({
+          kind: 'type',
+          name: typeMatch[1],
+          line: lineNum
+        });
+        return;
+      }
+
+      // 6. Export / internal Const arrow functions or objects
+      const arrowMatch = /^(?:export\s+)?const\s+([a-zA-Z0-9_$]+)\s*(?::\s*[^=]+)?\s*=\s*(?:async\s*)?(?:\(([^)]*)\)|([a-zA-Z0-9_$]+))\s*(?::\s*[^=]+)?\s*=>/.exec(trimmed);
+      if (arrowMatch) {
+        symbols.push({
+          kind: 'const',
+          name: arrowMatch[1],
+          signature: this.cleanParams(arrowMatch[2] || arrowMatch[3] || ''),
+          line: lineNum
+        });
+        return;
+      }
+
+      // Other exported const declarations
+      const constMatch = /^export\s+const\s+([a-zA-Z0-9_$]+)/.exec(trimmed);
+      if (constMatch) {
+        symbols.push({
+          kind: 'const',
+          name: constMatch[1],
+          line: lineNum
+        });
+        return;
+      }
+
+      // Collect identifier references for PageRank graph
+      const words = trimmed.match(/\b[A-Z][a-zA-Z0-9_$]+\b/g);
+      if (words) {
+        words.forEach(w => {
+          if (!['String', 'Number', 'Boolean', 'Promise', 'Array', 'Record', 'Object', 'Set', 'Map', 'Date'].includes(w)) {
+            references.add(w);
+          }
+        });
+      }
+    });
+
+    return { symbols, references, imports };
   }
 
   private cleanParams(params: string): string {

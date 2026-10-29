@@ -1,6 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { resolveSafePath, isDangerousCommand, isSsrfSafeUrl } from '../src/tools/security.js';
+import {
+  resolveSafePath,
+  isDangerousCommand,
+  classifyCommandSecurity,
+  splitCompoundCommands,
+  extractCommandSubstitutions,
+  extractInlineScripts,
+  isSsrfSafeUrl
+} from '../src/tools/security.js';
+import { resolveSandboxWrapper } from '../src/tools/terminal.js';
 import path from 'node:path';
 
 test('Security - resolveSafePath allows internal paths and blocks path traversal', () => {
@@ -64,4 +73,87 @@ test('Security - isSsrfSafeUrl blocks loopback, private ranges, and cloud metada
   // Invalid protocol
   assert.equal(isSsrfSafeUrl('file:///etc/passwd').safe, false);
   assert.equal(isSsrfSafeUrl('ftp://ftp.test.com').safe, false);
+});
+
+// ============================================================================
+// Phase 1: Structural Shell Tokenization & Obfuscation Detection
+// ============================================================================
+
+test('Security Phase 1 - splitCompoundCommands accurately splits pipelines and ignores quoted operators', () => {
+  // Compound command with &&, ;, ||, |
+  const parts = splitCompoundCommands('echo step1 && npm test; git status || echo fail | cat');
+  assert.deepEqual(parts, ['echo step1', 'npm test', 'git status', 'echo fail', 'cat']);
+
+  // Respects quotes around operators
+  const quoted = splitCompoundCommands('git commit -m "feat; fix && test"');
+  assert.deepEqual(quoted, ['git commit -m "feat; fix && test"']);
+
+  // Respects escaped operators
+  const escaped = splitCompoundCommands('echo foo\\;bar');
+  assert.deepEqual(escaped, ['echo foo\\;bar']);
+});
+
+test('Security Phase 1 - classifyCommandSecurity denies compound commands containing prohibited operations', () => {
+  // Compound command with prohibited branch
+  const res1 = classifyCommandSecurity('echo "building project" && rm -rf /');
+  assert.equal(res1.decision, 'deny');
+  assert.equal(res1.dangerous, true);
+
+  const res2 = classifyCommandSecurity('git status; format C:');
+  assert.equal(res2.decision, 'deny');
+
+  // Compound command with safe operations only
+  const res3 = classifyCommandSecurity('echo ok && npm test && git status');
+  assert.equal(res3.decision, 'allow');
+  assert.equal(res3.dangerous, false);
+
+  // Compound command with ask operation
+  const res4 = classifyCommandSecurity('npm test && rm old_log.txt');
+  assert.equal(res4.decision, 'ask');
+  assert.equal(res4.dangerous, true);
+});
+
+test('Security Phase 1 - classifyCommandSecurity recursively inspects inline interpreters and subshells', () => {
+  // bash -c wrapping destructive command
+  const res1 = classifyCommandSecurity('bash -c "rm -rf /"');
+  assert.equal(res1.decision, 'deny');
+
+  const res2 = classifyCommandSecurity("sh -c 'shutdown -h now'");
+  assert.equal(res2.decision, 'deny');
+
+  // $(...) command substitution wrapping destructive command
+  const res3 = classifyCommandSecurity('echo $(rm -rf /)');
+  assert.equal(res3.decision, 'deny');
+
+  // backtick command substitution wrapping destructive command
+  const res4 = classifyCommandSecurity('echo `rm -rf /`');
+  assert.equal(res4.decision, 'deny');
+
+  // Dynamic command substitution without blocked command -> requires approval ('ask')
+  const res5 = classifyCommandSecurity('echo $(whoami)');
+  assert.equal(res5.decision, 'ask');
+  assert.equal(res5.dangerous, true);
+
+  // Inline node/python evaluation -> requires approval ('ask')
+  const res6 = classifyCommandSecurity('node -e "console.log(process.cwd())"');
+  assert.equal(res6.decision, 'ask');
+
+  const res7 = classifyCommandSecurity('python -c "import os; print(os.name)"');
+  assert.equal(res7.decision, 'ask');
+});
+
+test('Security Phase 1 - classifyCommandSecurity detects base64 decode piped to shell', () => {
+  const res1 = classifyCommandSecurity('echo "ZWNobyBoYWNrZWQK" | base64 -d | sh');
+  assert.equal(res1.decision, 'ask');
+  assert.equal(res1.dangerous, true);
+  assert.ok(res1.reason?.includes('Obfuscated base64/hex decode'));
+
+  const res2 = classifyCommandSecurity('cat payload.txt | base64 --decode | bash');
+  assert.equal(res2.decision, 'ask');
+});
+
+test('Security Phase 1 - resolveSandboxWrapper falls back cleanly when OS sandbox unavailable', async () => {
+  const result = await resolveSandboxWrapper('npm test', process.cwd());
+  assert.ok(result.command);
+  assert.equal(typeof result.isSandboxed, 'boolean');
 });

@@ -4,7 +4,13 @@ export interface ToolParameterProperty {
   enum?: string[];
   items?: {
     type: string;
-  };
+    description?: string;
+    properties?: Record<string, ToolParameterProperty | any>;
+    required?: string[];
+    items?: any;
+  } | Record<string, any>;
+  properties?: Record<string, ToolParameterProperty | any>;
+  required?: string[];
 }
 
 export interface ToolParameters {

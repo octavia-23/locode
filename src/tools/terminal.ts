@@ -3,6 +3,39 @@ import { execa } from 'execa';
 import { ToolDefinition } from '../types.js';
 import { resolveSafePath, classifyCommandSecurity, isDangerousCommand } from './security.js';
 import { isCloudProvider } from '../providers/factory.js';
+import { HarnessExecutionProfile } from '../runtime/profiles.js';
+
+/**
+ * Resolves an optional lightweight OS sandbox wrapper (bwrap on Linux, sandbox-exec on macOS).
+ * Returns the wrapped command string or original command if sandboxing is not active/available.
+ */
+export async function resolveSandboxWrapper(
+  command: string,
+  cwd: string,
+  _profile?: HarnessExecutionProfile
+): Promise<{ command: string; isSandboxed: boolean; sandboxType?: string }> {
+  if (process.platform === 'linux') {
+    try {
+      await execa('which bwrap', { shell: true });
+      const bwrapCmd = `bwrap --ro-bind / / --bind "${cwd}" "${cwd}" --dev /dev --proc /proc --tmpfs /tmp ${command}`;
+      return { command: bwrapCmd, isSandboxed: true, sandboxType: 'bwrap' };
+    } catch {
+      return { command, isSandboxed: false };
+    }
+  }
+
+  if (process.platform === 'darwin') {
+    try {
+      await execa('which sandbox-exec', { shell: true });
+      const sandboxCmd = `sandbox-exec -p '(version 1)(allow default)(deny file-write* (regex #"^/(System|bin|sbin|usr|etc)"))' ${command}`;
+      return { command: sandboxCmd, isSandboxed: true, sandboxType: 'sandbox-exec' };
+    } catch {
+      return { command, isSandboxed: false };
+    }
+  }
+
+  return { command, isSandboxed: false };
+}
 
 /**
  * Safely and recursively terminates a process and all its child processes.

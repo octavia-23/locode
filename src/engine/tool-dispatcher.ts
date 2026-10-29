@@ -209,6 +209,33 @@ export class ToolDispatcher {
     // STEP 4: Pre-execution File Snapshot
     let fileChangeRecord: FileChangeRecord | undefined;
     const isFileMutation = (toolName === 'edit_file' || toolName === 'write_file') && Boolean(cleanArgs.path);
+    const multiEditPaths: string[] = [];
+
+    if (toolName === 'multi_edit_file') {
+      if (cleanArgs.path && typeof cleanArgs.path === 'string') multiEditPaths.push(cleanArgs.path);
+      if (Array.isArray(cleanArgs.files)) {
+        for (const f of cleanArgs.files) {
+          if (f && typeof f.path === 'string') multiEditPaths.push(f.path);
+        }
+      }
+      if (Array.isArray(cleanArgs.edits)) {
+        for (const e of cleanArgs.edits) {
+          if (e && typeof e.path === 'string') multiEditPaths.push(e.path);
+        }
+      }
+    }
+
+    const multiEditSnapshots = new Map<string, { beforeContent: string; beforeHash: string }>();
+    if (multiEditPaths.length > 0) {
+      for (const p of new Set(multiEditPaths)) {
+        try {
+          const fullPath = path.resolve(context.cwd, p);
+          const beforeContent = await fs.readFile(fullPath, 'utf8');
+          const beforeHash = crypto.createHash('sha256').update(beforeContent).digest('hex');
+          multiEditSnapshots.set(p, { beforeContent, beforeHash });
+        } catch {}
+      }
+    }
 
     if (isFileMutation && cleanArgs.path) {
       try {
@@ -280,6 +307,20 @@ export class ToolDispatcher {
       }
     }
 
+    const multiEditChanges: Array<{ path: string; beforeHash: string; afterHash: string }> = [];
+    if (multiEditSnapshots.size > 0 && !isError) {
+      for (const [p, snap] of multiEditSnapshots.entries()) {
+        try {
+          const fullPath = path.resolve(context.cwd, p);
+          const contentAfter = await fs.readFile(fullPath, 'utf8');
+          const hashAfter = crypto.createHash('sha256').update(contentAfter).digest('hex');
+          if (snap.beforeHash !== hashAfter) {
+            multiEditChanges.push({ path: p, beforeHash: snap.beforeHash, afterHash: hashAfter });
+          }
+        } catch {}
+      }
+    }
+
     const durationMs = Date.now() - startTime;
 
     if (this.journal) {
@@ -289,6 +330,16 @@ export class ToolDispatcher {
           path: fileChangeRecord.path,
           beforeHash: fileChangeRecord.hashBefore,
           afterHash: fileChangeRecord.hashAfter,
+          changed: true
+        }, callId).catch(() => {});
+      }
+
+      for (const change of multiEditChanges) {
+        await this.journal.recordEvent('file_change_recorded', {
+          toolCallId: callId,
+          path: change.path,
+          beforeHash: change.beforeHash,
+          afterHash: change.afterHash,
           changed: true
         }, callId).catch(() => {});
       }

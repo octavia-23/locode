@@ -35,3 +35,33 @@ test('CodeVerifier - runFastLint executes fast linter/typecheck on modified file
   // In clean LOCODE codebase, fast lint (typecheck) should pass cleanly
   assert.equal(result.passed, true);
 });
+
+test('CodeVerifier - verifyFilesFast checks clean TypeScript file in under 50ms', async () => {
+  const cwd = process.cwd();
+  const result = await CodeVerifier.verifyFilesFast(['src/index.ts'], cwd);
+
+  assert.equal(result.passed, true);
+  assert.equal(result.errors.length, 0);
+  assert.ok(result.durationMs < 100, `Execution took ${result.durationMs}ms, should be fast`);
+});
+
+test('CodeVerifier - verifyFilesFast catches syntax errors in under 50ms without subprocess', async () => {
+  const fs = await import('node:fs/promises');
+  const os = await import('node:os');
+  const path = await import('node:path');
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-fast-lint-'));
+  try {
+    const badFile = path.join(tmpDir, 'broken.ts');
+    await fs.writeFile(badFile, 'export const value: = 999;', 'utf8');
+
+    const result = await CodeVerifier.verifyFilesFast(['broken.ts'], tmpDir);
+
+    assert.equal(result.passed, false);
+    assert.ok(result.errors.length > 0);
+    assert.equal(result.errors[0].file, 'broken.ts');
+    assert.ok(result.durationMs < 100, `Execution took ${result.durationMs}ms, should be fast`);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});

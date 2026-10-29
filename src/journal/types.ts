@@ -152,6 +152,7 @@ export interface DurableJournalSnapshot {
   pendingObjectives: string[];
   completedObjectives: string[];
   decisions: string[];
+  checkpoint?: string;
   fileHashes: Record<string, string>; // path -> latest confirmed hash
   toolCalls: Record<string, DurableToolRecord>;
   verificationResults: Record<string, {

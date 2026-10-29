@@ -27,7 +27,8 @@ import {
   DEFAULT_QWEN_MODEL_PATH,
   DEFAULT_QWEN_MODEL_ALIAS,
   INFERENCE_PROFILES,
-  InferenceProfileName
+  InferenceProfileName,
+  resolveProfileForHardware
 } from './runtime/profiles.js';
 import { RuntimeDetector } from './runtime/detector.js';
 import { getSharedLlamaRuntime, isCloudProvider, resolveProvider } from './providers/factory.js';
@@ -43,7 +44,7 @@ program
   .option('-m, --model <name>', 'Model to use (or alias for local TurboQuant model)')
   .option('-p, --provider <type>', 'Provider: gemini | anthropic | openai | openrouter | groq | llamacpp | ollama | lmstudio | vllm')
   .option('-c, --ctx <number_or_size>', 'Context window size (e.g. 32k, 64k, 128k, 262k)')
-  .option('--profile <name>', 'Inference profile: ultra-context | performance | large-context | balanced', 'ultra-context')
+  .option('--profile <name>', 'Inference profile: ultra-context | performance | large-context | balanced')
   .option('--model-path <path>', 'Absolute path to local .gguf model file')
   .option('--llama-server <path>', 'Path to llama-server.exe')
   .option('--port <number>', 'Port for local model server (default: 8081 or auto-selected)')
@@ -122,7 +123,7 @@ async function main() {
   const profileName: InferenceProfileName =
     (options.profile as InferenceProfileName) ||
     (process.env.LOCODE_INFERENCE_PROFILE as InferenceProfileName) ||
-    (chosenProvider === 'llamacpp' ? 'ultra-context' : 'performance');
+    resolveProfileForHardware(hardwareProfile).profileName;
 
   const cliCtx = parseContextOption(options.ctx) || parseContextOption(process.env.LOCODE_LOCAL_MODEL_CONTEXT);
 
@@ -138,15 +139,7 @@ async function main() {
   } else if (chosenProvider === 'openai' || chosenProvider === 'openrouter') {
     numCtx = 128000;
   } else if (chosenProvider === 'llamacpp') {
-    if (profileName === 'ultra-context') {
-      numCtx = 262144;
-    } else if (profileName === 'large-context') {
-      numCtx = 65536;
-    } else if (profileName === 'performance') {
-      numCtx = 32768;
-    } else {
-      numCtx = hardwareProfile.recommendedCtx;
-    }
+    numCtx = INFERENCE_PROFILES[profileName]?.contextSize || hardwareProfile.recommendedCtx;
   } else {
     numCtx = hardwareProfile.recommendedCtx;
   }

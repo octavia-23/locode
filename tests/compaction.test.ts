@@ -188,3 +188,162 @@ test('Context Compaction - re-reading a folded file always returns its contents 
   const compacted = cm.compactMessages(messages);
   assert.ok(compacted[compacted.length - 1].content.includes('compute(50)'), 'newest view_file result must stay intact');
 });
+
+test('Context Compaction - Tier 1 pruneStaleToolOutputs replaces superseded view_file with turn pointer', () => {
+  const cm = new ContextManager(16384);
+  const fileContentV1 = 'File: src/service.ts (lines 1-50 of 50)\n' + 'const line = 1;\n'.repeat(50);
+  const fileContentV2 = 'File: src/service.ts (lines 1-50 of 50)\n' + 'const line = 2;\n'.repeat(50);
+
+  const messages: any[] = [
+    { role: 'system', content: 'You are Locode CLI.' },
+    { role: 'user', content: 'Inspect and fix src/service.ts' },
+    // Turn 1: view_file
+    {
+      role: 'assistant',
+      content: 'Inspecting src/service.ts',
+      tool_calls: [{ id: 'tc1', function: { name: 'view_file', arguments: { path: 'src/service.ts', startLine: 1, endLine: 50 } } }]
+    },
+    { role: 'tool', tool_call_id: 'tc1', content: fileContentV1 },
+    // Turn 2: edit_file
+    {
+      role: 'assistant',
+      content: 'Editing src/service.ts',
+      tool_calls: [{ id: 'tc2', function: { name: 'edit_file', arguments: { path: 'src/service.ts' } } }]
+    },
+    { role: 'tool', tool_call_id: 'tc2', content: '✓ Successfully updated src/service.ts' },
+    // Turn 3: view_file again
+    {
+      role: 'assistant',
+      content: 'Verifying src/service.ts',
+      tool_calls: [{ id: 'tc3', function: { name: 'view_file', arguments: { path: 'src/service.ts', startLine: 1, endLine: 50 } } }]
+    },
+    { role: 'tool', tool_call_id: 'tc3', content: fileContentV2 }
+  ];
+
+  cm.pruneStaleToolOutputs(messages);
+
+  // Turn 1 view_file must be superseded
+  assert.ok(messages[3].content.startsWith('[Superseded view_file of src/service.ts; latest state is in turn #3]'), 'Turn 1 view_file must point to Turn 3');
+  assert.ok(!messages[3].content.includes('const line = 1;'), 'Old file content lines must be removed');
+
+  // Turn 3 view_file must remain intact
+  assert.equal(messages[7].content, fileContentV2, 'Latest view_file must stay intact');
+});
+
+test('Context Compaction - Tier 1 pruneStaleToolOutputs folds error traces when verification passes', () => {
+  const cm = new ContextManager(16384);
+  const verboseTrace = [
+    '> test-runner',
+    'FAIL tests/service.test.ts',
+    '  ● Service › returns expected token',
+    '    AssertionError: expected "foo" to equal "bar"',
+    '      at Object.<anonymous> (tests/service.test.ts:18:12)',
+    '      at Promise.then.completed (node_modules/jest/build/runner.js:55:10)',
+    '      at runTest (node_modules/jest/build/runner.js:120:14)',
+    '      at async TestScheduler.scheduleTests (node_modules/jest/build/scheduler.js:300:20)',
+    '      at async runCLI (node_modules/jest/build/cli.js:410:15)'
+  ].join('\n');
+
+  const messages: any[] = [
+    { role: 'system', content: 'You are Locode CLI.' },
+    { role: 'user', content: 'Run tests' },
+    // Turn 1: failed test run
+    { role: 'assistant', content: 'Running tests', tool_calls: [{ id: 't1', function: { name: 'run_command', arguments: { command: 'npm test' } } }] },
+    { role: 'tool', tool_call_id: 't1', content: verboseTrace },
+    // Turn 2: edit file
+    { role: 'assistant', content: 'Fixing bug', tool_calls: [{ id: 't2', function: { name: 'edit_file', arguments: { path: 'src/service.ts' } } }] },
+    { role: 'tool', tool_call_id: 't2', content: '✓ Successfully updated src/service.ts' },
+    // Turn 3: test passes
+    { role: 'assistant', content: 'Re-running tests', tool_calls: [{ id: 't3', function: { name: 'run_command', arguments: { command: 'npm test' } } }] },
+    { role: 'tool', tool_call_id: 't3', content: '✓ Verification passed: `npm test` exited with 0 errors.' }
+  ];
+
+  cm.pruneStaleToolOutputs(messages);
+
+  // Turn 1 error output must be folded to 5 lines + summary
+  assert.ok(messages[3].content.includes('AssertionError: expected "foo" to equal "bar"'), 'Key assertion line must be retained in first 5 lines');
+  assert.ok(messages[3].content.includes('[Remaining 4 lines of resolved error trace folded; verification subsequently passed]'), 'Folded summary note must be appended');
+  assert.ok(!messages[3].content.includes('runCLI'), 'Deep stack trace lines beyond line 5 must be pruned');
+});
+
+test('Context Compaction - Tier 2 compact folds middle turns into structured <context_checkpoint>', () => {
+  const cm = new ContextManager(1000); // Low budget to force compaction
+  cm.setObjective('Refactor auth module and pass tests');
+  cm.addDecision('Use JWT with RS256 signing');
+  cm.recordFileRead('src/auth.ts', 'export const verify = () => true;');
+  cm.recordVerificationResult(true, 'npm test');
+
+  const messages: any[] = [
+    { role: 'system', content: 'System instruction' },
+    { role: 'user', content: 'Refactor auth module and pass tests' },
+    // Old middle turns that will be folded
+    { role: 'assistant', content: 'Inspecting directory structure.' },
+    { role: 'tool', content: 'dir listing: src/, tests/, package.json\n'.repeat(60) },
+    { role: 'assistant', content: 'Checking package.json dependencies.' },
+    { role: 'tool', content: 'dependencies: jsonwebtoken, jest\n'.repeat(60) },
+    // Recent turns to preserve
+    { role: 'assistant', content: 'Editing auth service.' },
+    { role: 'tool', content: '✓ Successfully updated src/auth.ts' },
+    { role: 'assistant', content: 'Running verification.' },
+    { role: 'tool', content: '✓ Verification passed: `npm test` exited with 0 errors.' }
+  ];
+
+  const compacted = cm.compact(messages, { keepRecentMessages: 4 });
+
+  // System prompt and original user prompt preserved
+  assert.equal(compacted[0].role, 'system');
+  assert.equal(compacted[1].role, 'user');
+  assert.equal(compacted[1].content, 'Refactor auth module and pass tests');
+
+  // Folded checkpoint message exists
+  const checkpointMsg = compacted.find(m => m.content.includes('<context_checkpoint>'));
+  assert.ok(checkpointMsg, 'Must contain a <context_checkpoint> block');
+  assert.ok(checkpointMsg.content.includes('### Active Goal & Constraints'), 'Must contain Active Goal & Constraints section');
+  assert.ok(checkpointMsg.content.includes('### Completed Milestones & Verified Edits'), 'Must contain Completed Milestones section');
+  assert.ok(checkpointMsg.content.includes('### Working Set Files'), 'Must contain Working Set Files section');
+  assert.ok(checkpointMsg.content.includes('### Key Decisions & Rejected Approaches'), 'Must contain Key Decisions section');
+  assert.ok(checkpointMsg.content.includes('RS256 signing'), 'Must contain durable decision');
+  assert.ok(checkpointMsg.content.includes('src/auth.ts'), 'Must contain relevant working set file');
+
+  // Recent 4 messages preserved
+  const lastFour = compacted.slice(-4);
+  assert.equal(lastFour[0].content, 'Editing auth service.');
+  assert.equal(lastFour[1].content, '✓ Successfully updated src/auth.ts');
+  assert.equal(lastFour[2].content, 'Running verification.');
+  assert.equal(lastFour[3].content, '✓ Verification passed: `npm test` exited with 0 errors.');
+});
+
+test('Context Compaction - SessionMemory and journal snapshots store checkpoint', async () => {
+  const { SessionMemory } = await import('../src/agent/memory.js');
+  const { ExecutionJournal } = await import('../src/journal/journal.js');
+  const fs = await import('node:fs/promises');
+  const path = await import('node:path');
+  const os = await import('node:os');
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'locode-compact-test-'));
+  try {
+    const memory = new SessionMemory(tmpDir);
+    const journal = new ExecutionJournal({ cwd: tmpDir });
+    await journal.init();
+
+    const sampleCheckpoint = '<context_checkpoint>\n### Active Goal & Constraints\nGoal: Pass tests\n</context_checkpoint>';
+
+    // Save session with checkpoint
+    await memory.saveSession({
+      model: 'test-model',
+      messages: [{ role: 'user', content: 'test' }],
+      checkpoint: sampleCheckpoint
+    });
+
+    const loaded = await memory.loadSession();
+    assert.equal(loaded?.checkpoint, sampleCheckpoint, 'SessionMemory must persist and restore checkpoint');
+
+    // Create journal snapshot with checkpoint
+    const snapshot = await journal.createSnapshot({
+      checkpoint: sampleCheckpoint
+    });
+    assert.equal(snapshot.checkpoint, sampleCheckpoint, 'ExecutionJournal must persist checkpoint in snapshot');
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});

@@ -25,13 +25,15 @@ export interface ToolParseResult {
 const DEFAULT_KNOWN_TOOLS = [
   'view_file',
   'edit_file',
+  'multi_edit_file',
   'write_file',
   'run_command',
   'list_dir',
   'search_code',
   'batch_read_files',
   'fetch_web',
-  'search_web'
+  'search_web',
+  'delegate_task'
 ];
 
 /**

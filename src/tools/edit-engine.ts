@@ -3,7 +3,7 @@ import { applyPatch } from 'diff';
 export interface EditResult {
   success: boolean;
   content: string;
-  strategyUsed?: 'exact' | 'clean-line-numbers' | 'whitespace-trimmed' | 'anchor-context' | 'unified-diff';
+  strategyUsed?: 'exact' | 'clean-line-numbers' | 'whitespace-trimmed' | 'anchor-context' | 'unified-diff' | 'fuzzy-hunk';
   error?: string;
   closestMatch?: {
     startLine: number;
@@ -75,7 +75,14 @@ export class MultiStrategyEditEngine {
       return { success: true, content: diffResult.content!, strategyUsed: 'unified-diff' };
     }
 
-    // ── Strategy 6: Actionable Closest-Match Diagnostic ──
+    // ── Strategy 6: Fuzzy Hunk Matching (Tolerant to Minor Local Hallucinations) ──
+    const fuzzyResult = this.tryFuzzyHunkMatch(normFile, normTarget, normReplacement, filePath);
+    if (fuzzyResult.handled) {
+      if (fuzzyResult.error) return { success: false, content: fileContent, error: fuzzyResult.error };
+      return { success: true, content: fuzzyResult.content!, strategyUsed: 'fuzzy-hunk' };
+    }
+
+    // ── Strategy 7: Actionable Closest-Match Diagnostic ──
     const closest = this.findClosestMatch(normFile, normTarget);
     let errorMsg = `Target content not found in ${filePath}.`;
     if (closest) {
@@ -164,9 +171,42 @@ export class MultiStrategyEditEngine {
       const idx = matches[0];
       const before = fileLines.slice(0, idx);
       const after = fileLines.slice(idx + targetLines.length);
+
+      // Re-indent replacement block to match the target file's surrounding indentation level
+      const fileIndentMatch = fileLines[idx].match(/^(\s*)/);
+      const targetIndentMatch = targetLines[0].match(/^(\s*)/);
+      const fileIndent = fileIndentMatch ? fileIndentMatch[1] : '';
+      const targetIndent = targetIndentMatch ? targetIndentMatch[1] : '';
+
+      let formattedReplacement = replacement;
+      if (fileIndent !== targetIndent) {
+        const repLines = replacement.split('\n');
+        const needsReindent = repLines.some(l => l.trim() && !l.startsWith(fileIndent));
+        if (needsReindent) {
+          const targetIndentLen = targetIndent.length;
+          const fileIndentLen = fileIndent.length;
+          const indentChar = fileIndent.startsWith('\t') ? '\t' : ' ';
+
+          if (targetIndentLen > 0 && fileIndentLen > 0) {
+            const ratio = fileIndentLen / targetIndentLen;
+            formattedReplacement = repLines.map(l => {
+              if (!l.trim()) return l;
+              const curIndentLen = (l.match(/^(\s*)/)?.[1] || '').length;
+              const newIndentLen = Math.round(curIndentLen * ratio);
+              return indentChar.repeat(newIndentLen) + l.trimStart();
+            }).join('\n');
+          } else if (fileIndentLen > 0) {
+            formattedReplacement = repLines.map(l => {
+              if (!l.trim()) return l;
+              return fileIndent + l;
+            }).join('\n');
+          }
+        }
+      }
+
       return {
         handled: true,
-        content: [...before, replacement, ...after].join('\n')
+        content: [...before, formattedReplacement, ...after].join('\n')
       };
     }
 
@@ -242,6 +282,71 @@ export class MultiStrategyEditEngine {
         return { handled: true, content: patched };
       }
     } catch {}
+
+    return { handled: false };
+  }
+
+  private static tryFuzzyHunkMatch(
+    file: string,
+    target: string,
+    replacement: string,
+    filePath: string
+  ): { handled: boolean; content?: string; error?: string } {
+    const fileLines = file.split('\n');
+    const targetLines = target.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+    if (targetLines.length < 2 || fileLines.length < targetLines.length) return { handled: false };
+
+    // Function to calculate similarity between two strings [0..1]
+    const lineSimilarity = (a: string, b: string): number => {
+      const aTrim = a.trim();
+      const bTrim = b.trim();
+      if (aTrim === bTrim) return 1.0;
+      if (!aTrim || !bTrim) return 0.0;
+      
+      const aTokens = Array.from(new Set(aTrim.toLowerCase().match(/\b[a-zA-Z0-9_$]+\b/g) || []));
+      const bTokens = Array.from(new Set(bTrim.toLowerCase().match(/\b[a-zA-Z0-9_$]+\b/g) || []));
+      if (aTokens.length === 0 || bTokens.length === 0) return 0.0;
+      
+      let matches = 0;
+      for (const t of aTokens) {
+        if (bTokens.some(bt => bt === t || (bt.length >= 4 && t.includes(bt)) || (t.length >= 4 && bt.includes(t)))) {
+          matches++;
+        }
+      }
+      const union = new Set([...aTokens, ...bTokens]).size;
+      return matches / union;
+    };
+
+    const windowSize = targetLines.length;
+    let bestScore = 0;
+    let secondBestScore = 0;
+    let bestIdx = -1;
+
+    for (let i = 0; i <= fileLines.length - windowSize; i++) {
+      let scoreSum = 0;
+      for (let j = 0; j < windowSize; j++) {
+        scoreSum += lineSimilarity(fileLines[i + j], targetLines[j]);
+      }
+      const avgScore = scoreSum / windowSize;
+      if (avgScore > bestScore) {
+        secondBestScore = bestScore;
+        bestScore = avgScore;
+        bestIdx = i;
+      } else if (avgScore > secondBestScore) {
+        secondBestScore = avgScore;
+      }
+    }
+
+    // Require confidence (>= 0.65) and clear separation from second best candidate
+    if (bestScore >= 0.65 && (bestScore - secondBestScore >= 0.20 || secondBestScore < 0.40) && bestIdx !== -1) {
+      const before = fileLines.slice(0, bestIdx);
+      const after = fileLines.slice(bestIdx + windowSize);
+      return {
+        handled: true,
+        content: [...before, replacement, ...after].join('\n')
+      };
+    }
 
     return { handled: false };
   }

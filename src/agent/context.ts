@@ -94,6 +94,7 @@ export class ContextEngine {
   private repoMapCachedAt: number = 0;
   private taskState: TaskState;
   private durableDecisions: string[] = [];
+  private latestCheckpoint: string = '';
   private stats: ContextStats = {
     totalTokensEstimated: 0,
     budgetTokens: 0,
@@ -476,9 +477,309 @@ export class ContextEngine {
     return changed;
   }
 
-  compactMessages(messages: ChatMessage[], synthesizedFindings?: string): ChatMessage[] {
+  /**
+   * Tier 1 Compaction: Prunes stale tool outputs in conversation history:
+   * 1. Deduplicates stale view_file calls: when the same file path (and overlapping line range)
+   *    is read multiple times or followed by an edit, replaces older tool results with:
+   *    `[Superseded view_file of <path>; latest state is in turn #N]`
+   * 2. Error trace folding: once verification transitions from 'failed' to 'passed',
+   *    compresses intermediate failed stack traces to the first 5 lines + summary.
+   */
+  pruneStaleToolOutputs(messages: ChatMessage[]): ChatMessage[] {
+    if (!messages || messages.length === 0) return messages;
+
+    // 1. Establish 1-based turn number mapping for all messages
+    let currentTurn = 1;
+    let hasEncounteredAssistant = false;
+    const messageTurns: number[] = [];
+
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.role === 'assistant') {
+        if (hasEncounteredAssistant) {
+          currentTurn++;
+        }
+        hasEncounteredAssistant = true;
+      } else if (msg.role === 'user' && !hasEncounteredAssistant && i > 1) {
+        currentTurn++;
+      }
+      messageTurns.push(currentTurn);
+    }
+
+    // 2. Identify file reads and edits across messages
+    interface FileEvent {
+      msgIndex: number;
+      turn: number;
+      type: 'read' | 'edit';
+      filePath: string;
+      normPath: string;
+      startLine?: number;
+      endLine?: number;
+    }
+
+    const fileEvents: FileEvent[] = [];
+
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      const turn = messageTurns[i];
+
+      // Check preceding assistant message for tool_calls if msg is a tool response
+      let toolCallName: string | undefined;
+      let toolCallArgs: any;
+      if (msg.role === 'tool' && i > 0 && messages[i - 1].role === 'assistant') {
+        const prevAssistant = messages[i - 1];
+        const tc = prevAssistant.tool_calls?.find(c => c.id === msg.tool_call_id) || prevAssistant.tool_calls?.[0];
+        if (tc) {
+          toolCallName = tc.function?.name;
+          let args = tc.function?.arguments;
+          if (typeof args === 'string') {
+            try { args = JSON.parse(args); } catch {}
+          }
+          toolCallArgs = args;
+        }
+      }
+
+      // Check if this is a file read (view_file)
+      if (msg.role === 'tool' && msg.content) {
+        let isRead = false;
+        let isEdit = false;
+        let filePath = '';
+        let startLine: number | undefined;
+        let endLine: number | undefined;
+
+        if (toolCallName === 'view_file' && toolCallArgs?.path) {
+          isRead = true;
+          filePath = String(toolCallArgs.path);
+          if (toolCallArgs.startLine !== undefined) startLine = Number(toolCallArgs.startLine);
+          if (toolCallArgs.endLine !== undefined) endLine = Number(toolCallArgs.endLine);
+        } else {
+          const viewMatch = /^File:\s+([^\s\n]+)\s+\(lines\s+(\d+)-(\d+)\s+of\s+(\d+)\)/.exec(msg.content.trim());
+          if (viewMatch) {
+            isRead = true;
+            filePath = viewMatch[1];
+            startLine = parseInt(viewMatch[2], 10);
+            endLine = parseInt(viewMatch[3], 10);
+          } else {
+            const simpleViewMatch = /^File:\s+([^\s\n]+)/.exec(msg.content.trim());
+            if (simpleViewMatch && !msg.content.includes('Successfully')) {
+              isRead = true;
+              filePath = simpleViewMatch[1];
+            }
+          }
+        }
+
+        // Check if this is a file edit or write
+        if (toolCallName && ['edit_file', 'write_file', 'multi_edit_file', 'patch_file'].includes(toolCallName)) {
+          isEdit = true;
+          filePath = String(toolCallArgs?.path || toolCallArgs?.filePath || toolCallArgs?.file || '');
+        } else {
+          const editMatch = /^(?:✓\s+)?Successfully\s+(?:updated|wrote(?:\s+\d+\s+characters\s+to)?)\s+([^\s\n]+)/i.exec(msg.content.trim());
+          if (editMatch) {
+            isEdit = true;
+            filePath = editMatch[1];
+          } else {
+            const changesMatch = /(?:Changes in|New file:)\s+([^\s\n]+)/i.exec(msg.content);
+            if (changesMatch) {
+              isEdit = true;
+              filePath = changesMatch[1];
+            }
+          }
+        }
+
+        if (isRead && filePath) {
+          fileEvents.push({
+            msgIndex: i,
+            turn,
+            type: 'read',
+            filePath,
+            normPath: filePath.replace(/\\/g, '/').toLowerCase(),
+            startLine,
+            endLine
+          });
+        } else if (isEdit && filePath) {
+          fileEvents.push({
+            msgIndex: i,
+            turn,
+            type: 'edit',
+            filePath,
+            normPath: filePath.replace(/\\/g, '/').toLowerCase()
+          });
+        }
+      }
+    }
+
+    // Deduplicate stale view_file calls:
+    // If an earlier read is superseded by a subsequent edit or read on the same file with overlapping line range:
+    for (let r = 0; r < fileEvents.length; r++) {
+      const readEvent = fileEvents[r];
+      if (readEvent.type !== 'read') continue;
+
+      let latestSupersedingTurn: number | null = null;
+
+      for (let s = r + 1; s < fileEvents.length; s++) {
+        const laterEvent = fileEvents[s];
+        if (laterEvent.normPath !== readEvent.normPath) continue;
+
+        if (laterEvent.type === 'edit') {
+          latestSupersedingTurn = laterEvent.turn;
+        } else if (laterEvent.type === 'read') {
+          const rangesOverlap =
+            readEvent.startLine === undefined ||
+            laterEvent.startLine === undefined ||
+            Math.max(readEvent.startLine, laterEvent.startLine) <= Math.min(readEvent.endLine || Infinity, laterEvent.endLine || Infinity);
+
+          if (rangesOverlap) {
+            latestSupersedingTurn = laterEvent.turn;
+          }
+        }
+      }
+
+      if (latestSupersedingTurn !== null) {
+        const oldContent = messages[readEvent.msgIndex].content;
+        const replacement = `[Superseded view_file of ${readEvent.filePath}; latest state is in turn #${latestSupersedingTurn}]`;
+        if (oldContent !== replacement && !oldContent.startsWith('[Superseded view_file')) {
+          messages[readEvent.msgIndex].content = replacement;
+          const saved = this.estimateTokens(oldContent) - this.estimateTokens(replacement);
+          if (saved > 0) {
+            this.stats.tokensAvoidedByDeduplication += saved;
+          }
+        }
+      }
+    }
+
+    // 3. Error trace folding: Once verify transitions from 'failed' to 'passed',
+    // compress intermediate failed stack traces to first 5 lines + summary.
+    let passIndex = -1;
+
+    if (this.taskState.lastVerification?.passed) {
+      passIndex = messages.length;
+    }
+
+    for (let i = 0; i < messages.length; i++) {
+      const c = messages[i].content || '';
+      if (
+        /✓\s*Verification passed|PASSED:\s*`|verification succeeded|exited with 0 errors/i.test(c) ||
+        (messages[i].role === 'tool' && /Command .* exited cleanly with exit code 0/i.test(c))
+      ) {
+        passIndex = i;
+        break;
+      }
+    }
+
+    if (passIndex > 0) {
+      for (let i = 0; i < passIndex; i++) {
+        const msg = messages[i];
+        if (msg.role !== 'tool' || !msg.content) continue;
+        if (msg.content.startsWith('[Superseded') || msg.content.includes('[Remaining') || msg.content.includes('[Compacted Output')) continue;
+
+        const isErrorOutput =
+          /error|fail|exception|panic|fatal|ts\d{4}|assertionerror|typeerror|referenceerror|syntaxerror/i.test(msg.content) &&
+          (/^\s*at\s+|\berror\s+ts\d+:|:\d+:\d+:|FAIL\s+|AssertionError/m.test(msg.content) || /exited with code [1-9]/i.test(msg.content));
+
+        if (isErrorOutput) {
+          const lines = msg.content.split('\n');
+          if (lines.length > 5) {
+            const headLines = lines.slice(0, 5).join('\n');
+            const foldedCount = lines.length - 5;
+            const replacement = `${headLines}\n[Remaining ${foldedCount} lines of resolved error trace folded; verification subsequently passed]`;
+            const saved = this.estimateTokens(msg.content) - this.estimateTokens(replacement);
+            msg.content = replacement;
+            if (saved > 0) {
+              this.stats.tokensSavedByCompression += saved;
+            }
+          }
+        }
+      }
+    }
+
+    return messages;
+  }
+
+  /**
+   * Generates a structured <context_checkpoint> XML block:
+   * - Active Goal & Constraints
+   * - Completed Milestones & Verified Edits
+   * - Working Set Files
+   * - Key Decisions & Rejected Approaches
+   */
+  generateCheckpoint(synthesizedFindings?: string): string {
+    const parts: string[] = ['<context_checkpoint>'];
+
+    // 1. Active Goal & Constraints
+    parts.push('### Active Goal & Constraints');
+    const goal = this.taskState.objective || 'Not specified';
+    const subtask = this.taskState.currentSubtask ? `\nCurrent Subtask: ${this.taskState.currentSubtask}` : '';
+    parts.push(`Goal: ${goal}${subtask}`);
+
+    // 2. Completed Milestones & Verified Edits
+    parts.push('\n### Completed Milestones & Verified Edits');
+    if (this.taskState.completedObjectives && this.taskState.completedObjectives.length > 0) {
+      parts.push('Completed Milestones:');
+      this.taskState.completedObjectives.forEach(obj => parts.push(`- ${obj}`));
+    } else {
+      parts.push('Completed Milestones: None');
+    }
+    if (this.taskState.lastVerification) {
+      parts.push(`Verification Status: ${this.taskState.lastVerification.summary}`);
+    } else {
+      parts.push('Verification Status: Not run');
+    }
+
+    // 3. Working Set Files
+    parts.push('\n### Working Set Files');
+    if (this.taskState.relevantFiles && this.taskState.relevantFiles.length > 0) {
+      this.taskState.relevantFiles.forEach(file => parts.push(`- ${file}`));
+    } else {
+      parts.push('- None');
+    }
+
+    // 4. Key Decisions & Rejected Approaches
+    parts.push('\n### Key Decisions & Rejected Approaches');
+    if (this.durableDecisions && this.durableDecisions.length > 0) {
+      parts.push('Key Decisions:');
+      this.durableDecisions.forEach(d => parts.push(`- ${d}`));
+    } else {
+      parts.push('Key Decisions: None');
+    }
+    if (this.taskState.unresolvedErrors && this.taskState.unresolvedErrors.length > 0) {
+      parts.push('Rejected Approaches / Errors:');
+      this.taskState.unresolvedErrors.forEach(err => parts.push(`- ${err}`));
+    } else {
+      parts.push('Rejected Approaches / Errors: None');
+    }
+
+    if (synthesizedFindings) {
+      parts.push(`\nSynthesized Findings: ${synthesizedFindings}`);
+    }
+
+    parts.push('</context_checkpoint>');
+    const result = parts.join('\n');
+    this.latestCheckpoint = result;
+    return result;
+  }
+
+  getLatestCheckpoint(): string {
+    return this.latestCheckpoint || this.generateCheckpoint();
+  }
+
+  /**
+   * Tier 2 Compaction:
+   * - First executes Tier 1 pruneStaleToolOutputs
+   * - Preserves system prompt, original task prompt, and last keepRecentMessages (default 8)
+   * - Folds older middle turns into structured <context_checkpoint> XML block
+   */
+  compact(
+    messages: ChatMessage[],
+    options?: { keepRecentMessages?: number; synthesizedFindings?: string }
+  ): ChatMessage[] {
+    const keepRecent = options?.keepRecentMessages ?? 8;
+    const synthesizedFindings = options?.synthesizedFindings;
+
     const budget = this.getAvailableContextBudget();
     this.stats.budgetTokens = budget;
+
+    // Step 0: Tier 1 Stale tool output pruning
+    this.pruneStaleToolOutputs(messages);
 
     const totalTokens = this.estimateMessagesTokens(messages);
     this.stats.totalTokensEstimated = totalTokens;
@@ -527,7 +828,6 @@ export class ContextEngine {
     this.dedupeToolOutputs(compacted, 1);
 
     // Step 2: Compress older tool outputs & evict older file viewings
-    // Keep the final turn (last 2 messages: assistant/user) intact; compact earlier turns
     const preserveLast = 2;
     const endIdx = compacted.length - preserveLast;
 
@@ -548,29 +848,33 @@ export class ContextEngine {
       }
     }
 
-    // Step 3: If still over budget, retain structured task state and drop stale intermediate messages
+    // Step 3: If still over budget or history is long, fold older middle turns into <context_checkpoint>
     let currentTokens = this.estimateMessagesTokens(compacted);
-    if (currentTokens > budget && compacted.length > 4) {
-      // Build a synthetic structured state message to replace older dropped turns
-      let stateSummary = this.buildTaskStateSummary();
+    if ((currentTokens > budget || compacted.length > keepRecent + 2) && compacted.length > 4) {
+      const checkpointXml = this.generateCheckpoint(synthesizedFindings);
+      let foldedContent = `[SESSION CONTEXT RESTORED FROM COMPACT STATE]\n${checkpointXml}`;
       if (synthesizedFindings) {
-        stateSummary = `WORKING FINDINGS & SYNTHESIS:\n${synthesizedFindings}\n\n` + stateSummary;
+        foldedContent = `WORKING FINDINGS & SYNTHESIS:\n${synthesizedFindings}\n\n` + foldedContent;
       }
+
       const systemMsg = compacted[0];
       const initialUser = compacted.find(m => m.role === 'user') || { role: 'user', content: this.taskState.objective };
-      // Never start the window on a `tool` message: its assistant tool_call would be dropped (orphaned result).
-      let windowStart = Math.max(1, compacted.length - 4);
-      while (windowStart > 1 && compacted[windowStart].role === 'tool') windowStart--;
-      const recentWindow = compacted.slice(windowStart);
+
+      let windowStart = Math.max(1, compacted.length - keepRecent);
+      while (windowStart > 1 && compacted[windowStart].role === 'tool') {
+        windowStart--;
+      }
+
+      const recentWindow = compacted.slice(windowStart).filter(m => m !== initialUser && m !== systemMsg);
 
       const prunedMessages: ChatMessage[] = [
         systemMsg,
         initialUser,
         {
           role: 'user',
-          content: `[SESSION CONTEXT RESTORED FROM COMPACT STATE]\n${stateSummary}`
+          content: foldedContent
         },
-        ...recentWindow.filter(m => m !== initialUser && m !== systemMsg)
+        ...recentWindow
       ];
 
       currentTokens = this.estimateMessagesTokens(prunedMessages);
@@ -596,23 +900,11 @@ export class ContextEngine {
     return compacted;
   }
 
+  compactMessages(messages: ChatMessage[], synthesizedFindings?: string): ChatMessage[] {
+    return this.compact(messages, { synthesizedFindings });
+  }
+
   private buildTaskStateSummary(): string {
-    const parts: string[] = [];
-    if (this.taskState.objective) {
-      parts.push(`OBJECTIVE: ${this.taskState.objective}`);
-    }
-    if (this.taskState.relevantFiles.length > 0) {
-      parts.push(`RELEVANT FILES: ${this.taskState.relevantFiles.join(', ')}`);
-    }
-    if (this.taskState.unresolvedErrors.length > 0) {
-      parts.push(`CURRENT UNRESOLVED ERRORS:\n- ${this.taskState.unresolvedErrors.join('\n- ')}`);
-    }
-    if (this.taskState.lastVerification) {
-      parts.push(`VERIFICATION STATUS: ${this.taskState.lastVerification.summary}`);
-    }
-    if (this.durableDecisions.length > 0) {
-      parts.push(`KEY ARCHITECTURAL DECISIONS:\n- ${this.durableDecisions.join('\n- ')}`);
-    }
-    return parts.join('\n\n');
+    return this.generateCheckpoint();
   }
 }

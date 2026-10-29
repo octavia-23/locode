@@ -19,7 +19,7 @@ const DEFAULT_BLOCKED_COMMANDS: RegExp[] = [
   // System shutdown / reboot
   /\b(shutdown|reboot|init\s+0|halt)\b/i,
   // Unrestricted rm -rf of root / wildcards
-  /\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|--recursive\s+--force)\s+[/~]/i,
+  /\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|--recursive\s+--force)\s+([/~]|\*|\/\*)/i,
   // Windows equivalents of destructive operations
   /\b(format\s+[a-zA-Z]:|rd\s+\/s\s+\/q\s+[\\\/]|del\s+\/f\s+\/s\s+\/q\s+[\\\/])/i,
   // Destructive git commands that wipe everything without rollback
@@ -127,11 +127,231 @@ export interface CommandSecurityEvaluation {
  * - 'ask': high-risk command requiring explicit user confirmation.
  * - 'allow': normal development command allowed if other checks pass.
  */
-export function classifyCommandSecurity(command: string): CommandSecurityEvaluation {
-  const trimmed = command.trim();
+/**
+ * Splits compound shell commands across ;, &&, ||, |, and newlines while respecting quotes.
+ */
+export function splitCompoundCommands(command: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let isEscaped = false;
 
-  // 1. Unconditional DENY list: Truly prohibited commands that must NEVER execute
-  // Cannot be bypassed by --auto, profile overrides, or approval handlers.
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+
+    if (isEscaped) {
+      current += ch;
+      isEscaped = false;
+      continue;
+    }
+
+    if (ch === '\\' && !inSingleQuote) {
+      isEscaped = true;
+      current += ch;
+      continue;
+    }
+
+    if (ch === '\'' && !inDoubleQuote) {
+      inSingleQuote = !inSingleQuote;
+      current += ch;
+      continue;
+    }
+
+    if (ch === '"' && !inSingleQuote) {
+      inDoubleQuote = !inDoubleQuote;
+      current += ch;
+      continue;
+    }
+
+    if (!inSingleQuote && !inDoubleQuote) {
+      // Split on ; or \n or \r
+      if (ch === ';' || ch === '\n' || ch === '\r') {
+        if (current.trim()) parts.push(current.trim());
+        current = '';
+        continue;
+      }
+
+      // Split on && or ||
+      if ((ch === '&' && command[i + 1] === '&') || (ch === '|' && command[i + 1] === '|')) {
+        if (current.trim()) parts.push(current.trim());
+        current = '';
+        i++; // skip second operator character
+        continue;
+      }
+
+      // Split on single pipe |
+      if (ch === '|') {
+        if (current.trim()) parts.push(current.trim());
+        current = '';
+        continue;
+      }
+    }
+
+    current += ch;
+  }
+
+  if (current.trim()) {
+    parts.push(current.trim());
+  }
+
+  return parts.length > 0 ? parts : [command.trim()];
+}
+
+/**
+ * Extracts subshell and command substitution segments: $(...), `...`, <(...), >(...)
+ */
+export function extractCommandSubstitutions(command: string): string[] {
+  const extracted: string[] = [];
+
+  // 1. $(...) and <(...) and >(...)
+  for (let i = 0; i < command.length - 1; i++) {
+    if (
+      (command[i] === '$' || command[i] === '<' || command[i] === '>') &&
+      command[i + 1] === '('
+    ) {
+      let depth = 1;
+      let j = i + 2;
+      let inSingle = false;
+      let inDouble = false;
+      let escaped = false;
+      while (j < command.length && depth > 0) {
+        const c = command[j];
+        if (escaped) {
+          escaped = false;
+        } else if (c === '\\') {
+          escaped = true;
+        } else if (c === '\'' && !inDouble) {
+          inSingle = !inSingle;
+        } else if (c === '"' && !inSingle) {
+          inDouble = !inDouble;
+        } else if (!inSingle && !inDouble) {
+          if (c === '(') depth++;
+          else if (c === ')') depth--;
+        }
+        if (depth === 0) break;
+        j++;
+      }
+      if (depth === 0) {
+        extracted.push(command.slice(i + 2, j).trim());
+        i = j;
+      }
+    }
+  }
+
+  // 2. Backtick substitutions `...`
+  let inBacktick = false;
+  let btStart = -1;
+  let escaped = false;
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (c === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (c === '`') {
+      if (!inBacktick) {
+        inBacktick = true;
+        btStart = i + 1;
+      } else {
+        inBacktick = false;
+        extracted.push(command.slice(btStart, i).trim());
+      }
+    }
+  }
+
+  return extracted;
+}
+
+/**
+ * Extracts scripts evaluated inline via shell/interpreter flags (-c, -e, --eval).
+ */
+export function extractInlineScripts(command: string): string[] {
+  const extracted: string[] = [];
+
+  // sh/bash/zsh -c "..."
+  const shellRegex = /\b(?:sh|bash|zsh|dash|ksh)\s+(?:-[a-zA-Z]*c|--command)\s+(?:(["'])([\s\S]*?)\1|([^\s;&|]+))/gi;
+  let match: RegExpExecArray | null;
+  while ((match = shellRegex.exec(command)) !== null) {
+    const script = match[2] !== undefined ? match[2] : match[3];
+    if (script) extracted.push(script.trim());
+  }
+
+  // node/tsx/python/perl/ruby inline evaluators
+  const interpRegex = /\b(?:node|nodejs|tsx|ts-node|python|python3|py|perl|ruby)\s+(?:-[a-zA-Z]*[ec]|--eval)\s+(?:(["'])([\s\S]*?)\1|([^\s;&|]+))/gi;
+  while ((match = interpRegex.exec(command)) !== null) {
+    const script = match[2] !== undefined ? match[2] : match[3];
+    if (script) extracted.push(script.trim());
+  }
+
+  return extracted;
+}
+
+/**
+ * Checks for base64 or hex decode commands piped into shell interpreters.
+ */
+export function isBase64OrHexDecodePipe(command: string): boolean {
+  return /(?:base64\s+(?:-[a-zA-Z]*d|--decode)|xxd\s+-r)\b[\s\S]*?\|\s*(?:sh|bash|zsh|eval|source)\b/i.test(command);
+}
+
+/**
+ * Classifies a command into an explicit security decision:
+ * - 'deny': unconditionally prohibited command (e.g. format disk, rm -rf /, shutdown). Never executed.
+ * - 'ask': high-risk command requiring explicit user confirmation.
+ * - 'allow': normal development command allowed if other checks pass.
+ */
+export function classifyCommandSecurity(command: string, depth: number = 0): CommandSecurityEvaluation {
+  const trimmed = command.trim();
+  if (!trimmed) {
+    return { decision: 'allow', dangerous: false };
+  }
+
+  // 1. Check for obfuscated base64/hex decode piped into shell
+  if (isBase64OrHexDecodePipe(trimmed)) {
+    return {
+      decision: 'ask',
+      dangerous: true,
+      reason: 'Obfuscated base64/hex decode execution piped to shell interpreter'
+    };
+  }
+
+  // 2. Check piped remote script execution before pipeline splitting
+  if (/\b(?:curl|wget|fetch)\b[\s\S]*?\|\s*(?:sh|bash|zsh|powershell|cmd|eval)\b/i.test(trimmed)) {
+    return {
+      decision: 'ask',
+      dangerous: true,
+      reason: 'Piped remote script execution'
+    };
+  }
+
+  // 3. Split compound commands across ;, &&, ||, |, and newlines (if not already sub-analyzing)
+  const subCommands = splitCompoundCommands(trimmed);
+  if (subCommands.length > 1) {
+    let hasAsk = false;
+    let askReason: string | undefined;
+
+    for (const sub of subCommands) {
+      const evalRes = classifyCommandSecurity(sub, depth + 1);
+      if (evalRes.decision === 'deny') {
+        return evalRes; // Unconditional DENY in any pipeline branch denies entire chain
+      }
+      if (evalRes.decision === 'ask') {
+        hasAsk = true;
+        askReason = evalRes.reason;
+      }
+    }
+
+    if (hasAsk) {
+      return { decision: 'ask', dangerous: true, reason: askReason || 'Compound command contains high-risk operation' };
+    }
+    return { decision: 'allow', dangerous: false };
+  }
+
+  // 3. Unconditional DENY list: Truly prohibited commands that must NEVER execute
   for (const pattern of DEFAULT_BLOCKED_COMMANDS) {
     if (pattern.test(trimmed)) {
       return {
@@ -142,7 +362,47 @@ export function classifyCommandSecurity(command: string): CommandSecurityEvaluat
     }
   }
 
-  // 2. ASK list: High-risk command patterns that require explicit user approval
+  // 4. Inspect Command Substitutions: $(...), `...`, <(...), >(...)
+  const substitutions = extractCommandSubstitutions(trimmed);
+  if (substitutions.length > 0) {
+    for (const sub of substitutions) {
+      const innerEval = classifyCommandSecurity(sub, depth + 1);
+      if (innerEval.decision === 'deny') {
+        return {
+          decision: 'deny',
+          dangerous: true,
+          reason: `Command substitution contains prohibited command: ${innerEval.reason}`
+        };
+      }
+    }
+    return {
+      decision: 'ask',
+      dangerous: true,
+      reason: 'Command utilizes dynamic subshell / command substitution'
+    };
+  }
+
+  // 5. Inspect Inline Script Evaluators (e.g. bash -c "...", node -e "...")
+  const inlineScripts = extractInlineScripts(trimmed);
+  if (inlineScripts.length > 0) {
+    for (const script of inlineScripts) {
+      const innerEval = classifyCommandSecurity(script, depth + 1);
+      if (innerEval.decision === 'deny') {
+        return {
+          decision: 'deny',
+          dangerous: true,
+          reason: `Inline interpreter payload is prohibited: ${innerEval.reason}`
+        };
+      }
+    }
+    return {
+      decision: 'ask',
+      dangerous: true,
+      reason: 'Inline script execution flag (-c / -e) requires approval'
+    };
+  }
+
+  // 6. ASK list: High-risk command patterns that require explicit user approval
   const dangerousPatterns = [
     { pattern: /\b(rm|del|rd|rmdir)\b/i, reason: 'File deletion command' },
     { pattern: /\bgit\s+(reset\s+--hard|clean\s+-fd|push\s+--force)/i, reason: 'Destructive Git operation' },

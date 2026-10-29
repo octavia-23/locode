@@ -7,7 +7,8 @@ import {
   LlamaRuntimeConfig,
   INFERENCE_PROFILES,
   DEFAULT_QWEN_MODEL_PATH,
-  DEFAULT_QWEN_MODEL_ALIAS
+  DEFAULT_QWEN_MODEL_ALIAS,
+  resolveProfileConfig
 } from './profiles.js';
 import { RuntimeDetector, BinaryFlagSupport } from './detector.js';
 
@@ -36,33 +37,11 @@ export class LlamaCppRuntime {
   private flagSupport?: BinaryFlagSupport;
 
   constructor(customConfig?: Partial<LlamaRuntimeConfig>) {
-    const requestedProfile = customConfig?.profileName || 'ultra-context';
-    const profile = INFERENCE_PROFILES[requestedProfile] || INFERENCE_PROFILES['ultra-context'] || INFERENCE_PROFILES.performance;
+    const requestedProfile = customConfig?.profileName || 'balanced';
+    const resolved = resolveProfileConfig(requestedProfile, customConfig);
     this.config = {
-      profileName: 'ultra-context',
-      modelPath: process.env.LOCODE_LOCAL_MODEL_PATH || DEFAULT_QWEN_MODEL_PATH,
-      modelAlias: DEFAULT_QWEN_MODEL_ALIAS,
-      serverPath: process.env.LOCODE_LLAMA_SERVER_PATH,
-      host: '127.0.0.1',
-      port: process.env.LOCODE_LOCAL_MODEL_PORT ? parseInt(process.env.LOCODE_LOCAL_MODEL_PORT, 10) : 8081,
-      autoPort: true,
-      autoStart: process.env.LOCODE_LOCAL_MODEL_AUTO_START !== 'false',
-      contextSize: process.env.LOCODE_LOCAL_MODEL_CONTEXT ? parseInt(process.env.LOCODE_LOCAL_MODEL_CONTEXT, 10) : 262144,
-      nCpuMoe: 34,
-      nGpuLayers: 999,
-      batchSize: 2048,
-      ubatchSize: 512,
-      flashAttention: true,
-      cacheTypeK: 'turbo4',
-      cacheTypeV: 'turbo3',
-      noMmap: true,
-      mlock: true,
-      threads: 12,
-      jinja: true,
-      cacheReuse: 256,
-      reasoningFormat: 'none',
-      ...profile,
-      ...customConfig
+      ...resolved,
+      contextSize: customConfig?.contextSize || (process.env.LOCODE_LOCAL_MODEL_CONTEXT ? parseInt(process.env.LOCODE_LOCAL_MODEL_CONTEXT, 10) : resolved.contextSize)
     };
 
     // Clean up child process on parent exit

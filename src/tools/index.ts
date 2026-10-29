@@ -1,19 +1,24 @@
 import { ToolDefinition } from '../types.js';
-import { viewFileTool, batchReadFilesTool, writeFileTool, editFileTool } from './file-ops.js';
+import { viewFileTool, batchReadFilesTool, writeFileTool, editFileTool, multiEditFileTool } from './file-ops.js';
 import { listDirTool, searchCodeTool } from './search.js';
 import { runCommandTool } from './terminal.js';
 import { fetchWebTool, searchWebTool } from './web.js';
+import { delegateTaskTool } from './subagent.js';
+
+export { delegateTaskTool, multiEditFileTool };
 
 export const allTools: ToolDefinition[] = [
   viewFileTool,
   batchReadFilesTool,
   writeFileTool,
   editFileTool,
+  multiEditFileTool,
   listDirTool,
   searchCodeTool,
   runCommandTool,
   fetchWebTool,
-  searchWebTool
+  searchWebTool,
+  delegateTaskTool
 ];
 
 export const toolRegistry = new Map<string, ToolDefinition>();

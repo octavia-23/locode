@@ -2,8 +2,30 @@ import chalk from 'chalk';
 import { AgentContext, ChatMessage } from '../types.js';
 import { ILLMProvider } from '../providers/types.js';
 import { createLLMProvider } from '../providers/factory.js';
+import { SubagentRunner } from './subagents/runner.js';
+import { SubagentOutcome } from './subagents/types.js';
 
 export class ArchitectEngine {
+  /**
+   * Invokes an isolated Architect subagent with read-only tools to deeply inspect
+   * contracts and produce a structured root-cause diagnosis.
+   */
+  static async diagnoseWithSubagent(
+    errorOutput: string,
+    command: string,
+    context: AgentContext,
+    provider?: ILLMProvider
+  ): Promise<SubagentOutcome> {
+    const objective = `Analyze verification failure for command '${command}', inspect the referenced source files, and determine the root cause and surgical fix directive.`;
+    return await SubagentRunner.run({
+      role: 'architect',
+      objective,
+      context,
+      initialContext: errorOutput,
+      maxSteps: 5
+    }, provider);
+  }
+
   /**
    * Generates a deep structural diagnosis when the worker model gets stuck in a verification error.
    */

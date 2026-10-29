@@ -47,7 +47,7 @@ export class PermissionEngine {
 
     // 1. Read-only policy enforcement
     if (this.policy.readOnly) {
-      if (tool.name === 'write_file' || tool.name === 'edit_file') {
+      if (tool.name === 'write_file' || tool.name === 'edit_file' || tool.name === 'multi_edit_file') {
         return {
           allowed: false,
           reason: `Permission Denied: Workspace is in read-only mode. Tool "${tool.name}" is prohibited.`
@@ -84,7 +84,7 @@ export class PermissionEngine {
     }
 
     // 4. Filesystem path validation & containment
-    const isMutatingFileTool = tool.name === 'write_file' || tool.name === 'edit_file';
+    const isMutatingFileTool = tool.name === 'write_file' || tool.name === 'edit_file' || tool.name === 'multi_edit_file';
     // Mutating file tools NEVER allow writing outside workspace
     const effectiveAllowOutside = isMutatingFileTool ? false : allowOutside;
 
@@ -97,11 +97,22 @@ export class PermissionEngine {
         if (typeof p === 'string') pathsToCheck.push(p);
       }
     }
+    if (Array.isArray(args.files)) {
+      for (const f of args.files) {
+        if (f && typeof f.path === 'string') pathsToCheck.push(f.path);
+      }
+    }
+    if (Array.isArray(args.edits)) {
+      for (const e of args.edits) {
+        if (e && typeof e.path === 'string') pathsToCheck.push(e.path);
+      }
+    }
 
     const isPathSensitiveTool = tool.name === 'view_file' ||
                                 tool.name === 'batch_read_files' ||
                                 tool.name === 'write_file' ||
                                 tool.name === 'edit_file' ||
+                                tool.name === 'multi_edit_file' ||
                                 tool.name === 'list_dir' ||
                                 tool.name === 'search_code';
 

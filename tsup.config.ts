@@ -5,6 +5,7 @@ export default defineConfig({
   format: ['esm'],
   clean: true,
   dts: false,
+  external: ['esbuild'],
   banner: {
     js: '#!/usr/bin/env node'
   }

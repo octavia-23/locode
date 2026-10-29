@@ -1,5 +1,4 @@
 import { ToolDefinition, AgentContext } from '../types.js';
-import { SubagentRunner } from '../agent/subagents/runner.js';
 import { SubagentRole } from '../agent/subagents/types.js';
 
 export const delegateTaskTool: ToolDefinition = {
@@ -25,6 +24,7 @@ export const delegateTaskTool: ToolDefinition = {
     required: ['role', 'prompt']
   },
   execute: async (args: { role: SubagentRole; prompt: string; maxSteps?: number }, context: AgentContext): Promise<{ result: string; isError?: boolean }> => {
+    const { SubagentRunner } = await import('../agent/subagents/runner.js');
     const outcome = await SubagentRunner.run({
       role: args.role,
       objective: args.prompt,

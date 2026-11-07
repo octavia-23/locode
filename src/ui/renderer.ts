@@ -347,4 +347,41 @@ export class TerminalRenderer {
     const line = parts.join(` ${theme.faint('·')} `);
     console.log(`  ${theme.faint('──')} ${theme.muted(line)}\n`);
   }
+
+  printStatusHUD(
+    model: string,
+    provider: string,
+    numCtx?: number,
+    usedTokens?: number,
+    autoApprove?: boolean,
+    sessionName?: string,
+    lastTps?: number
+  ) {
+    const isCloud = isCloudProvider(provider);
+    const provDisplay = provider === 'llamacpp' ? 'llama.cpp' : (provider || 'ollama');
+    const cloudBadge = isCloud ? theme.accent('☁ cloud') : theme.dim(provDisplay);
+    const sessionStr = sessionName ? `${theme.secondary(sessionName)} ${theme.faint('·')} ` : '';
+    const modeTag = autoApprove ? theme.accent('auto') : theme.dim('safe');
+
+    const parts: string[] = [];
+    parts.push(`${theme.diamond} ${sessionStr}${theme.text(model)} [${cloudBadge}]`);
+
+    if (numCtx && numCtx > 0) {
+      const used = usedTokens || 0;
+      const pct = Math.min(100, Math.round((used / numCtx) * 100));
+      const usedK = (used / 1024).toFixed(1);
+      const maxK = (numCtx / 1024).toFixed(0);
+      const gaugeBar = theme.gauge(pct, 6);
+      parts.push(`ctx ${gaugeBar} ${pct}% ${theme.dim(`(${usedK}k/${maxK}k)`)}`);
+    }
+
+    if (lastTps && lastTps > 0) {
+      parts.push(theme.accent(`${lastTps.toFixed(1)} tok/s`));
+    }
+
+    parts.push(modeTag);
+
+    const hudLine = parts.join(` ${theme.faint('·')} `);
+    console.log(`\n  ${hudLine}`);
+  }
 }

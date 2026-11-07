@@ -228,7 +228,7 @@ export const LOCAL_CONSERVATIVE_PROFILE: HarnessExecutionProfile = {
     redactSecrets: false
   },
   costPolicy: {},
-  timeoutMs: 180000
+  timeoutMs: 600000
 };
 
 export const LOCAL_TURBO_PROFILE: HarnessExecutionProfile = {
@@ -245,7 +245,7 @@ export const LOCAL_TURBO_PROFILE: HarnessExecutionProfile = {
     redactSecrets: false
   },
   costPolicy: {},
-  timeoutMs: 240000
+  timeoutMs: 600000
 };
 
 export const CLOUD_FRONTIER_PROFILE: HarnessExecutionProfile = {
@@ -265,7 +265,7 @@ export const CLOUD_FRONTIER_PROFILE: HarnessExecutionProfile = {
     maxCostPerTurn: 2.0,
     alertOnCostThreshold: true
   },
-  timeoutMs: 300000
+  timeoutMs: 600000
 };
 
 export const HYBRID_PROFILE: HarnessExecutionProfile = {
@@ -285,7 +285,7 @@ export const HYBRID_PROFILE: HarnessExecutionProfile = {
     maxCostPerTurn: 1.0,
     alertOnCostThreshold: true
   },
-  timeoutMs: 240000
+  timeoutMs: 600000
 };
 
 export function resolveExecutionProfile(

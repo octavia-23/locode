@@ -188,3 +188,128 @@ test('Provider Factory - getApiKeyForProvider & getEnvKeyNameForProvider support
     process.env = origEnv;
   }
 });
+
+test('Provider Factory & Config - identifyProviderFromApiKey detects cloud providers accurately', async () => {
+  const { identifyProviderFromApiKey, maskApiKey } = await import('../src/utils/config.js');
+
+  // Gemini
+  assert.equal(identifyProviderFromApiKey('AIzaSyAbc123_456-789XYZ'), 'gemini');
+  assert.equal(identifyProviderFromApiKey('"AIzaSyAbc123_456-789XYZ"'), 'gemini');
+
+  // Anthropic
+  assert.equal(identifyProviderFromApiKey('sk-ant-api03-abcdef123456'), 'anthropic');
+  assert.equal(identifyProviderFromApiKey('  sk-ant-api03-abcdef123456  '), 'anthropic');
+
+  // Groq
+  assert.equal(identifyProviderFromApiKey('gsk_1234567890abcdef'), 'groq');
+  assert.equal(identifyProviderFromApiKey('gsk-dummy-test-key'), 'groq');
+
+  // OpenRouter
+  assert.equal(identifyProviderFromApiKey('sk-or-v1-abcdef123456'), 'openrouter');
+  assert.equal(identifyProviderFromApiKey('or-custom-key-12345'), 'openrouter');
+
+  // NVIDIA NIM
+  assert.equal(identifyProviderFromApiKey('nvapi-abcdef123456'), 'nim');
+  assert.equal(identifyProviderFromApiKey('nvapi_abcdef123456'), 'nim');
+
+  // OpenAI
+  assert.equal(identifyProviderFromApiKey('sk-proj-abcdef123456'), 'openai');
+  assert.equal(identifyProviderFromApiKey('sk-admin-abcdef123456'), 'openai');
+  assert.equal(identifyProviderFromApiKey('sk-svcacct-abcdef123456'), 'openai');
+  assert.equal(identifyProviderFromApiKey('sk-1234567890abcdef1234567890'), 'openai');
+
+  // Negative / Invalid cases
+  assert.equal(identifyProviderFromApiKey(undefined), undefined);
+  assert.equal(identifyProviderFromApiKey(''), undefined);
+  assert.equal(identifyProviderFromApiKey('   '), undefined);
+  assert.equal(identifyProviderFromApiKey('random_unknown_token_value'), undefined);
+
+  // Masking utility
+  assert.equal(maskApiKey('AIzaSyAbc123_456-789XYZ'), 'AIzaSy...9XYZ');
+  assert.equal(maskApiKey('sk-ant-api03-12345678'), 'sk-ant...5678');
+  assert.equal(maskApiKey('short'), '****');
+  assert.equal(maskApiKey(''), '');
+});
+
+test('Provider Factory - resolveProvider auto-detects provider from explicit apiKey', () => {
+  const origEnv = { ...process.env };
+  delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  delete process.env.GOOGLE_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  delete process.env.OPENROUTER_API_KEY;
+  delete process.env.GROQ_API_KEY;
+  delete process.env.NVIDIA_API_KEY;
+
+  try {
+    assert.equal(resolveProvider({ apiKey: 'AIzaSyTestGeminiKey123456' }), 'gemini');
+    assert.equal(resolveProvider({ apiKey: 'sk-ant-api03-test-claude' }), 'anthropic');
+    assert.equal(resolveProvider({ apiKey: 'gsk_test_groq_key_12345' }), 'groq');
+    assert.equal(resolveProvider({ apiKey: 'sk-or-v1-test-openrouter' }), 'openrouter');
+    assert.equal(resolveProvider({ apiKey: 'nvapi-test-nvidia-key' }), 'nim');
+    assert.equal(resolveProvider({ apiKey: 'sk-proj-test-openai-key' }), 'openai');
+
+    // Explicit provider overrides apiKey
+    assert.equal(resolveProvider({ provider: 'gemini', apiKey: 'sk-ant-api03-test' }), 'gemini');
+    assert.equal(resolveProvider({ provider: 'openrouter', apiKey: 'sk-proj-openai' }), 'openrouter');
+  } finally {
+    Object.assign(process.env, origEnv);
+  }
+});
+
+test('Provider Factory - getDefaultModelForProvider & getDefaultContextForProvider provide valid configurations', async () => {
+  const { getDefaultModelForProvider, getDefaultContextForProvider, SUPPORTED_PROVIDERS } = await import('../src/providers/factory.js');
+
+  assert.ok(SUPPORTED_PROVIDERS.length >= 8);
+
+  assert.equal(getDefaultModelForProvider('gemini'), 'gemini-3.6-flash');
+  assert.equal(getDefaultModelForProvider('anthropic'), 'claude-3-5-sonnet-20241022');
+  assert.equal(getDefaultModelForProvider('openai'), 'gpt-4o');
+  assert.equal(getDefaultModelForProvider('openrouter'), 'anthropic/claude-3.5-sonnet');
+  assert.equal(getDefaultModelForProvider('groq'), 'qwen/qwen3.8-27b');
+  assert.equal(getDefaultModelForProvider('nim'), 'meta/llama-3.3-70b-instruct');
+  assert.equal(getDefaultModelForProvider('ollama'), 'qwen2.5-coder:7b');
+
+  assert.equal(getDefaultContextForProvider('gemini'), 1048576);
+  assert.equal(getDefaultContextForProvider('anthropic'), 200000);
+  assert.equal(getDefaultContextForProvider('groq'), 131072);
+  assert.equal(getDefaultContextForProvider('openai'), 128000);
+});
+
+test('Provider Factory - getAvailableModels provides rich model options even without active API credentials', async () => {
+  const gemini = createLLMProvider({
+    cwd: process.cwd(),
+    autoApprove: true,
+    model: 'gemini-3.6-flash',
+    ollamaHost: 'http://127.0.0.1:11434',
+    provider: 'gemini',
+    apiKey: ''
+  });
+  const geminiModels = await gemini.getAvailableModels();
+  assert.ok(geminiModels.length > 1);
+  assert.ok(geminiModels.includes('gemini-3.6-flash'));
+
+  const anthropic = createLLMProvider({
+    cwd: process.cwd(),
+    autoApprove: true,
+    model: 'claude-3-5-sonnet-20241022',
+    ollamaHost: 'http://127.0.0.1:11434',
+    provider: 'anthropic',
+    apiKey: ''
+  });
+  const anthropicModels = await anthropic.getAvailableModels();
+  assert.ok(anthropicModels.length >= 3);
+  assert.ok(anthropicModels.includes('claude-3-5-sonnet-20241022'));
+
+  const groq = createLLMProvider({
+    cwd: process.cwd(),
+    autoApprove: true,
+    model: 'qwen/qwen3.8-27b',
+    ollamaHost: 'http://127.0.0.1:11434',
+    provider: 'groq',
+    apiKey: ''
+  });
+  const groqModels = await groq.getAvailableModels();
+  assert.ok(groqModels.length > 1);
+  assert.ok(groqModels.includes('qwen/qwen3.8-27b'));
+});

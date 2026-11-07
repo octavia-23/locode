@@ -3,6 +3,7 @@ import path from 'node:path';
 import syncFs from 'node:fs';
 import readline from 'node:readline';
 import { theme } from '../ui/theme.js';
+import type { ProviderType } from '../types.js';
 
 export function getGlobalConfigDir(): string {
   return path.join(os.homedir(), '.locode');
@@ -31,7 +32,7 @@ export function loadEnvironmentVariables(cwd: string): void {
   }
 
   // Clean empty-string values (e.g. KEY="" in .env shouldn't count as a defined key)
-  for (const key of ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'GROQ_API_KEY', 'NVIDIA_API_KEY', 'NVAPI_KEY']) {
+  for (const key of ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'GROQ_API_KEY', 'NVIDIA_API_KEY', 'NVAPI_KEY', 'APINEX_API_KEY']) {
     if (process.env[key] !== undefined && process.env[key]!.trim() === '') {
       delete process.env[key];
     }
@@ -44,6 +45,8 @@ export function getEnvKeyNameForProvider(provider: string): string {
       return 'GEMINI_API_KEY';
     case 'anthropic':
       return 'ANTHROPIC_API_KEY';
+    case 'apinex':
+      return 'APINEX_API_KEY';
     case 'openrouter':
       return 'OPENROUTER_API_KEY';
     case 'groq':
@@ -67,6 +70,8 @@ export function getApiKeyForProvider(provider: string, explicitKey?: string): st
       return (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').trim() || undefined;
     case 'anthropic':
       return (process.env.ANTHROPIC_API_KEY || '').trim() || undefined;
+    case 'apinex':
+      return (process.env.APINEX_API_KEY || process.env.APINEX_KEY || '').trim() || undefined;
     case 'openrouter':
       return (process.env.OPENROUTER_API_KEY || '').trim() || undefined;
     case 'groq':
@@ -79,6 +84,67 @@ export function getApiKeyForProvider(provider: string, explicitKey?: string): st
     default:
       return undefined;
   }
+}
+
+/**
+ * Identifies the LLM provider based on API key structure and prefix conventions.
+ */
+export function identifyProviderFromApiKey(apiKey?: string): ProviderType | undefined {
+  if (!apiKey || typeof apiKey !== 'string') return undefined;
+  const key = apiKey.trim().replace(/^["']|["']$/g, '');
+  if (!key) return undefined;
+
+  // Google Gemini API keys start with "AIza"
+  if (key.startsWith('AIza')) {
+    return 'gemini';
+  }
+
+  // Anthropic Claude keys start with "sk-ant-"
+  if (key.startsWith('sk-ant-')) {
+    return 'anthropic';
+  }
+
+  // APINex keys start with "sk-apx" or "apx-"
+  if (key.startsWith('sk-apx') || key.startsWith('apx-')) {
+    return 'apinex';
+  }
+
+  // Groq keys start with "gsk_" or "gsk-"
+  if (key.startsWith('gsk_') || key.startsWith('gsk-')) {
+    return 'groq';
+  }
+
+  // OpenRouter keys start with "sk-or-" or "or-"
+  if (key.startsWith('sk-or-') || key.startsWith('or-')) {
+    return 'openrouter';
+  }
+
+  // NVIDIA NIM keys start with "nvapi-" or "nvapi_"
+  if (key.startsWith('nvapi-') || key.startsWith('nvapi_')) {
+    return 'nim';
+  }
+
+  // OpenAI keys start with "sk-proj-", "sk-svcacct-", "sk-admin-", or standard "sk-" (not anthropic, apinex, or openrouter)
+  if (
+    key.startsWith('sk-proj-') ||
+    key.startsWith('sk-svcacct-') ||
+    key.startsWith('sk-admin-') ||
+    (key.startsWith('sk-') && !key.startsWith('sk-ant-') && !key.startsWith('sk-or-') && !key.startsWith('sk-apx'))
+  ) {
+    return 'openai';
+  }
+
+  return undefined;
+}
+
+/**
+ * Safely masks an API key for display (e.g. "AIzaSy...****").
+ */
+export function maskApiKey(apiKey?: string): string {
+  if (!apiKey) return '';
+  const trimmed = apiKey.trim().replace(/^["']|["']$/g, '');
+  if (trimmed.length <= 8) return '****';
+  return `${trimmed.slice(0, 6)}...${trimmed.slice(-4)}`;
 }
 
 export function saveApiKeyToGlobalEnv(keyName: string, keyValue: string): void {
@@ -134,12 +200,69 @@ export async function promptAndSaveApiKey(
       rl.close();
       const trimmed = answer.trim();
       if (trimmed) {
-        saveApiKeyToGlobalEnv(keyName, trimmed);
-        console.log(`  ${theme.strong('✓')} Saved ${theme.accent(keyName)} to ${theme.secondary(filePath)}\n`);
+        const detectedProvider = identifyProviderFromApiKey(trimmed);
+        const actualKeyName = detectedProvider && detectedProvider !== provider.toLowerCase()
+          ? getEnvKeyNameForProvider(detectedProvider)
+          : keyName;
+        saveApiKeyToGlobalEnv(actualKeyName, trimmed);
+        if (actualKeyName !== keyName) {
+          saveApiKeyToGlobalEnv(keyName, trimmed);
+        }
+        console.log(`  ${theme.strong('✓')} Saved ${theme.accent(actualKeyName)} to ${theme.secondary(filePath)}\n`);
         resolve(trimmed);
       } else {
         resolve(undefined);
       }
     });
   });
+}
+
+export interface ExternalModelConfig {
+  providerName: string;
+  modelId: string;
+  displayName?: string;
+  baseURL?: string;
+  apiKey?: string;
+  contextLimit?: number;
+  outputLimit?: number;
+}
+
+/**
+ * Loads custom provider & model definitions from ~/.config/opencode/opencode.json
+ * and ~/.locode/config.json for seamless cross-harness compatibility.
+ */
+export function loadOpenCodeConfig(): ExternalModelConfig[] {
+  const candidates = [
+    path.join(os.homedir(), '.config', 'opencode', 'opencode.json'),
+    path.join(os.homedir(), '.locode', 'config.json')
+  ];
+
+  const configs: ExternalModelConfig[] = [];
+  for (const cPath of candidates) {
+    try {
+      if (!syncFs.existsSync(cPath)) continue;
+      const raw = syncFs.readFileSync(cPath, 'utf8');
+      const json = JSON.parse(raw);
+      if (!json || typeof json.provider !== 'object') continue;
+
+      for (const [providerKey, pVal] of Object.entries<any>(json.provider)) {
+        const baseURL = pVal.options?.baseURL;
+        const apiKey = pVal.options?.apiKey;
+        if (pVal.models && typeof pVal.models === 'object') {
+          for (const [modelKey, mVal] of Object.entries<any>(pVal.models)) {
+            configs.push({
+              providerName: providerKey,
+              modelId: modelKey,
+              displayName: mVal.name,
+              baseURL,
+              apiKey,
+              contextLimit: mVal.limit?.context,
+              outputLimit: mVal.limit?.output
+            });
+          }
+        }
+      }
+    } catch {}
+  }
+  return configs;
 }

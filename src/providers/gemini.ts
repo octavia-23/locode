@@ -100,18 +100,27 @@ export class GeminiProvider implements ILLMProvider {
   }
 
   async getAvailableModels(): Promise<string[]> {
-    if (!this.apiKey) return [this.model];
+    const fallbackModels = Array.from(new Set([
+      this.model,
+      'gemini-3.6-flash',
+      'gemini-2.5-pro',
+      'gemini-2.5-flash',
+      'gemini-2.0-flash',
+      'gemini-1.5-pro',
+      'gemini-1.5-flash'
+    ]));
+    if (!this.apiKey) return fallbackModels;
     try {
       const url = `${this.apiBase}/v1beta/models?key=${this.apiKey}`;
       const res = await fetch(url, { signal: AbortSignal.timeout(4000) });
-      if (!res.ok) return [this.model];
+      if (!res.ok) return fallbackModels;
       const data: any = await res.json();
       const models = (data.models || [])
         .map((m: any) => m.name.replace(/^models\//, ''))
         .filter((name: string) => name.toLowerCase().includes('gemini'));
-      return models.length > 0 ? models : [this.model];
+      return models.length > 0 ? Array.from(new Set([this.model, ...models])) : fallbackModels;
     } catch {
-      return [this.model];
+      return fallbackModels;
     }
   }
 

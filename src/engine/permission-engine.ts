@@ -11,6 +11,7 @@ export interface PermissionPolicy {
   allowedCommands?: RegExp[];
   blockedCommands?: RegExp[];
   autoApprove?: boolean;
+  allowTestEdits?: boolean;
 }
 
 export class PermissionEngine {

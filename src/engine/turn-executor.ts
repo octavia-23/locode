@@ -36,7 +36,11 @@ export const READ_ONLY_TOOLS = new Set([
 ]);
 
 export function isReadOnlyTool(toolName: string): boolean {
-  return READ_ONLY_TOOLS.has(toolName.toLowerCase().trim());
+  const norm = toolName.toLowerCase().trim();
+  if (READ_ONLY_TOOLS.has(norm)) return true;
+  const tool = toolRegistry.get(toolName);
+  if (tool && (tool as any).isReadOnly) return true;
+  return false;
 }
 
 export interface ExecutedToolItem {
@@ -99,6 +103,7 @@ export interface TurnBatchProgressTracker {
   failedToolCount: number;
   consecutiveNoProgressCount: number;
   consecutiveEmptyResponses: number;
+  consecutiveFluffCount?: number;
   actionNudgeGiven?: boolean;
   singleFileObsession?: boolean;
   obsessedFilePath?: string;
@@ -202,7 +207,8 @@ export class TurnExecutor {
   static normalizeResponse(response: any, error?: any): NormalizedGeneration {
     if (error) {
       const msg = error.message || String(error);
-      const isRetryable =
+      const isAbortOrTaskTimeout = /Task timeout:|aborted|cancelled|SIGINT/i.test(msg);
+      const isRetryable = !isAbortOrTaskTimeout &&
         /ECONNRESET|ETIMEDOUT|ENOTFOUND|rate\s*limit|429|500|502|503|504|timeout|socket\s*hang\s*up/i.test(msg);
       return {
         type: isRetryable ? 'PROVIDER_ERROR_RETRYABLE' : 'PROVIDER_ERROR_FATAL',
@@ -578,15 +584,15 @@ export class TurnExecutor {
       };
     }
 
-    // Sequential execution
+    // Sequential execution with chunked parallel read acceleration
     for (let i = 0; i < toolCalls.length; i++) {
       const call = toolCalls[i];
-      toolCallsCount++;
-      const callId = call.id || `call_${Date.now()}_${i}`;
       const toolName = call.function.name;
-      const toolArgs = call.function.arguments || {};
 
       if (effectiveSignal?.aborted) {
+        const callId = call.id || `call_${Date.now()}_${i}`;
+        const toolArgs = call.function.arguments || {};
+        toolCallsCount++;
         toolMessages.push({
           role: 'tool',
           name: toolName,
@@ -602,6 +608,66 @@ export class TurnExecutor {
         });
         break;
       }
+
+      // Parallel Read Chunking: If concurrency is permitted and consecutive read-only tools exist
+      if (allowParallel && isReadOnlyTool(toolName)) {
+        let readChunkEnd = i;
+        while (readChunkEnd + 1 < toolCalls.length && isReadOnlyTool(toolCalls[readChunkEnd + 1].function.name)) {
+          readChunkEnd++;
+        }
+        if (readChunkEnd > i) {
+          const chunk = toolCalls.slice(i, readChunkEnd + 1);
+          if (renderer) {
+            renderer.startSpinner(`Executing ${chunk.length} read operations in parallel...`);
+          }
+          const batchRes = await TurnExecutor.executeToolBatch(
+            chunk,
+            dispatcher,
+            context,
+            {
+              allowParallelTools: true,
+              autoApprove: options.autoApprove ?? context.autoApprove,
+              allowNetwork: options.allowNetwork ?? options.profile?.privacyPolicy.allowWebAccess,
+              signal: effectiveSignal
+            }
+          );
+          if (renderer) {
+            renderer.stopSpinner();
+          }
+
+          for (const res of batchRes.results) {
+            toolCallsCount++;
+            readStepCount++;
+            if (renderer) {
+              renderer.printToolResult(res.toolName, res.output, res.isError);
+            }
+            toolMessages.push({
+              role: 'tool',
+              name: res.toolName,
+              tool_call_id: res.callId,
+              content: res.output
+            });
+            results.push(res);
+            if (res.isError) {
+              failedToolCalls++;
+              if (progress) progress.failedToolCount++;
+            } else {
+              successfulToolCalls++;
+              if (progress) progress.successfulToolCount++;
+            }
+            if (progress) {
+              progress.recentToolSignatures.push(`${res.toolName}:${JSON.stringify(res.arguments || {})}`);
+            }
+          }
+
+          i = readChunkEnd;
+          continue;
+        }
+      }
+
+      toolCallsCount++;
+      const callId = call.id || `call_${Date.now()}_${i}`;
+      const toolArgs = call.function.arguments || {};
 
       // POST-VERIFICATION COMPLETION GATE
       const lastVerif = contextEngine?.getTaskState().lastVerification;
@@ -752,8 +818,11 @@ You MUST invoke 'edit_file' or 'write_file' to make a meaningful change${targetH
         }
       }
 
-      if (renderer) {
-        renderer.startSpinner(`Executing ${toolName}...`);
+      const needsApproval = typeof tool.needsApproval === 'function' ? tool.needsApproval(toolArgs) : tool.needsApproval;
+      const isAutoApprove = options.autoApprove ?? context.autoApprove;
+      if (renderer && (!needsApproval || isAutoApprove)) {
+        const detail = toolName === 'run_command' && toolArgs?.command ? ` (${toolArgs.command.slice(0, 45)})` : '';
+        renderer.startSpinner(`Executing ${toolName}${detail}...`);
       }
 
       const durableResult = await dispatcher.dispatch(

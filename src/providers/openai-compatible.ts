@@ -61,6 +61,34 @@ export class OpenAICompatibleProvider implements ILLMProvider {
     return this.apiBase.includes('localhost') || this.apiBase.includes('127.0.0.1') || this.apiBase.includes('0.0.0.0');
   }
 
+  formatApiError(status: number, errText: string): Error {
+    try {
+      const parsed = JSON.parse(errText);
+      const errMsg = parsed.error?.message || parsed.message;
+      if (
+        status === 402 ||
+        (typeof errMsg === 'string' && /insufficient balance|top up|billing/i.test(errMsg))
+      ) {
+        if (this.apiBase.includes('apinex')) {
+          const billingUrlMatch = typeof errMsg === 'string' ? errMsg.match(/https?:\/\/[^\s"]+/) : null;
+          const billingUrl = billingUrlMatch ? billingUrlMatch[0] : 'https://apinex.bond/billing';
+          return new Error(
+            `Insufficient APInex balance for model "${this.model}".\n` +
+            `  • Top up credits at: ${billingUrl}\n` +
+            `  • Or switch immediately to a free-tier model: /model free/deepseek-v4.1-flash or /model free/gemini-3.8-flash`
+          );
+        }
+        return new Error(`Insufficient account balance (402): ${errMsg || errText}`);
+      }
+      if (parsed.error?.message) {
+        return new Error(`OpenAI API error (${status}): ${parsed.error.message}`);
+      }
+    } catch {
+      // not JSON
+    }
+    return new Error(`OpenAI API error (${status}): ${errText}`);
+  }
+
   async isHealthy(): Promise<boolean> {
     try {
       const headers: Record<string, string> = { ...this.extraHeaders };
@@ -78,6 +106,62 @@ export class OpenAICompatibleProvider implements ILLMProvider {
   }
 
   async getAvailableModels(): Promise<string[]> {
+    const base = this.apiBase.toLowerCase();
+    let fallback: string[] = [this.model];
+    if (base.includes('groq.com')) {
+      fallback = Array.from(new Set([
+        this.model,
+        'qwen/qwen3.8-27b',
+        'llama-3.3-70b-versatile',
+        'llama-3.1-8b-instant',
+        'deepseek-r1-distill-llama-70b'
+      ]));
+    } else if (base.includes('nvidia.com')) {
+      fallback = Array.from(new Set([
+        this.model,
+        'meta/llama-3.3-70b-instruct',
+        'deepseek-ai/deepseek-r1',
+        'nvidia/llama-3.1-nemotron-70b-instruct'
+      ]));
+    } else if (base.includes('openrouter.ai')) {
+      fallback = Array.from(new Set([
+        this.model,
+        'anthropic/claude-3.5-sonnet',
+        'openai/gpt-4o',
+        'deepseek/deepseek-r1',
+        'google/gemini-2.0-flash-001',
+        'meta-llama/llama-3.3-70b-instruct'
+      ]));
+    } else if (base.includes('openai.com')) {
+      fallback = Array.from(new Set([
+        this.model,
+        'gpt-4o',
+        'gpt-4o-mini',
+        'o1',
+        'o3-mini',
+        'gpt-4-turbo'
+      ]));
+    } else if (base.includes('apinex')) {
+      fallback = Array.from(new Set([
+        this.model,
+        'free/deepseek-v4.1-flash',
+        'free/gemini-3.8-flash',
+        'free/qwen-3.8-max',
+        'free/kimi-k3',
+        'free/glm-5.3-flash',
+        'free/claude-sonnet-4.6',
+        'free/claude-opus-4.6',
+        'free/muse-spark-1.3',
+        'free/minimax-m3.1-flash',
+        'free/gpt-6-luna',
+        'claude-sonnet-5.5',
+        'gpt-6.1-sol',
+        'deepseek-v4.1-flash',
+        'kimi-k2.8',
+        'jev-1.13'
+      ]));
+    }
+
     try {
       const headers: Record<string, string> = { ...this.extraHeaders };
       if (this.apiKey && this.apiKey !== 'not-needed') {
@@ -87,12 +171,28 @@ export class OpenAICompatibleProvider implements ILLMProvider {
         headers,
         signal: AbortSignal.timeout(4000)
       });
-      if (!res.ok) return [this.model];
+      if (!res.ok) return fallback;
       const data: any = await res.json();
-      const ids = (data.data || []).map((m: any) => m.id);
-      return ids.length > 0 ? ids : [this.model];
+      let ids = (data.data || []).map((m: any) => m.id);
+      if (base.includes('openai.com')) {
+        ids = ids.filter((id: string) => !id.includes('whisper') && !id.includes('tts') && !id.includes('embedding') && !id.includes('dall-e'));
+      }
+      if (base.includes('apinex')) {
+        ids.sort((a: string, b: string) => {
+          if (a === 'free/deepseek-v4.1-flash') return -1;
+          if (b === 'free/deepseek-v4.1-flash') return 1;
+          if (a === 'free/gemini-3.8-flash') return -1;
+          if (b === 'free/gemini-3.8-flash') return 1;
+          const aFree = a.startsWith('free/');
+          const bFree = b.startsWith('free/');
+          if (aFree && !bFree) return -1;
+          if (!aFree && bFree) return 1;
+          return a.localeCompare(b);
+        });
+      }
+      return ids.length > 0 ? Array.from(new Set([this.model, ...ids])) : fallback;
     } catch {
-      return [this.model];
+      return fallback;
     }
   }
 
@@ -164,7 +264,7 @@ export class OpenAICompatibleProvider implements ILLMProvider {
 
       if (!response.ok) {
         const errText = await response.text();
-        throw new Error(`OpenAI API error (${response.status}): ${errText}`);
+        throw this.formatApiError(response.status, errText);
       }
 
       if (response.body) {
@@ -281,7 +381,7 @@ export class OpenAICompatibleProvider implements ILLMProvider {
 
     if (!response.ok) {
       const errText = await response.text();
-      throw new Error(`OpenAI API error (${response.status}): ${errText}`);
+      throw this.formatApiError(response.status, errText);
     }
 
     const data: any = await response.json();

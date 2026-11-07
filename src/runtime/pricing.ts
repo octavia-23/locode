@@ -23,6 +23,18 @@ export const TRUSTWORTHY_MODEL_PRICING: Record<string, ModelPricing> = {
   'o1-mini': { inputPerMillion: 3.00, outputPerMillion: 12.00 },
   'o3-mini': { inputPerMillion: 1.10, outputPerMillion: 4.40 },
 
+  // APINex / Frontier Models
+  'free/deepseek-v4.1-flash': { inputPerMillion: 0.0, outputPerMillion: 0.0 },
+  'free/gemini-3.8-flash': { inputPerMillion: 0.0, outputPerMillion: 0.0 },
+  'free/qwen-3.8-max': { inputPerMillion: 0.0, outputPerMillion: 0.0 },
+  'free/kimi-k3': { inputPerMillion: 0.0, outputPerMillion: 0.0 },
+  'free/glm-5.3-flash': { inputPerMillion: 0.0, outputPerMillion: 0.0 },
+  'claude-sonnet-5.5': { inputPerMillion: 3.00, outputPerMillion: 15.00 },
+  'gpt-6.1-sol': { inputPerMillion: 2.50, outputPerMillion: 10.00 },
+  'deepseek-v4.1-flash': { inputPerMillion: 0.50, outputPerMillion: 0.50 },
+  'kimi-k2.8': { inputPerMillion: 0.80, outputPerMillion: 0.80 },
+  'jev-1.13': { inputPerMillion: 1.00, outputPerMillion: 1.00 },
+
   // Anthropic
   'claude-3-5-sonnet': { inputPerMillion: 3.00, outputPerMillion: 15.00 },
   'claude-3-5-sonnet-20241022': { inputPerMillion: 3.00, outputPerMillion: 15.00 },
@@ -61,6 +73,9 @@ export function getModelPricing(modelName: string, providerType?: string): Model
   }
 
   const normalized = modelName.toLowerCase().trim();
+  if (normalized.startsWith('free/')) {
+    return { inputPerMillion: 0.0, outputPerMillion: 0.0 };
+  }
   // Check exact match
   if (TRUSTWORTHY_MODEL_PRICING[normalized]) {
     return TRUSTWORTHY_MODEL_PRICING[normalized];

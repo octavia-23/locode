@@ -57,11 +57,13 @@ export type ProviderType =
   | 'openrouter'
   | 'groq'
   | 'nim'
-  | 'nvidia';
+  | 'nvidia'
+  | 'apinex';
 
 export interface AgentContext {
   cwd: string;
   autoApprove: boolean;
+  allowTestEdits?: boolean;
   model: string;
   ollamaHost: string;
   provider?: ProviderType;

@@ -187,6 +187,16 @@ export const runCommandTool: ToolDefinition = {
         });
       }
 
+      // Periodic progress heartbeat ensures live seconds tick even if child stdout is block-buffered
+      const heartbeatTimer = setInterval(() => {
+        if (context.onCommandProgress) {
+          context.onCommandProgress({
+            elapsedMs: Date.now() - startTime,
+            lastOutput: lastOutputLine
+          });
+        }
+      }, 1000);
+
       // Cancellation listener
       let abortListener: (() => void) | undefined;
       if (context.signal) {
@@ -217,6 +227,7 @@ export const runCommandTool: ToolDefinition = {
       try {
         result = await child;
       } finally {
+        clearInterval(heartbeatTimer);
         if (timer) clearTimeout(timer);
         if (context.signal && abortListener) {
           context.signal.removeEventListener('abort', abortListener);

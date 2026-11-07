@@ -190,7 +190,7 @@ Arguments:
   prompt                     Initial instruction to execute
 
 Options:
-  -p, --provider <type>      Provider: gemini | anthropic | openai | openrouter | groq | llamacpp | ollama
+  -p, --provider <type>      Provider: gemini | anthropic | apinex | openai | openrouter | groq | nim | llamacpp | ollama
   -m, --model <name>         Model identifier
   -c, --ctx <size>           Context window override (e.g. 16k, 32k, 64k, 128k, 262k)
   -y, --yes, --auto          Auto-approve tool executions without manual confirmation
@@ -211,8 +211,9 @@ Within interactive mode, use slash commands to inspect state or modify settings 
 
 | Command | Description |
 | :--- | :--- |
-| `/provider [name]` | Switch provider (`gemini`, `anthropic`, `groq`, `openai`, `llamacpp`, `ollama`) |
-| `/model [name]` | Change active model identifier |
+| `/key [key]` | Configure API key with automatic provider identification & model discovery |
+| `/provider [name]` | Switch provider with interactive arrow-key provider and model selection |
+| `/model [name]` | Change active model (interactive arrow-key selection when run without args) |
 | `/auto` | Toggle permissionless auto-approval mode |
 | `/verify [cmd]` | Run project linters or test commands |
 | `/undo` | Roll back workspace changes to the state before the last agent turn |

@@ -18,7 +18,7 @@ import { resolveFileMentions } from './mentions.js';
 import { MCPManager } from '../mcp/manager.js';
 import { CodeVerifier } from './verifier.js';
 import { ArchitectEngine } from './architect.js';
-import { SessionMemory } from './memory.js';
+import { SessionMemory, SessionMetadata, SerializedSession } from './memory.js';
 import { extractToolCalls } from '../utils/tool-parser.js';
 import {
   StagnationDetector,
@@ -113,6 +113,7 @@ export class AgentLoop {
   private repairCoordinator: RepairCoordinator;
   private turnExecutor: TurnExecutor;
   private pendingPromptRefresh: Promise<void> | null = null;
+  private currentWatchdog?: { pause: () => void; resume: () => void };
 
   constructor(context: AgentContext, renderer: TerminalRenderer, customProvider?: ILLMProvider) {
     this.context = context;
@@ -142,22 +143,32 @@ export class AgentLoop {
     this.toolDispatcher = new ToolDispatcher(
       this.permissionEngine,
       {
+        onBeforeApproval: () => {
+          this.renderer.stopSpinner();
+        },
         confirmApproval: async (toolName, args, reason) => {
+          this.renderer.stopSpinner();
+          this.currentWatchdog?.pause();
           try {
+            const detail = args?.command ? ` [${args.command}]` : (args?.path ? ` [${args.path}]` : '');
             return await confirm({
-              message: `approve ${theme.accent(toolName)}?${reason ? ` (${reason})` : ''}`,
+              message: `approve ${theme.accent(toolName)}${theme.secondary(detail)}?${reason ? ` (${reason})` : ''}`,
               default: true
             });
           } catch {
             return false;
+          } finally {
+            this.currentWatchdog?.resume();
           }
+        },
+        onExecutionStarted: (toolName, args) => {
+          const detail = toolName === 'run_command' && args?.command ? ` (${args.command.slice(0, 45)})` : '';
+          this.renderer.startSpinner(`Executing ${toolName}${detail}...`);
         },
         onProgress: (prog) => {
           const sec = Math.floor(prog.elapsedMs / 1000);
-          if (sec >= 1) {
-            const hint = prog.lastOutput ? ` · ${prog.lastOutput.slice(0, 45)}` : '';
-            this.renderer.startSpinner(`Executing... (${sec}s${hint})`);
-          }
+          const hint = prog.lastOutput ? ` · ${prog.lastOutput.slice(0, 45)}` : '';
+          this.renderer.startSpinner(`Executing... (${sec}s${hint})`);
         }
       },
       this.journal
@@ -421,6 +432,38 @@ export class AgentLoop {
     return this.sessionMemory;
   }
 
+  async forkSession(name?: string): Promise<{ id: string; name: string }> {
+    const forked = await this.sessionMemory.forkSession({
+      name,
+      messages: this.messages,
+      lastDecisions: this.contextEngine.getTaskState().decisions,
+      recentFiles: this.contextEngine.getTaskState().relevantFiles,
+      summary: this.contextEngine.getTaskState().objective,
+      checkpoint: this.contextEngine.getLatestCheckpoint(),
+      model: this.context.model,
+      provider: this.context.provider
+    });
+    return { id: forked.id, name: forked.name };
+  }
+
+  async listSessions(): Promise<SessionMetadata[]> {
+    return this.sessionMemory.listSessions();
+  }
+
+  async switchSession(idOrName: string): Promise<{ success: boolean; session?: SerializedSession; message: string }> {
+    const session = await this.sessionMemory.switchSession(idOrName);
+    if (!session) {
+      return { success: false, message: `Session matching "${idOrName}" not found.` };
+    }
+    this.messages = session.messages ? session.messages.map(m => ({ ...m })) : [];
+    if (session.model && session.model !== this.context.model) {
+      this.context.model = session.model;
+      this.provider.setModel(session.model);
+    }
+    await this.refreshSystemPrompt();
+    return { success: true, session, message: `Switched to session "${session.name}" (${session.id})` };
+  }
+
   getMessages(): ChatMessage[] {
     return this.messages;
   }
@@ -572,9 +615,19 @@ export class AgentLoop {
       cwd: this.context.cwd
     });
 
+    // Colloquial Nudge Transformer:
+    // When the user inputs brief colloquial continuation nudges (e.g. "continue", "work", "proceed", "next"),
+    // open-weights models often reply with conversational affirmations instead of invoking tools.
+    // Transform colloquial nudges into an explicit action directive while preserving conversational history.
+    const colloquialNudgeRegex = /^(continue|continu3|proceed|go on|work|work man|more|next|do it|keep going|carry on)[\s.!]*/i;
+    let finalUserPrompt = processedPrompt;
+    if (this.messages.length > 2 && colloquialNudgeRegex.test(userInput.trim())) {
+      finalUserPrompt = `[USER DIRECTIVE] ${userInput.trim()}. Resume pending milestones immediately. You MUST call the required tool now rather than outputting conversational status updates.`;
+    }
+
     this.messages.push({
       role: 'user',
-      content: processedPrompt
+      content: finalUserPrompt
     });
 
     // Adaptive execution budget governed by active HarnessExecutionProfile:
@@ -594,11 +647,32 @@ export class AgentLoop {
     const profileTimeoutMs = this.executionProfile.timeoutMs;
     const taskAbortController = new AbortController();
     let taskTimeoutTimer: NodeJS.Timeout | undefined;
+    let timerRemainingMs = profileTimeoutMs;
+    let timerStartTime = Date.now();
+
+    const pauseWatchdog = () => {
+      if (taskTimeoutTimer) {
+        clearTimeout(taskTimeoutTimer);
+        taskTimeoutTimer = undefined;
+        const elapsed = Date.now() - timerStartTime;
+        timerRemainingMs = Math.max(1000, timerRemainingMs - elapsed);
+      }
+    };
+
+    const resumeWatchdog = () => {
+      if (profileTimeoutMs > 0 && timerRemainingMs > 0 && !taskAbortController.signal.aborted) {
+        timerStartTime = Date.now();
+        taskTimeoutTimer = setTimeout(() => {
+          taskAbortController.abort(new Error(`Task timeout: Exceeded execution profile timeout of ${profileTimeoutMs}ms`));
+        }, timerRemainingMs);
+      }
+    };
+
     if (profileTimeoutMs > 0) {
-      taskTimeoutTimer = setTimeout(() => {
-        taskAbortController.abort(new Error(`Task timeout: Exceeded execution profile timeout of ${profileTimeoutMs}ms`));
-      }, profileTimeoutMs);
+      resumeWatchdog();
     }
+
+    this.currentWatchdog = { pause: pauseWatchdog, resume: resumeWatchdog };
 
     const effectiveSignal = this.context.signal
       ? AbortSignal.any([this.context.signal, taskAbortController.signal])
@@ -620,6 +694,7 @@ export class AgentLoop {
       failedToolCount: 0,
       consecutiveNoProgressCount: 0,
       consecutiveEmptyResponses: 0,
+      consecutiveFluffCount: 0,
       actionNudgeGiven: false
     };
 
@@ -632,7 +707,7 @@ export class AgentLoop {
       }
       stepCount++;
 
-      // Run working synthesis ONLY when code has already been modified, approaching true context boundary
+      // Run working synthesis when approaching context boundary
       let synthesizedFindings: string | undefined;
       const currentMsgTokens = this.contextEngine.estimateMessagesTokens(this.messages);
       const toolTokens = this.contextEngine.estimateToolsTokens(allTools);
@@ -640,19 +715,16 @@ export class AgentLoop {
       const hasSynthesisHeadroom = currentMsgTokens + toolTokens < maxTokens - 1500;
 
       if (
-        hasModifiedCode &&
-        stepCount >= 15 &&
         this.contextEngine.shouldCompact(this.messages, toolTokens) &&
-        this.messages.length > 8 &&
+        this.messages.length > 6 &&
         hasSynthesisHeadroom &&
-        progress.consecutiveNoProgressCount === 0 &&
-        stepCount % 10 === 0
+        progress.consecutiveNoProgressCount === 0
       ) {
         this.renderer.startSpinner('Saving working state before memory fold...');
         try {
           const synthesisPrompt: ChatMessage = {
             role: 'user',
-            content: '[DIRECTIVE] Working state fold. State in 1 sentence what code modification you will apply next. Then immediately apply it with edit_file or write_file.'
+            content: '[DIRECTIVE] Working state fold. State in 1 concise sentence what file inspection or code modification you will perform next. Then immediately execute it with the appropriate tool.'
           };
           const preFoldTurn = [...this.messages, synthesisPrompt];
           const digest = await this.provider.chat(this.prepareMessagesForProvider(preFoldTurn), [], undefined, { toolChoice: 'none' });
@@ -675,7 +747,8 @@ export class AgentLoop {
       // If compaction folded earlier file views out of context, the model legitimately has to re-read them.
       // Don't count those re-reads as "obsession"/inspection streaks, otherwise the action gate withdraws
       // view_file (leaving only edit tools) and the model can never recover the contents it just lost.
-      if (this.contextEngine.getStats().compactionRuns > compactionRunsBefore) {
+      const justCompacted = this.contextEngine.getStats().compactionRuns > compactionRunsBefore;
+      if (justCompacted) {
         progress.fileReadTurns.clear();
         progress.singleFileObsession = false;
         progress.obsessedFilePath = '';
@@ -737,6 +810,15 @@ export class AgentLoop {
 
       // Pre-flight spending control: evaluate conservative projected request cost BEFORE dispatching
       const outgoingMessages = this.prepareMessagesForProvider(compacted);
+      // Post-Compaction Handshake:
+      // If compaction occurred in this turn, inject an imperative resumption directive
+      // to keep open-weights models strictly in tool-calling mode.
+      if (justCompacted) {
+        outgoingMessages.push({
+          role: 'user',
+          content: `[RESUMPTION DIRECTIVE] Context was just compacted to preserve budget. You have pending milestones in the checkpoint above. You MUST immediately invoke the next tool call to proceed with execution. Do NOT output conversational status updates or explanations without a tool call.`
+        });
+      }
       const estPromptTokens = this.contextEngine.estimateMessagesTokens(outgoingMessages);
       let requestedOutputTokens = chatOpts.maxTokens || modelCaps.defaultOutputTokens || 4096;
       let preflightCost = estimatePreflightCost(
@@ -934,6 +1016,31 @@ export class AgentLoop {
 
       // Outcome C: Text Only (No Tool Calls Requested)
       if (outcome.type === 'TEXT_FINAL' || !outcome.toolCalls || outcome.toolCalls.length === 0) {
+        // Intent-Action Gap Interceptor (Anti-Stall Guardian for open-weights models):
+        // Detects when the model outputs conversational statements promising actions
+        // (e.g. "Let me check...", "I will now edit...", "I need to read...") but emitted zero tool calls.
+        const statedIntentRegex = /\b(let me|i will|going to|next i need to|proceeding to|let's|i'll)\s+(read|check|run|inspect|look|see|fix|examine|edit|write|test|verify|update|modify|create)\b/i;
+        const cleanedText = outcome.cleanedText || outcome.rawContent || '';
+
+        if (
+          !lastVerifPassed &&
+          statedIntentRegex.test(cleanedText) &&
+          (!outcome.toolCalls || outcome.toolCalls.length === 0) &&
+          (progress.consecutiveFluffCount || 0) < 2
+        ) {
+          progress.consecutiveFluffCount = (progress.consecutiveFluffCount || 0) + 1;
+          this.renderer.printWarning('Model promised action but emitted no tool calls. Intercepting Intent-Action gap...');
+          this.messages.push({
+            role: 'assistant',
+            content: outcome.rawContent || ''
+          });
+          this.messages.push({
+            role: 'user',
+            content: `[ACTION REQUIRED] You stated an intention to act, but did not call any tool. Do NOT output conversational promises or explanations. You MUST invoke the corresponding tool (e.g. view_file, batch_read_files, edit_file, write_file, run_command) now.`
+          });
+          continue;
+        }
+
         // Anti-Procrastination Nudge: If user requested code modification on a local model, but model only returned text without edits
         if (!isCloud && !hasModifiedCode && readStepCount >= 1 && !progress.actionNudgeGiven) {
           const isModificationRequest = /\b(add|fix|edit|modify|update|change|create|implement|style|improve|refactor|remove|delete|write|build|setup|redesign)\b/i.test(userInput);
@@ -1058,6 +1165,7 @@ export class AgentLoop {
 
       // Outcome D: Tool Calls
       const toolCalls = outcome.toolCalls;
+      progress.consecutiveFluffCount = 0;
 
       // Persist model's tool-call proposals BEFORE performing side effects (Phase 2 requirement)
       for (const call of toolCalls) {
@@ -1164,6 +1272,7 @@ export class AgentLoop {
       this.messages.push({ role: 'assistant', content: stopReport });
     }
   } finally {
+    this.currentWatchdog = undefined;
     if (taskTimeoutTimer) clearTimeout(taskTimeoutTimer);
     if (this.journal.getSnapshot().taskState === 'running') {
       const isInterrupted = effectiveSignal?.aborted || (stepCount >= safetyCeiling && !endedWithFinalAssistantText);

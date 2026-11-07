@@ -31,8 +31,14 @@ import {
   resolveProfileForHardware
 } from './runtime/profiles.js';
 import { RuntimeDetector } from './runtime/detector.js';
-import { getSharedLlamaRuntime, isCloudProvider, resolveProvider } from './providers/factory.js';
-import { loadEnvironmentVariables, getApiKeyForProvider, promptAndSaveApiKey } from './utils/config.js';
+import { getSharedLlamaRuntime, isCloudProvider, resolveProvider, getDefaultModelForProvider } from './providers/factory.js';
+import {
+  loadEnvironmentVariables,
+  getApiKeyForProvider,
+  promptAndSaveApiKey,
+  saveApiKeyToGlobalEnv,
+  getEnvKeyNameForProvider
+} from './utils/config.js';
 
 const program = new Command();
 
@@ -42,7 +48,7 @@ program
   .version('0.4.0')
   .argument('[prompt...]', 'Initial coding instruction to execute')
   .option('-m, --model <name>', 'Model to use (or alias for local TurboQuant model)')
-  .option('-p, --provider <type>', 'Provider: gemini | anthropic | openai | openrouter | groq | nim | nvidia | llamacpp | ollama | lmstudio | vllm')
+  .option('-p, --provider <type>', 'Provider: gemini | anthropic | apinex | openai | openrouter | groq | nim | nvidia | llamacpp | ollama | lmstudio | vllm')
   .option('-c, --ctx <number_or_size>', 'Context window size (e.g. 32k, 64k, 128k, 262k)')
   .option('--profile <name>', 'Inference profile: ultra-context | performance | large-context | balanced')
   .option('--model-path <path>', 'Absolute path to local .gguf model file')
@@ -57,6 +63,7 @@ program
   .option('-f, --file <path>', 'Load prompt from a text/markdown file')
   .option('-d, --dir <path>', 'Workspace directory', process.cwd())
   .option('--architect <model>', 'Secondary deep reasoning / architect model for complex bug escalation')
+  .option('--allow-test-edits', 'Allow modifying or deleting test assertions (disabled by default to prevent test tampering)', false)
   .option('--mode <type>', 'Initial execution mode: worker | architect', 'worker')
   .option('--host <url>', 'Ollama API host URL', 'http://127.0.0.1:11434');
 
@@ -116,6 +123,8 @@ async function main() {
     activeApiKey = getApiKeyForProvider(chosenProvider, options.apiKey);
     if (!activeApiKey) {
       activeApiKey = await promptAndSaveApiKey(chosenProvider);
+    } else if (options.apiKey) {
+      saveApiKeyToGlobalEnv(getEnvKeyNameForProvider(chosenProvider), options.apiKey);
     }
   }
 
@@ -132,7 +141,7 @@ async function main() {
     numCtx = cliCtx;
   } else if (chosenProvider === 'gemini') {
     numCtx = 1048576;
-  } else if (chosenProvider === 'anthropic') {
+  } else if (chosenProvider === 'anthropic' || chosenProvider === 'apinex') {
     numCtx = 200000;
   } else if (chosenProvider === 'groq' || chosenProvider === 'nim' || chosenProvider === 'nvidia') {
     numCtx = 131072;
@@ -147,23 +156,7 @@ async function main() {
   // Determine active model name / alias
   let modelName = options.model;
   if (!modelName) {
-    if (chosenProvider === 'gemini') {
-      modelName = 'gemini-3.6-flash';
-    } else if (chosenProvider === 'anthropic') {
-      modelName = 'claude-3-5-sonnet-20241022';
-    } else if (chosenProvider === 'openrouter') {
-      modelName = 'anthropic/claude-3.5-sonnet';
-    } else if (chosenProvider === 'groq') {
-      modelName = 'qwen/qwen3.8-27b';
-    } else if (chosenProvider === 'nim' || chosenProvider === 'nvidia') {
-      modelName = 'meta/llama-3.3-70b-instruct';
-    } else if (chosenProvider === 'openai') {
-      modelName = 'gpt-4o';
-    } else if (chosenProvider === 'llamacpp') {
-      modelName = DEFAULT_QWEN_MODEL_ALIAS;
-    } else {
-      modelName = 'qwen2.5-coder:7b';
-    }
+    modelName = getDefaultModelForProvider(chosenProvider);
   }
 
   const llamaConfig = {
@@ -182,6 +175,7 @@ async function main() {
   const context: AgentContext = {
     cwd: targetCwd,
     autoApprove: isAutoMode,
+    allowTestEdits: Boolean(options.allowTestEdits),
     model: modelName,
     ollamaHost: options.host,
     provider: chosenProvider as any,
@@ -226,6 +220,19 @@ async function main() {
   const agent = new AgentLoop(context, renderer);
   const provider = agent.getProvider();
 
+  let activeAbortController: AbortController | null = null;
+  process.on('SIGINT', () => {
+    if (activeAbortController) {
+      renderer.stopSpinner();
+      console.log(theme.warning('\nCancelling current operation (SIGINT)...'));
+      activeAbortController.abort();
+      activeAbortController = null;
+    } else {
+      console.log(theme.muted('\nExiting Locode.'));
+      process.exit(0);
+    }
+  });
+
   await agent.init();
 
   // Check Provider health
@@ -261,8 +268,15 @@ async function main() {
   if (promptArgs) {
     renderer.printHeader(context.model, context.cwd, context.autoApprove, context.hardwareProfile, context.numCtx, context.provider);
     console.log(`  ${theme.promptGlyph} ${theme.strong(promptArgs)}\n`);
-    await agent.run(promptArgs);
-    renderer.stopSpinner();
+    activeAbortController = new AbortController();
+    context.signal = activeAbortController.signal;
+    try {
+      await agent.run(promptArgs);
+    } finally {
+      activeAbortController = null;
+      context.signal = undefined;
+      renderer.stopSpinner();
+    }
     return;
   }
 
@@ -271,6 +285,21 @@ async function main() {
 
   while (true) {
     try {
+      const stats = agent.getStats();
+      const sessionMemory = agent.getSessionMemory();
+      const activeSessionId = sessionMemory.getActiveSessionId();
+      const lastTps = stats.totalDurationMs > 0 ? (stats.completionTokens / (stats.totalDurationMs / 1000)) : undefined;
+
+      renderer.printStatusHUD(
+        context.model,
+        context.provider || 'ollama',
+        context.numCtx,
+        agent.getContextEngine().getStats().totalTokensEstimated,
+        context.autoApprove,
+        activeSessionId,
+        lastTps
+      );
+
       const modeTag = context.autoApprove
         ? theme.accent('auto')
         : theme.muted('safe');
@@ -286,7 +315,14 @@ async function main() {
         if (handled) continue;
       }
 
-      await agent.run(trimmed);
+      activeAbortController = new AbortController();
+      context.signal = activeAbortController.signal;
+      try {
+        await agent.run(trimmed);
+      } finally {
+        activeAbortController = null;
+        context.signal = undefined;
+      }
       console.log(); // Blank line for spacing
     } catch (err: any) {
       if (err.name === 'ExitPromptError' || err.message?.includes('force closed')) {

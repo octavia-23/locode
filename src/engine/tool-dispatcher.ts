@@ -9,6 +9,8 @@ import { ExecutionJournal } from '../journal/journal.js';
 
 export interface PromptHandler {
   confirmApproval: (toolName: string, args: Record<string, any>, reason?: string) => Promise<boolean>;
+  onBeforeApproval?: () => void;
+  onExecutionStarted?: (toolName: string, args: Record<string, any>) => void;
   onProgress?: (progress: { elapsedMs: number; lastOutput?: string }) => void;
 }
 
@@ -128,6 +130,9 @@ export class ToolDispatcher {
     const isUnredactableSecret = Boolean(permEval.reason?.includes('cannot be safely redacted'));
     const needsUserPrompt = permEval.requiresPrompt && (isUnredactableSecret || (!options?.autoApprove && !context.autoApprove));
     if (needsUserPrompt) {
+      if (this.promptHandler?.onBeforeApproval) {
+        this.promptHandler.onBeforeApproval();
+      }
       if (!this.promptHandler?.confirmApproval) {
         if (this.journal) {
           await this.journal.recordEvent('permission_decided', {
@@ -263,6 +268,10 @@ export class ToolDispatcher {
         toolName,
         startTime
       }, callId).catch(() => {});
+    }
+
+    if (this.promptHandler?.onExecutionStarted) {
+      this.promptHandler.onExecutionStarted(toolName, cleanArgs);
     }
 
     let resultText = '';

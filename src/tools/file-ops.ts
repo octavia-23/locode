@@ -6,6 +6,7 @@ import { MultiStrategyEditEngine } from './edit-engine.js';
 import { isCloudProvider } from '../providers/factory.js';
 import { isSensitiveFile, redactSensitiveFileContent } from '../utils/secret-redactor.js';
 import { CodeVerifier } from '../agent/verifier.js';
+import { TestAssertionGuard } from '../engine/assertion-guard.js';
 
 export const viewFileTool: ToolDefinition = {
   name: 'view_file',
@@ -191,6 +192,19 @@ export const writeFileTool: ToolDefinition = {
   async execute(args, context) {
     try {
       const fullPath = resolveSafePath(args.path, context.cwd);
+      let existingContent = '';
+      try {
+        existingContent = await fs.readFile(fullPath, 'utf8');
+      } catch {}
+
+      if (existingContent) {
+        const allowTestEdits = context?.allowTestEdits ?? false;
+        const guardRes = TestAssertionGuard.validateEdit(args.path, existingContent, args.content, allowTestEdits);
+        if (!guardRes.allowed) {
+          return { result: guardRes.reason || 'Assertion tampering blocked by harness.', isError: true };
+        }
+      }
+
       await fs.mkdir(path.dirname(fullPath), { recursive: true });
       await fs.writeFile(fullPath, args.content, 'utf8');
       if (context.contextEngine?.invalidateFile) {
@@ -243,6 +257,13 @@ export const editFileTool: ToolDefinition = {
 
       const hasCrlf = existing.includes('\r\n');
       const finalContent = hasCrlf ? editResult.content.replace(/\r?\n/g, '\r\n') : editResult.content;
+
+      const allowTestEdits = context?.allowTestEdits ?? false;
+      const guardRes = TestAssertionGuard.validateEdit(args.path, existing, finalContent, allowTestEdits);
+      if (!guardRes.allowed) {
+        return { result: guardRes.reason || 'Assertion tampering blocked by harness.', isError: true };
+      }
+
       await fs.writeFile(fullPath, finalContent, 'utf8');
       if (context.contextEngine?.invalidateFile) {
         context.contextEngine.invalidateFile(args.path);
@@ -443,6 +464,23 @@ export const multiEditFileTool: ToolDefinition = {
               isError: true
             };
           }
+        }
+      }
+
+      // Step 2.6: Test Assertion Guard Validation
+      const allowTestEdits = context?.allowTestEdits ?? false;
+      for (const [filePath, pending] of pendingWrites.entries()) {
+        const guardRes = TestAssertionGuard.validateEdit(
+          filePath,
+          pending.originalContent,
+          pending.newContent,
+          allowTestEdits
+        );
+        if (!guardRes.allowed) {
+          return {
+            result: `Transaction aborted: ${guardRes.reason}\n\nATOMIC ROLLBACK: 0 files modified on disk. All changes have been reverted.`,
+            isError: true
+          };
         }
       }
 

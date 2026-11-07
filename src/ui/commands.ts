@@ -7,11 +7,41 @@ import { allTools } from '../tools/index.js';
 import { TerminalRenderer } from './renderer.js';
 import { HardwareDetector } from '../hardware/detector.js';
 import { CodeVerifier } from '../agent/verifier.js';
-import { createLLMProvider, isCloudProvider, resolveProvider } from '../providers/factory.js';
-import { getApiKeyForProvider } from '../utils/config.js';
-import { ProviderType } from '../types.js';
-import { theme } from './theme.js';
+import { select, input as promptInput } from '@inquirer/prompts';
+import {
+  createLLMProvider,
+  isCloudProvider,
+  resolveProvider,
+  SUPPORTED_PROVIDERS,
+  getDefaultModelForProvider,
+  getDefaultContextForProvider
+} from '../providers/factory.js';
+import {
+  getApiKeyForProvider,
+  getEnvKeyNameForProvider,
+  saveApiKeyToGlobalEnv,
+  getGlobalEnvPath,
+  identifyProviderFromApiKey,
+  maskApiKey
+} from '../utils/config.js';
+import { ProviderType, AgentContext } from '../types.js';
+import { theme, setActiveTheme, getActiveTheme, getAvailableThemes } from './theme.js';
 import { JournalRecoveryManager } from '../journal/recovery.js';
+import { showDiffTUI } from './diff-viewer.js';
+
+async function listWorkspaceFiles(cwd: string, query?: string): Promise<string[]> {
+  try {
+    const res = await execa('git ls-files', { cwd, shell: true });
+    let files = res.stdout.split('\n').map(f => f.trim()).filter(Boolean);
+    if (query) {
+      const q = query.toLowerCase();
+      files = files.filter(f => f.toLowerCase().includes(q));
+    }
+    return files.slice(0, 100);
+  } catch {
+    return [];
+  }
+}
 
 export async function handleSlashCommand(
   input: string,
@@ -32,8 +62,15 @@ export async function handleSlashCommand(
         ['/undo', 'Rollback workspace to checkpoint before last turn'],
         ['/verify [cmd]', 'Run linter & automated test suite'],
         ['/commit [msg]', 'Stage and commit workspace changes with git'],
-        ['/diff', 'Show pending workspace git modifications'],
+        ['/diff [file]', 'Inspect colored diff and pending modifications'],
+        ['/find [query]', 'Interactive workspace file search & preview'],
+        ['/fork [name]', 'Fork conversation into an independent session branch'],
+        ['/sessions', 'List and switch between saved conversation sessions'],
+        ['/session <cmd>', 'Manage sessions (switch, list, delete)'],
+        ['/theme [name]', 'Switch UI color palette (terracotta, nord, monokai...)'],
+        ['/menu', 'Open interactive command palette'],
         ['/stats', 'Display session token count and generation speed'],
+        ['/key [key]', 'Configure API key with auto-detection & model discovery'],
         ['/provider [name]', 'Switch active provider (gemini, anthropic, openai, llamacpp, ollama)'],
         ['/hardware', 'Inspect GPU, VRAM, and offload telemetry'],
         ['/mcp', 'List connected MCP servers and external tools'],
@@ -196,74 +233,244 @@ export async function handleSlashCommand(
     case '/stats': {
       const stats = agent.getStats();
       const ctx = agent.getContext();
+      const ctxEngine = agent.getContextEngine();
+      const ctxStats = ctxEngine.getStats();
       const isCloud = isCloudProvider(ctx.provider);
       const avgTps = stats.totalDurationMs > 0
         ? (stats.completionTokens / (stats.totalDurationMs / 1000)).toFixed(1)
         : '0.0';
       const sec = (stats.totalDurationMs / 1000).toFixed(1);
 
-      console.log(`\n  ${theme.diamond} ${theme.strong('Session Telemetry')}\n`);
-      console.log(`    ${theme.muted('provider'.padEnd(14))} ${theme.accent(ctx.provider || 'auto')} ${theme.dim(`[${isCloud ? '☁ Cloud Frontier' : '💻 Local Quantized'}]`)}`);
-      console.log(`    ${theme.muted('model'.padEnd(14))} ${theme.secondary(ctx.model)}`);
-      console.log(`    ${theme.muted('turns'.padEnd(14))} ${theme.text(String(stats.turns))}`);
-      console.log(`    ${theme.muted('model calls'.padEnd(14))} ${theme.text(String(stats.modelCalls))}`);
-      console.log(`    ${theme.muted('tool calls'.padEnd(14))} ${theme.text(String(stats.toolCalls))} ${theme.dim(`(${stats.successfulToolCalls} ok, ${stats.failedToolCalls} fail)`)}`);
-      console.log(`    ${theme.muted('total tokens'.padEnd(14))} ${theme.text(stats.totalTokens.toLocaleString())}`);
-      console.log(`    ${theme.muted('prompt tok'.padEnd(14))} ${theme.dim(stats.promptTokens.toLocaleString())}`);
-      console.log(`    ${theme.muted('output tok'.padEnd(14))} ${theme.secondary(stats.completionTokens.toLocaleString())}`);
-      console.log(`    ${theme.muted('duration'.padEnd(14))} ${theme.secondary(`${sec}s`)}`);
-      console.log(`    ${theme.muted('avg speed'.padEnd(14))} ${theme.accent(`${avgTps} tok/s`)}\n`);
+      console.log(`\n  ${theme.diamond} ${theme.strong('Session Telemetry & Dashboard')}\n`);
+      console.log(`    ${theme.muted('provider'.padEnd(16))} ${theme.accent(ctx.provider || 'auto')} ${theme.dim(`[${isCloud ? '☁ Cloud Frontier' : '💻 Local Quantized'}]`)}`);
+      console.log(`    ${theme.muted('model'.padEnd(16))} ${theme.secondary(ctx.model)}`);
+      console.log(`    ${theme.muted('turns'.padEnd(16))} ${theme.text(String(stats.turns))}`);
+      console.log(`    ${theme.muted('model calls'.padEnd(16))} ${theme.text(String(stats.modelCalls))}`);
+
+      // Tool success rate
+      const totalTools = stats.toolCalls;
+      const toolSuccessPct = totalTools > 0 ? Math.round((stats.successfulToolCalls / totalTools) * 100) : 100;
+      const toolGauge = theme.gauge(toolSuccessPct, 6);
+      console.log(`    ${theme.muted('tool calls'.padEnd(16))} ${theme.text(String(totalTools))} ${theme.dim(`(${stats.successfulToolCalls} ok, ${stats.failedToolCalls} fail)`)} ${toolGauge} ${theme.dim(`${toolSuccessPct}%`)}`);
+
+      // Tokens breakdown
+      console.log(`    ${theme.muted('total tokens'.padEnd(16))} ${theme.text(stats.totalTokens.toLocaleString())}`);
+      console.log(`    ${theme.muted('prompt tok'.padEnd(16))} ${theme.dim(stats.promptTokens.toLocaleString())}`);
+      console.log(`    ${theme.muted('output tok'.padEnd(16))} ${theme.secondary(stats.completionTokens.toLocaleString())}`);
+
+      // Context efficiency & compaction
+      const activeCtx = ctx.numCtx || 32768;
+      const estTokens = ctxStats.totalTokensEstimated || 0;
+      const ctxPct = Math.min(100, Math.round((estTokens / activeCtx) * 100));
+      const ctxGauge = theme.gauge(ctxPct, 8);
+      console.log(`    ${theme.muted('active context'.padEnd(16))} ${ctxGauge} ${theme.accent(`${ctxPct}%`)} ${theme.dim(`(${estTokens.toLocaleString()} / ${activeCtx.toLocaleString()} tokens)`)}`);
+
+      const savedTokens = (stats.tokensSavedByCompression || 0) + (ctxStats.tokensSavedByCompression || 0);
+      const dedupeTokens = (stats.tokensAvoidedByDeduplication || 0) + (ctxStats.tokensAvoidedByDeduplication || 0);
+      if (savedTokens > 0 || dedupeTokens > 0) {
+        console.log(`    ${theme.muted('budget savings'.padEnd(16))} ${theme.success(`+${(savedTokens + dedupeTokens).toLocaleString()} tokens saved`)} ${theme.dim(`(${savedTokens.toLocaleString()} compacted, ${dedupeTokens.toLocaleString()} deduped)`)}`);
+      }
+
+      console.log(`    ${theme.muted('duration'.padEnd(16))} ${theme.secondary(`${sec}s`)}`);
+      console.log(`    ${theme.muted('avg speed'.padEnd(16))} ${theme.accent(`${avgTps} tok/s`)}\n`);
+      return true;
+    }
+
+    case '/key':
+    case '/apikey':
+    case '/auth': {
+      let keyToSet = arg.trim();
+
+      if (!keyToSet) {
+        if (!process.stdin.isTTY) {
+          renderer.printError('usage: /key <api-key>');
+          return true;
+        }
+        try {
+          keyToSet = await promptInput({
+            message: 'Enter your API key:',
+            validate: (val: string) => val.trim().length > 0 || 'API key cannot be empty'
+          });
+          keyToSet = keyToSet.trim();
+        } catch {
+          return true;
+        }
+      }
+
+      if (!keyToSet) return true;
+
+      // Automatically identify provider from API key format
+      let detectedProvider = identifyProviderFromApiKey(keyToSet);
+      if (!detectedProvider) {
+        if (process.stdin.isTTY) {
+          try {
+            detectedProvider = await select<ProviderType>({
+              message: 'Could not automatically identify provider from key format. Select provider for this key:',
+              choices: [
+                { name: 'Gemini (Google AI)', value: 'gemini' },
+                { name: 'Anthropic (Claude)', value: 'anthropic' },
+                { name: 'APINex (https://apinex.bond)', value: 'apinex' },
+                { name: 'OpenAI', value: 'openai' },
+                { name: 'Groq', value: 'groq' },
+                { name: 'OpenRouter', value: 'openrouter' },
+                { name: 'NVIDIA NIM', value: 'nim' }
+              ]
+            });
+          } catch {
+            return true;
+          }
+        } else {
+          detectedProvider = 'openai';
+        }
+      }
+
+      const envVarName = getEnvKeyNameForProvider(detectedProvider);
+      saveApiKeyToGlobalEnv(envVarName, keyToSet);
+      process.env[envVarName] = keyToSet;
+
+      console.log(`\n  ${theme.strong('✓')} Identified provider: ${theme.accent(detectedProvider)} ${theme.muted(`(${envVarName} = ${maskApiKey(keyToSet)})`)}`);
+      console.log(`  ${theme.strong('✓')} Saved credentials to ${theme.secondary(getGlobalEnvPath())}\n`);
+
+      // Automatically load models for this provider
+      const defaultModel = getDefaultModelForProvider(detectedProvider);
+      const defaultCtx = getDefaultContextForProvider(detectedProvider);
+
+      const newContext: AgentContext = {
+        ...agent.getContext(),
+        provider: detectedProvider,
+        model: defaultModel,
+        apiKey: keyToSet,
+        apiBase: undefined,
+        numCtx: defaultCtx
+      };
+
+      const newProvider = createLLMProvider(newContext);
+
+      renderer.startSpinner(`querying available models for ${detectedProvider}...`);
+      let availableModels: string[] = [];
+      try {
+        availableModels = await newProvider.getAvailableModels();
+      } catch {
+        availableModels = [defaultModel];
+      } finally {
+        renderer.stopSpinner();
+      }
+
+      if (!availableModels || availableModels.length === 0) {
+        availableModels = [defaultModel];
+      }
+
+      let selectedModel = defaultModel;
+      if (process.stdin.isTTY && availableModels.length > 0) {
+        try {
+          selectedModel = await select({
+            message: `Select a model for ${detectedProvider}:`,
+            default: availableModels.includes(defaultModel) ? defaultModel : availableModels[0],
+            choices: availableModels.map(m => ({
+              name: m === defaultModel ? `${m} (recommended)` : m,
+              value: m
+            }))
+          });
+        } catch {
+          selectedModel = defaultModel;
+        }
+      }
+
+      newProvider.setModel(selectedModel);
+      newContext.model = selectedModel;
+
+      agent.setProvider(newProvider, detectedProvider);
+      agent.setContext(newContext);
+
+      const cloudBadge = isCloudProvider(detectedProvider) ? '☁ Cloud Frontier' : '💻 Local Quantized';
+      renderer.printSuccess(`active provider is now ${detectedProvider} [${cloudBadge}] (model: ${selectedModel}, ctx: ${defaultCtx.toLocaleString()}, ${availableModels.length} models detected)`);
       return true;
     }
 
     case '/provider': {
       const ctx = agent.getContext();
       const activeProvider = ctx.provider || 'ollama';
-      const supportedProviders: Array<{ name: ProviderType; defaultModel: string; type: 'cloud' | 'local' }> = [
-        { name: 'gemini', defaultModel: 'gemini-3.6-flash', type: 'cloud' },
-        { name: 'anthropic', defaultModel: 'claude-3-5-sonnet-20241022', type: 'cloud' },
-        { name: 'openai', defaultModel: 'gpt-4o', type: 'cloud' },
-        { name: 'openrouter', defaultModel: 'anthropic/claude-3.5-sonnet', type: 'cloud' },
-        { name: 'groq', defaultModel: 'qwen/qwen3.8-27b', type: 'cloud' },
-        { name: 'nim', defaultModel: 'meta/llama-3.3-70b-instruct', type: 'cloud' },
-        { name: 'llamacpp', defaultModel: 'qwen2.5-coder:7b', type: 'local' },
-        { name: 'ollama', defaultModel: 'qwen2.5-coder:7b', type: 'local' }
-      ];
+
+      let targetProvider: ProviderType | undefined;
 
       if (!arg) {
-        console.log(`\n  ${theme.diamond} ${theme.strong('LLM Providers')}\n`);
-        console.log(`    ${theme.muted('active:')} ${theme.accent(activeProvider)} ${theme.dim(`[${isCloudProvider(activeProvider) ? '☁ Cloud' : '💻 Local'}]`)}\n`);
-        console.log(`    ${theme.muted('available providers:')}`);
-        for (const p of supportedProviders) {
-          const isAct = p.name === activeProvider;
-          const marker = isAct ? theme.check : ' ';
-          const tag = p.type === 'cloud' ? theme.dim('(cloud)') : theme.dim('(local)');
-          const label = isAct ? theme.strong(p.name) : theme.secondary(p.name);
-          console.log(`    ${marker} ${label.padEnd(14)} ${tag.padEnd(10)} ${theme.muted(`default: ${p.defaultModel}`)}`);
+        if (!process.stdin.isTTY) {
+          console.log(`\n  ${theme.diamond} ${theme.strong('LLM Providers')}\n`);
+          console.log(`    ${theme.muted('active:')} ${theme.accent(activeProvider)} ${theme.dim(`[${isCloudProvider(activeProvider) ? '☁ Cloud' : '💻 Local'}]`)}\n`);
+          console.log(`    ${theme.muted('available providers:')}`);
+          for (const p of SUPPORTED_PROVIDERS) {
+            const isAct = p.name === activeProvider;
+            const marker = isAct ? theme.check : ' ';
+            const tag = p.type === 'cloud' ? theme.dim('(cloud)') : theme.dim('(local)');
+            const label = isAct ? theme.strong(p.name) : theme.secondary(p.name);
+            console.log(`    ${marker} ${label.padEnd(14)} ${tag.padEnd(10)} ${theme.muted(`default: ${p.defaultModel}`)}`);
+          }
+          console.log(`\n  ${theme.faint('switch with: /provider <name> (e.g. /provider gemini)\n')}`);
+          return true;
         }
-        console.log(`\n  ${theme.faint('switch with: /provider <name> (e.g. /provider gemini)\n')}`);
-        return true;
+
+        try {
+          targetProvider = await select<ProviderType>({
+            message: 'Select an LLM Provider:',
+            default: activeProvider,
+            choices: SUPPORTED_PROVIDERS.map(p => ({
+              name: `${p.name.padEnd(12)} ${p.type === 'cloud' ? '☁ Cloud' : '💻 Local'}  (default: ${p.defaultModel})`,
+              value: p.name,
+              description: `Switch active provider to ${p.name}`
+            }))
+          });
+        } catch {
+          return true;
+        }
+      } else {
+        const requested = arg.trim().toLowerCase() as ProviderType;
+        const target = SUPPORTED_PROVIDERS.find(p => p.name === requested);
+        if (!target) {
+          renderer.printError(`unknown provider "${arg}". Choose: ${SUPPORTED_PROVIDERS.map(p => p.name).join(', ')}`);
+          return true;
+        }
+        targetProvider = requested;
       }
 
-      const requested = arg.trim().toLowerCase() as ProviderType;
-      const target = supportedProviders.find(p => p.name === requested);
-      if (!target) {
-        renderer.printError(`unknown provider "${arg}". Choose: ${supportedProviders.map(p => p.name).join(', ')}`);
-        return true;
+      if (!targetProvider) return true;
+
+      const target = SUPPORTED_PROVIDERS.find(p => p.name === targetProvider)!;
+
+      // Check for required API key if cloud provider
+      let targetApiKey = isCloudProvider(targetProvider) ? getApiKeyForProvider(targetProvider) : undefined;
+      if (isCloudProvider(targetProvider) && !targetApiKey) {
+        const envVar = getEnvKeyNameForProvider(targetProvider);
+        if (process.stdin.isTTY) {
+          console.log(`\n  ${theme.diamond} ${theme.strong(`Setup ${targetProvider.toUpperCase()} API Key`)}`);
+          console.log(`  ${theme.muted(`No active ${envVar} detected in environment or ${getGlobalEnvPath()}.`)}\n`);
+          try {
+            const entered = await promptInput({
+              message: `Enter ${envVar}:`,
+              validate: (val: string) => val.trim().length > 0 || 'API key cannot be empty'
+            });
+            const trimmedKey = entered ? entered.trim() : '';
+            if (trimmedKey) {
+              targetApiKey = trimmedKey;
+              saveApiKeyToGlobalEnv(envVar, trimmedKey);
+              console.log(`  ${theme.strong('✓')} Saved ${theme.accent(envVar)} to ${theme.secondary(getGlobalEnvPath())}\n`);
+            }
+          } catch {
+            return true;
+          }
+        }
+        if (!targetApiKey) {
+          renderer.printError(`API key for ${targetProvider} is required. Set ${envVar} or use /key`);
+          return true;
+        }
       }
 
       try {
-        const targetApiKey = isCloudProvider(requested) ? getApiKeyForProvider(requested) : undefined;
-        let newNumCtx = 8192;
-        if (requested === 'gemini') newNumCtx = 1048576;
-        else if (requested === 'anthropic') newNumCtx = 200000;
-        else if (requested === 'groq' || requested === 'nim' || requested === 'nvidia') newNumCtx = 131072;
-        else if (requested === 'openai' || requested === 'openrouter') newNumCtx = 128000;
-        else if (requested === 'llamacpp') newNumCtx = 262144;
+        const newNumCtx = getDefaultContextForProvider(targetProvider);
+        let selectedModel = target.defaultModel;
 
-        const newContext = {
+        const newContext: AgentContext = {
           ...ctx,
-          provider: requested,
+          provider: targetProvider,
           model: target.defaultModel,
           apiKey: targetApiKey,
           apiBase: undefined,
@@ -271,17 +478,46 @@ export async function handleSlashCommand(
         };
 
         const newProvider = createLLMProvider(newContext);
-        agent.setProvider(newProvider, requested);
-        agent.setContext({
-          provider: requested,
-          model: target.defaultModel,
-          apiKey: targetApiKey,
-          apiBase: undefined,
-          numCtx: newNumCtx
-        });
 
-        const cloudBadge = isCloudProvider(requested) ? '☁ Cloud Frontier' : '💻 Local Quantized';
-        renderer.printSuccess(`provider switched to ${requested} [${cloudBadge}] (model: ${target.defaultModel}, ctx: ${newNumCtx.toLocaleString()})`);
+        // Fetch available models
+        let availableModels: string[] = [];
+        try {
+          renderer.startSpinner(`querying available models for ${targetProvider}...`);
+          availableModels = await newProvider.getAvailableModels();
+        } catch {
+          availableModels = [target.defaultModel];
+        } finally {
+          renderer.stopSpinner();
+        }
+
+        if (!availableModels || availableModels.length === 0) {
+          availableModels = [target.defaultModel];
+        }
+
+        // Give user option to just use arrow buttons to select a model within the given options
+        if (process.stdin.isTTY && availableModels.length > 0) {
+          try {
+            selectedModel = await select({
+              message: `Select a model for ${targetProvider}:`,
+              default: availableModels.includes(target.defaultModel) ? target.defaultModel : availableModels[0],
+              choices: availableModels.map(m => ({
+                name: m === target.defaultModel ? `${m} (recommended)` : m,
+                value: m
+              }))
+            });
+          } catch {
+            selectedModel = target.defaultModel;
+          }
+        }
+
+        newProvider.setModel(selectedModel);
+        newContext.model = selectedModel;
+
+        agent.setProvider(newProvider, targetProvider);
+        agent.setContext(newContext);
+
+        const cloudBadge = isCloudProvider(targetProvider) ? '☁ Cloud Frontier' : '💻 Local Quantized';
+        renderer.printSuccess(`provider switched to ${targetProvider} [${cloudBadge}] (model: ${selectedModel}, ctx: ${newNumCtx.toLocaleString()})`);
       } catch (err: any) {
         renderer.printError(`failed to switch provider: ${err.message}`);
       }
@@ -299,7 +535,35 @@ export async function handleSlashCommand(
     case '/model':
       if (!arg) {
         const current = provider.getModel();
-        const available = await provider.getAvailableModels();
+        let available: string[] = [];
+        try {
+          renderer.startSpinner('fetching available models...');
+          available = await provider.getAvailableModels();
+        } catch {
+          available = [current];
+        } finally {
+          renderer.stopSpinner();
+        }
+
+        if (process.stdin.isTTY && available.length > 0) {
+          try {
+            const chosen = await select({
+              message: 'Select a model:',
+              default: current,
+              choices: available.map(m => ({
+                name: m === current ? `${m} (active)` : m,
+                value: m
+              }))
+            });
+            provider.setModel(chosen);
+            agent.setContext({ model: chosen });
+            renderer.printSuccess(`model switched to ${chosen}`);
+          } catch {
+            // Cancelled
+          }
+          return true;
+        }
+
         console.log(`\n  ${theme.strong('models')}`);
         console.log(`  ${theme.muted('active:')} ${theme.accent(current)}`);
         console.log(`  ${theme.muted('available:')}`);
@@ -469,7 +733,117 @@ export async function handleSlashCommand(
       return true;
     }
 
+    case '/fork': {
+      try {
+        const forked = await agent.forkSession(arg || undefined);
+        renderer.printSuccess(`forked session into "${forked.name}" (${theme.secondary(forked.id)})`);
+        console.log(`  ${theme.muted('active conversation branched. You can switch back anytime with /sessions')}\n`);
+      } catch (err: any) {
+        renderer.printError(`failed to fork session: ${err.message}`);
+      }
+      return true;
+    }
+
+    case '/sessions': {
+      try {
+        const sessions = await agent.listSessions();
+        const activeId = agent.getSessionMemory().getActiveSessionId();
+
+        if (sessions.length === 0) {
+          console.log(`\n  ${theme.muted('no saved sessions found in .locode/sessions')}\n`);
+          return true;
+        }
+
+        console.log(`\n  ${theme.diamond} ${theme.strong('Conversation Sessions')} ${theme.dim(`(${sessions.length})`)}\n`);
+
+        for (const s of sessions) {
+          const isActive = s.id === activeId;
+          const marker = isActive ? theme.check : ' ';
+          const nameStr = isActive ? theme.strong(s.name) : theme.secondary(s.name);
+          const turnsStr = `${s.turns} turns`;
+          const modelStr = theme.dim(`[${s.model}]`);
+          const timeStr = theme.muted(new Date(s.updatedAt).toLocaleString());
+          const forkStr = s.forkedFrom ? theme.dim(`(forked from ${s.forkedFrom})`) : '';
+
+          console.log(`    ${marker} ${theme.accent(s.id.padEnd(20))} ${nameStr.padEnd(28)} ${theme.muted(turnsStr.padEnd(10))} ${modelStr} ${timeStr} ${forkStr}`);
+        }
+        console.log();
+
+        if (process.stdin.isTTY) {
+          try {
+            const choices = [
+              ...sessions.map(s => ({
+                name: `${s.id === activeId ? '● ' : '  '}${s.name.padEnd(25)} (${s.id}, ${s.turns} turns, ${s.model})`,
+                value: s.id
+              })),
+              { name: '✕ Close', value: '__EXIT__' }
+            ];
+
+            const chosen = await select({
+              message: 'Switch active session:',
+              default: activeId,
+              choices
+            });
+
+            if (chosen !== '__EXIT__' && chosen !== activeId) {
+              const res = await agent.switchSession(chosen);
+              if (res.success) {
+                renderer.printSuccess(res.message);
+              } else {
+                renderer.printError(res.message);
+              }
+            }
+          } catch {
+            // cancelled prompt
+          }
+        } else {
+          console.log(`  ${theme.faint('switch session with: /session switch <id> or /resume <id>\n')}`);
+        }
+      } catch (err: any) {
+        renderer.printError(`failed to list sessions: ${err.message}`);
+      }
+      return true;
+    }
+
+    case '/session': {
+      const subParts = (arg || '').trim().split(/\s+/);
+      const subCmd = subParts[0]?.toLowerCase();
+      const subTarget = subParts.slice(1).join(' ');
+
+      if (subCmd === 'switch' && subTarget) {
+        const res = await agent.switchSession(subTarget);
+        if (res.success) {
+          renderer.printSuccess(res.message);
+        } else {
+          renderer.printError(res.message);
+        }
+        return true;
+      } else if (subCmd === 'delete' && subTarget) {
+        const ok = await agent.getSessionMemory().deleteSession(subTarget);
+        if (ok) {
+          renderer.printSuccess(`deleted session "${subTarget}"`);
+        } else {
+          renderer.printError(`could not find session "${subTarget}" to delete`);
+        }
+        return true;
+      } else if (subCmd === 'fork') {
+        const forked = await agent.forkSession(subTarget || undefined);
+        renderer.printSuccess(`forked session into "${forked.name}" (${theme.secondary(forked.id)})`);
+        return true;
+      } else {
+        return handleSlashCommand('/sessions', agent, provider, renderer, cwd);
+      }
+    }
+
     case '/resume': {
+      if (arg) {
+        const sessionRes = await agent.switchSession(arg);
+        if (sessionRes.success) {
+          renderer.printSuccess(sessionRes.message);
+          return true;
+        }
+      }
+
       renderer.startSpinner('inspecting execution journal and workspace integrity...');
       const report = await agent.resumeTask();
       renderer.stopSpinner();
@@ -545,19 +919,163 @@ export async function handleSlashCommand(
       return true;
     }
 
+    case '/theme':
+    case '/palette': {
+      const themes = getAvailableThemes();
+      const current = getActiveTheme();
+
+      if (arg) {
+        const ok = setActiveTheme(arg);
+        if (ok) {
+          renderer.printSuccess(`switched theme to ${theme.accent(arg)}`);
+        } else {
+          renderer.printError(`unknown theme "${arg}". Choose: ${themes.map(t => t.name).join(', ')}`);
+        }
+        return true;
+      }
+
+      if (process.stdin.isTTY) {
+        try {
+          const chosen = await select({
+            message: 'Select a UI Color Palette:',
+            default: current.name,
+            choices: themes.map(t => ({
+              name: `${t.name.padEnd(12)} - ${t.label}`,
+              value: t.name
+            }))
+          });
+          setActiveTheme(chosen);
+          renderer.printSuccess(`active theme is now ${theme.accent(chosen)}`);
+        } catch {}
+        return true;
+      }
+
+      console.log(`\n  ${theme.diamond} ${theme.strong('UI Themes')}\n`);
+      console.log(`    ${theme.muted('active:')} ${theme.accent(current.name)} ${theme.dim(`(${current.label})`)}\n`);
+      for (const t of themes) {
+        const isAct = t.name === current.name;
+        console.log(`    ${isAct ? theme.check : ' '} ${isAct ? theme.strong(t.name.padEnd(14)) : theme.secondary(t.name.padEnd(14))} ${theme.muted(t.label)}`);
+      }
+      console.log(`\n  ${theme.faint('switch with: /theme <name>\n')}`);
+      return true;
+    }
+
+    case '/find':
+    case '/browse': {
+      try {
+        const query = arg.trim();
+        const files = await listWorkspaceFiles(cwd, query);
+        if (files.length === 0) {
+          console.log(`\n  ${theme.muted(query ? `no files matching "${query}" found` : 'no files found in workspace')}\n`);
+          return true;
+        }
+
+        if (!process.stdin.isTTY) {
+          console.log(`\n  ${theme.diamond} ${theme.strong('Workspace Files')} ${theme.dim(`(${files.length})`)}\n`);
+          for (const f of files.slice(0, 30)) {
+            console.log(`    ${theme.bullet} ${theme.secondary(f)}`);
+          }
+          if (files.length > 30) {
+            console.log(`    ${theme.faint(`... and ${files.length - 30} more files`)}`);
+          }
+          console.log();
+          return true;
+        }
+
+        const chosenFile = await select({
+          message: `Select a file (${files.length} found):`,
+          choices: [
+            ...files.slice(0, 50).map(f => ({ name: f, value: f })),
+            { name: '✕ Cancel', value: '__CANCEL__' }
+          ]
+        });
+
+        if (chosenFile === '__CANCEL__') return true;
+
+        const action = await select({
+          message: `Action for ${chosenFile}:`,
+          choices: [
+            { name: '📖 Read & display file', value: 'read' },
+            { name: '📝 Inspect git diff', value: 'diff' },
+            { name: '✕ Done', value: 'done' }
+          ]
+        });
+
+        if (action === 'diff') {
+          await showDiffTUI(cwd, chosenFile, renderer);
+        } else if (action === 'read') {
+          const fullPath = path.resolve(cwd, chosenFile);
+          const content = await fs.readFile(fullPath, 'utf8');
+          const lines = content.split('\n');
+          console.log(`\n  ${theme.diamond} ${theme.strong(chosenFile)} ${theme.dim(`(${lines.length} lines)`)}\n`);
+          const maxPreview = Math.min(60, lines.length);
+          for (let i = 0; i < maxPreview; i++) {
+            console.log(`    ${theme.gutter(i + 1, 4)}${lines[i]}`);
+          }
+          if (lines.length > maxPreview) {
+            console.log(`    ${theme.faint(`... [${lines.length - maxPreview} more lines omitted]`)}`);
+          }
+          console.log();
+        }
+      } catch (err: any) {
+        renderer.printError(`failed to search files: ${err.message}`);
+      }
+      return true;
+    }
+
+    case '/':
+    case '/menu': {
+      if (!process.stdin.isTTY) {
+        return handleSlashCommand('/help', agent, provider, renderer, cwd);
+      }
+
+      const choices = [
+        // Workspace & Git
+        { name: '📁 /diff [file]        Inspect colored diff and pending modifications', value: '/diff' },
+        { name: '📁 /commit [msg]       Stage and commit workspace changes with git', value: '/commit' },
+        { name: '📁 /verify [cmd]       Run linter & automated test suite', value: '/verify' },
+        { name: '📁 /undo               Rollback workspace to checkpoint before last turn', value: '/undo' },
+        // Sessions & Memory
+        { name: '🌿 /fork [name]        Fork conversation into an independent session branch', value: '/fork' },
+        { name: '🌿 /sessions           List and switch between saved conversation sessions', value: '/sessions' },
+        { name: '🌿 /resume             Resume interrupted task from durable execution journal', value: '/resume' },
+        { name: '🌿 /memory             View persisted project session memory', value: '/memory' },
+        { name: '🌿 /clear              Reset conversation memory', value: '/clear' },
+        // Model & Settings
+        { name: '🤖 /model              Switch active LLM model on the fly', value: '/model' },
+        { name: '🤖 /provider           Switch active provider (gemini, anthropic, llamacpp...)', value: '/provider' },
+        { name: '🤖 /key                Configure API key with auto-detection', value: '/key' },
+        { name: '🤖 /theme              Switch UI color palette (terracotta, nord, monokai...)', value: '/theme' },
+        { name: '🤖 /context            Switch context window size (16k, 32k, 64k, 262k)', value: '/context' },
+        { name: '🤖 /profile            Switch inference profile (ultra-context, performance...)', value: '/profile' },
+        { name: '🤖 /mode               Toggle worker vs architect lane', value: '/mode' },
+        { name: '🤖 /auto               Toggle autonomous zero-confirmation mode', value: '/auto' },
+        // Tools & Inspection
+        { name: '🔍 /find [query]       Interactive workspace file search & inspection', value: '/find' },
+        { name: '🔍 /hardware           Inspect GPU, VRAM, and offload telemetry', value: '/hardware' },
+        { name: '🔍 /stats              Display session token count and generation speed', value: '/stats' },
+        { name: '🔍 /mcp                List connected MCP servers and external tools', value: '/mcp' },
+        { name: '🔍 /tools              List registered agent tools', value: '/tools' },
+        { name: '✕ Exit Menu', value: '__CANCEL__' }
+      ];
+
+      try {
+        const chosen = await select({
+          message: 'Locode Command Palette:',
+          choices
+        });
+        if (chosen !== '__CANCEL__' && chosen) {
+          return handleSlashCommand(chosen, agent, provider, renderer, cwd);
+        }
+      } catch {}
+      return true;
+    }
+
     case '/diff':
       try {
-        const status = await execa('git status -s', { cwd, shell: true });
-        const diff = await execa('git diff', { cwd, shell: true });
-        console.log(`\n  ${theme.strong('git status')}`);
-        console.log(status.stdout ? `  ${status.stdout.split('\n').join('\n  ')}` : `  ${theme.muted('clean workspace')}`);
-        if (diff.stdout) {
-          console.log(`\n  ${theme.strong('git diff')}`);
-          console.log(theme.muted(diff.stdout));
-        }
-        console.log();
+        await showDiffTUI(cwd, arg || undefined, renderer);
       } catch (err: any) {
-        renderer.printError(`failed to run git diff: ${err.message}`);
+        renderer.printError(`failed to run diff: ${err.message}`);
       }
       return true;
 
@@ -567,7 +1085,14 @@ export async function handleSlashCommand(
       process.exit(0);
 
     default:
+      if (command === '/') {
+        return handleSlashCommand('/menu', agent, provider, renderer, cwd);
+      }
       if (command.startsWith('/')) {
+        if (process.stdin.isTTY) {
+          renderer.printWarning(`unknown command "${command}". Opening Command Palette...`);
+          return handleSlashCommand('/menu', agent, provider, renderer, cwd);
+        }
         renderer.printError(`unknown command "${command}". Type /help for options.`);
         return true;
       }
